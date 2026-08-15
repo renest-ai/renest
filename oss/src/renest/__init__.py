@@ -12,7 +12,7 @@ LICENSE-CLI and NOTICE files distributed with this package.
 
 from __future__ import annotations
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 def _supported_manifest_versions() -> tuple[str, ...]:
     """Manifest versions this CLI can read — **derived, never copied by hand**.
