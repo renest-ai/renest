@@ -1,0 +1,10 @@
+{
+  "schema": "ai.renest.rules.keys",
+  "schema_version": "1",
+  "updated": "2026-08-14",
+  "note": "Trust ring for signed rule updates: ed25519 public keys, hex-encoded. An empty ring means remote updates are closed (fail-closed) and the CLI uses only the baseline bundled in the package. Signing happens off-line, away from any server or pipeline, so a compromised control plane still cannot forge an update. Several keys may be valid at once; a client accepts a signature from any of them. k1 was retired on 2026-08-14: its private half had been living on an internet-facing server, which is exactly what the sentence above promises never happens. Nothing published was ever signed with it (the live bundle is k2), so retiring it breaks nothing.",
+  "keys": {
+    "k2": "8713d133cd909b223558278f15964e68865b14d130c7290119d350a2f53b57b9",
+    "k3": "688575712f9487e2cdc56a4f043b1bde72139b350037bdcec9963ec0b4c85f03"
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "name": "Minimal SDXL text-to-image",
+  "base_image": {
+    "ref": "<the pod's actual image, e.g. runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04>",
+    "digest": "sha256:<the image digest; from `docker inspect --format='{{index .RepoDigests 0}}'` or the pod's detail page>"
+  },
+  "runtime": {
+    "python_version": "<output of `python --version`, e.g. 3.11.9>",
+    "cuda_version": "<optional, e.g. 12.4>",
+    "gpu_model": "<optional, e.g. RTX 4090>"
+  },
+  "code_deps": [
+    {
+      "name": "ComfyUI",
+      "role": "host",
+      "repo_url": "https://github.com/comfyanonymous/ComfyUI",
+      "commit": "<full 40 characters from `git -C /workspace/ComfyUI rev-parse HEAD`>",
+      "install_path": "ComfyUI",
+      "exclude": [
+        "models",
+        "output",
+        "temp",
+        "input"
+      ],
+      "_exclude_note": "Recipes, not outputs: output directories are not packed. Models travel as separately content-addressed `files[]` entries and must never be mixed into the source archive, or the same bytes are stored twice."
+    }
+  ],
+  "python_lock": {
+    "tool": "uv",
+    "lockfile_path": "<relative path to the uv lockfile. Generate it first: `cd /workspace && uv pip freeze > requirements.lock`, then put `requirements.lock` here>"
+  },
+  "files": [
+    {
+      "path": "ComfyUI/models/checkpoints/sd_xl_base_1.0.safetensors",
+      "license": {
+        "shareable": false,
+        "serving_scope": "gated",
+        "tag": "rail",
+        "note": "CreativeML Open RAIL++-M: re-hosting counts as distribution, so a copy serves only its owner's rebuild and bytes are never served across users."
+      },
+      "origin_url": "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0",
+      "kind": "checkpoint"
+    }
+  ],
+  "adapters": {
+    "comfyui": {
+      "workflow_path": "<relative path to the workflow JSON from the run that worked, e.g. ComfyUI/user/default/workflows/sdxl.json>",
+      "workflow_name": "sdxl-txt2img-base",
+      "verified_run": {
+        "queue_completed_at": "<optional, ISO 8601 timestamp of the successful run>",
+        "duration_seconds": 0
+      }
+    }
+  },
+  "creation": {
+    "cloud": "runpod",
+    "region": "<region>",
+    "agent_version": "0.0.1-manual"
+  },
+  "_note": "Packing template for the minimal SDXL text-to-image case. Fill in the `<placeholders>` on a pod where the setup already works, then feed it to `renest pack`. All paths are relative to `--dir` (the environment root, usually `/workspace`). Hashes, sizes, archives and the environment fingerprint are computed by `renest pack`; do not fill them in by hand.",
+  "_files_note": "Pick one `serving_scope` (if unsure, leave it out -- `renest pack` falls back to `gated`): `private` = your own material (self-trained weights, your own assets); `open` = the licence itself permits redistribution (Apache-2.0, MIT); `gated` = restricted (assets that forbid re-hosting, models that require a login to download), which **must** carry `origin_url`, because downstream has to fetch it from the source with their own credentials."
+}

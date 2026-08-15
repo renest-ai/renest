@@ -1,0 +1,205 @@
+{
+  "schema": "ai.renest.rules.world",
+  "schema_version": "1",
+  "issued_at": null,
+  "provenance": "Factory baseline. **This file holds what the outside world currently looks like** -- the facts that go stale when something upstream changes. They used to be hard-coded, so correcting a single character required a new release; kept here, one update fixes them. The issue date is stamped by the signing tool, never written by hand: a hand-written date lies the moment someone edits the content and forgets it, which would turn \"speak up when stale\" into speaking falsely.",
+  "boundary_note": "**What does not belong in this file**: (1) anything that would relax the safety semantics of a restore (the path-traversal check, the launch-argument allowlist) -- those are format contract, not world knowledge, and letting them be changed remotely hands the gate to the network; (2) licence texts -- those are bytes that travel with a nest and should be content-addressed, not a mutable world file; (3) the escape hatch never reads anything here.",
+  "package_indexes": {
+    "vendor": {
+      "pytorch": "https://download.pytorch.org/whl/{label}/{name}/",
+      "note": "Packages carrying a local version segment (for example `torch==2.4.1+cu124`) exist only on a vendor's private index. **Only one vendor is recognised today** -- the one real runs actually hit. When another appears, add an entry here; no code change is needed. The key is the vendor that owns the marker prefix inside the local version."
+    },
+    "public": {
+      "pypi": "https://pypi.org/simple/{name}/",
+      "note": "The public index used to look up a dependency's content hash. **Users who switch mirrors still look hashes up here** (a hash has nothing to do with where the bytes were downloaded from). When this index is unreachable the hash cannot be found, and packing reports that honestly rather than writing half a record."
+    }
+  },
+  "image_registry": {
+    "token_url": "https://auth.docker.io/token",
+    "manifest_url": "https://registry-1.docker.io/v2/{repo}/manifests/{tag}",
+    "service": "registry.docker.io",
+    "note": "Resolves an image name to its content digest. **Only one registry is recognised today.** For any other registry the answer is an honest \"unknown\" rather than a guess. When another appears, add it here; no code change is needed."
+  },
+  "egress_probe": {
+    "url": "https://github.com/peak/s5cmd/releases/download/v2.2.2/s5cmd_2.2.2_Linux-64bit.tar.gz",
+    "note": "The probe used to measure this machine's download speed. **It is a link to one specific release**, so the day that release is deleted the speed check silently stops working. Keeping it here means that day does not require a new version of the tool. It was chosen for being a moderate size, publicly fetchable, and needing no login."
+  },
+  "default_cuda_tag": {
+    "value": "cu124",
+    "note": "Which CUDA generation to assume when the dependency list carries no marker. **Assuming the oldest is the conservative choice**: it demands the lowest driver version and so never rejects a good machine, but it also means a newer environment does not get the check it deserves. This default moves as the mainstream moves, which makes it a fact about the world rather than a decision of ours."
+  },
+  "comfyui_vocab": {
+    "provenance": "Read off ComfyUI's own source: the loader classes and the input names they declare, which is the only place this can be known exactly. Not hand-copied -- scripts/propose-rules-update.py parses that source and prints what upstream has and we do not; a human confirms each row against the source before it is written here, because the proposer has been wrong before (it once took an outer wrapper key for an input name). Last reconciled 2026-08-14; the rows added that day are in the factory table in capture.py, each checked one by one. A refreshed table can add a row to the factory one or replace a row, but never remove one, so refreshing this cannot make the tool recognise fewer node classes than it shipped with (_merge_vocab in capture.py).",
+    "note": "The two tables used to recognise ComfyUI nodes. **Every time upstream renames a node, these tables lose a little accuracy** -- and they lose it silently, simply collecting one model fewer, which is the easiest kind of failure to miss. Kept here, an upstream rename can be shipped the same day.\n\n**These tables only affect what can be recognised, never what may be collected.** The boundary is still \"only what this workflow referenced\", and that boundary lives in code, not in this file -- so changing these tables remotely cannot widen what gets collected.",
+    "categories": {
+      "checkpoint": {
+        "dirs": [
+          "models/checkpoints"
+        ],
+        "kind": "checkpoint"
+      },
+      "config": {
+        "dirs": [
+          "models/configs"
+        ],
+        "kind": "other"
+      },
+      "diffusion_model": {
+        "dirs": [
+          "models/diffusion_models",
+          "models/unet"
+        ],
+        "kind": "checkpoint"
+      },
+      "vae": {
+        "dirs": [
+          "models/vae"
+        ],
+        "kind": "vae"
+      },
+      "lora": {
+        "dirs": [
+          "models/loras"
+        ],
+        "kind": "lora"
+      },
+      "text_encoder": {
+        "dirs": [
+          "models/text_encoders",
+          "models/clip"
+        ],
+        "kind": "clip"
+      },
+      "clip_vision": {
+        "dirs": [
+          "models/clip_vision"
+        ],
+        "kind": "clip"
+      },
+      "controlnet": {
+        "dirs": [
+          "models/controlnet"
+        ],
+        "kind": "controlnet"
+      },
+      "upscale_model": {
+        "dirs": [
+          "models/upscale_models"
+        ],
+        "kind": "upscaler"
+      },
+      "style_model": {
+        "dirs": [
+          "models/style_models"
+        ],
+        "kind": "other"
+      },
+      "input_asset": {
+        "dirs": [
+          "input"
+        ],
+        "kind": "input_asset"
+      }
+    },
+    "model_ref_map": {
+      "CheckpointLoaderSimple": [
+        {
+          "input": "ckpt_name",
+          "category": "checkpoint"
+        }
+      ],
+      "CheckpointLoader": [
+        {
+          "input": "config_name",
+          "category": "config"
+        },
+        {
+          "input": "ckpt_name",
+          "category": "checkpoint"
+        }
+      ],
+      "UNETLoader": [
+        {
+          "input": "unet_name",
+          "category": "diffusion_model"
+        }
+      ],
+      "VAELoader": [
+        {
+          "input": "vae_name",
+          "category": "vae"
+        }
+      ],
+      "LoraLoader": [
+        {
+          "input": "lora_name",
+          "category": "lora"
+        }
+      ],
+      "LoraLoaderModelOnly": [
+        {
+          "input": "lora_name",
+          "category": "lora"
+        }
+      ],
+      "CLIPLoader": [
+        {
+          "input": "clip_name",
+          "category": "text_encoder"
+        }
+      ],
+      "DualCLIPLoader": [
+        {
+          "input": "clip_name1",
+          "category": "text_encoder"
+        },
+        {
+          "input": "clip_name2",
+          "category": "text_encoder"
+        }
+      ],
+      "CLIPVisionLoader": [
+        {
+          "input": "clip_name",
+          "category": "clip_vision"
+        }
+      ],
+      "ControlNetLoader": [
+        {
+          "input": "control_net_name",
+          "category": "controlnet"
+        }
+      ],
+      "DiffControlNetLoader": [
+        {
+          "input": "control_net_name",
+          "category": "controlnet"
+        }
+      ],
+      "UpscaleModelLoader": [
+        {
+          "input": "model_name",
+          "category": "upscale_model"
+        }
+      ],
+      "StyleModelLoader": [
+        {
+          "input": "style_model_name",
+          "category": "style_model"
+        }
+      ],
+      "LoadImage": [
+        {
+          "input": "image",
+          "category": "input_asset"
+        }
+      ],
+      "LoadImageMask": [
+        {
+          "input": "image",
+          "category": "input_asset"
+        }
+      ]
+    }
+  }
+}

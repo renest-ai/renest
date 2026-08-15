@@ -1,0 +1,33 @@
+{
+  "schema": "ai.renest.rules.sources",
+  "schema_version": "1",
+  "updated": "2026-07-19",
+  "provenance": "Factory baseline. Engine parameters come from measured selection; the regional playbook comes from measured scoring of alternative sources.",
+  "engine": {
+    "probe_timeout_s": 5.0,
+    "read_timeout_s": 30.0,
+    "range_workers": 8,
+    "single_stream_min_bytes": 8388608,
+    "note": "Measured: the in-house 8-way ranged download engine reached 5587 Mbps, about 2.5 times a common external downloader with the same concurrency. A stalled stream is declared dead after 30 s; below 8 MiB, splitting is not worth it."
+  },
+  "unsupported_kinds_note": "Source kinds we never fetch: they need a peer-to-peer client, which neither the engine nor the escape hatch has, and the escape hatch's tool list is fixed by the format contract. **This copy is a mirror, and deliberately not the one that decides**: download.py holds the list that is actually enforced, because a remotely-refreshable copy could relax it -- drop a name here and a machine would start trying to fetch what it cannot verify. The same reasoning as the boundary note in world-rules.json: safety semantics stay in code. A consistency test keeps the two copies identical so they cannot drift apart unnoticed.",
+  "unsupported_kinds": [
+    "torrent",
+    "magnet"
+  ],
+  "host_rewrites": [
+    {
+      "match_host": "huggingface.co",
+      "replace_host": "hf-mirror.com",
+      "regions": [
+        "cn"
+      ],
+      "kind": "mirror",
+      "note": "A same-path reverse proxy for the model host. Measured in that region: 38 minutes at a 100% success rate, against four hours and under 30% connecting directly. Rewriting only adds an equivalent door; which one is used is decided by a probe race, and correctness is guaranteed by the final sha256 check."
+    }
+  ],
+  "region_notes": {
+    "cn": "Measured restore-source priority for that region: our own regional cache, then the regional model host, then the reverse proxy; never a direct connection to the international model host. The regional host uses a different path scheme and cannot be rewritten mechanically, so it is handled when the source list is built at packing time, not in this rewrite table.",
+    "global": "The authoritative source we host ourselves comes first; public CDNs act as hash-verified accelerators. Ordering is left to the probe race rather than hard-coded."
+  }
+}

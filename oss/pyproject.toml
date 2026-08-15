@@ -1,0 +1,154 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "renest"
+version = "0.1.0"
+readme = "README.md"
+description = "Renest agent CLI: pack a working GPU setup — an image workflow or a fine-tuning run — into an open-format nest and restore it byte-identical anywhere."
+requires-python = ">=3.11"
+# The CLI is source-available: readable, but not licensed for building a
+# competing hosted service on. It is not an open-source licence, so this is not
+# a common SPDX identifier but the custom reference PEP 639 allows; the text is
+# in LICENSE-CLI. The genuinely open parts (Apache-2.0) are the format spec in
+# specs/ and the escape hatch in escape/, each carrying its own copy of the
+# Apache text; the escape hatch's copy travels into the wheel with it.
+license = "LicenseRef-Renest-Source-Available"
+# The licence text ships with the package. The identifier above is metadata
+# only, so without this line the installed package carries no text at all; this
+# puts it in the wheel's dist-info (test: tests/consistency/test_directional_isolation.py).
+license-files = ["LICENSE-CLI", "NOTICE"]
+dependencies = [
+    "platformdirs>=4.10.0",
+    "httpx>=0.27",
+    "jsonschema>=4.21",
+    "cryptography>=42",
+    # Needed to read a fine-tuning framework's training YAML (the whole recipe
+    # lives in that one file), and to read the extra model paths file on the
+    # image-generation side. Found on real hardware 2026-07-26: it used to be a
+    # dev-only dependency, so the wheel installed on a pod could not read a
+    # recipe at all -- the adapter was dead weight, while local tests stayed green.
+    "pyyaml>=6",
+    # The dependency-install step shells out to uv, so a rebuild on a fresh machine
+    # dies right there without it -- found on real hardware 2026-08-10: every file
+    # restored and verified, then "uv is not available" (exit 30). Sending the user
+    # off to install a second tool by hand, in the middle of the single command the
+    # walkthrough hands them, is not a rebuild story. It ships as a self-contained
+    # binary wheel: one download, no build.
+    # (The escape hatch is unaffected -- it may only lean on tools the machine
+    # already has, and uv was already on that list.)
+    "uv>=0.4",
+]
+
+[project.urls]
+# A source-available licence promises the code is readable. If the package does
+# not say where, that promise cannot be kept -- so these are not decoration.
+Homepage = "https://renest.ai"
+Source = "https://github.com/renest-ai/renest"
+Issues = "https://github.com/renest-ai/renest/issues"
+
+[project.scripts]
+# The command name is the brand name, `renest`. Namespace rule: tooling is
+# `renest`, assets are `nest`.
+renest = "renest.cli:main"
+
+[dependency-groups]
+dev = [
+    "jsonschema>=4.26.0",
+    "pytest>=8",
+    "pyyaml>=6",
+    # The two image-comparison packages are NOT product dependencies: most
+    # people only move an environment and should not pay for two extra packages
+    # (proof_image imports them inside the function). They must be in the dev
+    # group, though -- otherwise the output-verification tests silently skip in
+    # CI, which makes them decorative.
+    "pillow>=10",
+    "scikit-image>=0.24",
+]
+
+[tool.hatch.build.targets.sdist]
+# The source archive must not carry the test suite. Two reasons, the second one
+# is the load-bearing one:
+#   1. Nobody installing the tool runs our tests; they are dead weight in the
+#      archive (70 of the 135 files in the 0.1.0 sdist were tests).
+#   2. The tests are where most of the internal notes live -- 58,912 Chinese
+#      characters as of 2026-08-09, roughly half of everything we had to clean,
+#      and the risky half is not the language but what it says: what a run cost,
+#      which datacentre, gaps we admit to, how a check could be worked around,
+#      "not verified on real hardware yet". The wheel never contained tests
+#      (50 files, zero tests); the sdist did. Excluding them here retires that
+#      exposure with one line instead of rewriting 72 files.
+# Guarded by tests/consistency/test_shipped_surface.py -- if this exclusion is
+# dropped, that test goes red before anything reaches the index.
+exclude = [
+    "/tests",
+    # Superseded drafts and our own change-control paperwork. The format spec is
+    # published so an outsider can write their own reader; three obsolete drafts
+    # of it and an internal checklist do not help with that, they just make the
+    # published spec ambiguous ("which of these four documents is the format?")
+    # and put our working notes in front of strangers. They stay in the repo as
+    # history; they simply do not go in the archive. Checked 2026-08-09: nothing
+    # in the shipped code, the escape hatch, or the test suite reads them --
+    # every reference to it lives in files that never ship.
+    "/specs/manifest-v1.1-draft.md",
+    "/specs/manifest-v1.1-draft.schema.json",
+    "/specs/manifest-v2-draft.md",
+    "/specs/manifest-v2.3-freeze-record.cn.md",
+    "/specs/FORMAT-CHANGE-CHECKLIST.md",
+    # Rules-publishing intermediates must not ship. They are already kept out of the
+    # repository (see .gitignore) because the finished
+    # article lives in the public rules repo -- but the build copies whatever sits in
+    # src/renest/data/ on the machine doing the packing, so without this the wheel
+    # picks up whichever leftovers that machine happens to have. Found 2026-08-11:
+    # a locally built 0.2.0 carried eleven of them, five dated two days earlier and
+    # still naming the old CUDA driver floor -- the same wheel then stated two
+    # different answers for the same number. It also made the build unreproducible:
+    # a clean checkout has none of these files, so it would produce a different wheel.
+    # What the tool actually reads is the plain .json baseline plus what it downloads.
+    # Guarded by tests/consistency/test_rules_intermediates_do_not_ship.py.
+    "src/renest/data/*.signed.json",
+    "src/renest/data/*.public.json",
+]
+
+[tool.hatch.build.targets.sdist.hooks.custom]
+# Ships the rules data without our internal notes. See hatch_build.py.
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/renest"]
+exclude = [
+    # Same reason as the sdist exclusion above: publishing
+    # intermediates are not part of the tool.
+    "src/renest/data/*.signed.json",
+    "src/renest/data/*.public.json",
+]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+# Same as the sdist: the rules data goes out without our internal notes.
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.wheel.force-include]
+# The single source of truth stays oss/specs (mirrored from the repository-root
+# specs/). The wheel embeds a copy under renest/specs/ so that lint.find_schema()
+# can read it in place after a pip install. Do not hand-copy a second schema
+# under src/renest/ -- that creates drift.
+"specs/manifest.schema.json" = "renest/specs/manifest.schema.json"
+"specs/pack-spec.schema.json" = "renest/specs/pack-spec.schema.json"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint.per-file-ignores]
+# This file is the decision table for the eight fields added in format 2.2: one
+# row per case (build a minimal nest, change one field, expect pass or reject).
+# Writing several statements on a line is what makes the table readable as a
+# table; split into three tidy lines each, 35 cases become well over a hundred
+# lines and the comparison between cases disappears.
+# So E702 (multiple statements on one line) is waived for this file only;
+# everywhere else it still applies.
+"tests/matrix/test_format_v22_fields.py" = ["E702"]

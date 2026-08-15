@@ -1,0 +1,85 @@
+{
+ "schema": "ai.renest.rules.fingerprint",
+ "schema_version": "1",
+ "updated": "2026-08-15",
+ "provenance": "Factory baseline. The critical-package list comes from recorded failure scenarios; the coverage list comes from our own measurement records. How many runs each card has, and where they ran, stay in the private archive.",
+ "provenance_grammar_note": "Every tested_gpus entry carries `measured YYYY-MM-DD`, the day that card first appears in our own run records. It is an anchor, not a story: the date resolves to one batch in our measurement ledger, and everything about that batch -- how many runs, which hosts, what it cost -- stays there and never travels with this file. A guard refuses any entry whose anchor resolves to no batch.",
+ "confidence_note": "high = the verdict rests on a large body of runs; low = we have run this card, but only a few times. The counting rule lives in scripts/propose-tested-gpus.py.",
+ "critical_packages_note": "Packages whose exact version decides whether a rebuilt environment runs at all: compiled extensions, anything bound to a CUDA line, and the ones whose ABI moves between minor releases. The fingerprint records their versions so a rebuild can be compared against the machine that worked. The list came out of real failures, not from reading changelogs -- each name is here because a mismatch on it broke a run. The same list is mirrored in fingerprint.py as CRITICAL_PACKAGES, the copy used when this file cannot be read.",
+ "critical_packages": [
+  "torch",
+  "torchvision",
+  "xformers",
+  "insightface",
+  "onnxruntime",
+  "numpy",
+  "transformers",
+  "diffusers"
+ ],
+ "tested_gpus": [
+  {
+   "name_contains": "A4000",
+   "confidence": "high",
+   "provenance": "measured 2026-07-14",
+   "note": "The card we have tested most."
+  },
+  {
+   "name_contains": "A5000",
+   "confidence": "high",
+   "provenance": "measured 2026-07-13",
+   "note": "Well tested."
+  },
+  {
+   "name_contains": "RTX 3090",
+   "confidence": "low",
+   "provenance": "measured 2026-07-15",
+   "note": "Only lightly tested so far, so the verdict errs on the cautious side."
+  },
+  {
+   "name_contains": "RTX 4000 Ada",
+   "confidence": "low",
+   "provenance": "measured 2026-07-14",
+   "note": "Only lightly tested so far, so the verdict errs on the cautious side."
+  },
+  {
+   "name_contains": "A4500",
+   "confidence": "low",
+   "provenance": "measured 2026-07-13",
+   "note": "Barely tested so far, so the verdict errs on the cautious side."
+  },
+  {
+   "name_contains": "L4",
+   "confidence": "low",
+   "provenance": "measured 2026-07-14",
+   "note": "Barely tested so far, so the verdict errs on the cautious side."
+  },
+  {
+   "name_contains": "A10",
+   "confidence": "low",
+   "provenance": "measured 2026-07-15",
+   "note": "Barely tested so far, so the verdict errs on the cautious side."
+  },
+  {
+   "name_contains": "RTX 4090",
+   "sm": "sm_89",
+   "confidence": "low",
+   "provenance": "measured 2026-07-25",
+   "note": "Rebuild checked against the source machine: output similarity 0.9847 over five repeats (measured 2026-08-08)."
+  },
+  {
+   "name_contains": "RTX 5090",
+   "sm": "sm_120",
+   "confidence": "low",
+   "provenance": "measured 2026-07-22",
+   "note": "Rebuild checked against the source machine: output similarity 0.9885 over five repeats (measured 2026-08-08)."
+  },
+  {
+   "name_contains": "H100",
+   "sm": "sm_90",
+   "confidence": "low",
+   "provenance": "measured 2026-07-26",
+   "note": "Rebuild checked against the source machine: output similarity 0.9863 (measured 2026-08-09)."
+  }
+ ],
+ "coverage_note": "GPUs not on this list have not been tested by us. Verdicts for them err on the cautious side and are a best guess, not a measurement. The list grows as we test more cards."
+}

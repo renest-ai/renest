@@ -1,0 +1,22 @@
+Renest
+Copyright 2026 Tensor Logic Digital, LLC
+
+This package is licensed in layers; each part carries its own licence text:
+
+  * The command-line tool (everything under src/renest/ except the escape
+    hatch) is source-available under the Renest CLI Source-Available Licence
+    -- see the LICENSE-CLI file distributed with this work. It is not open
+    source: the source is public and yours to read, audit, and patch, but
+    using it to run a competing hosted service is not granted.
+
+  * The escape hatch (src/renest/escape/) is licensed under the Apache
+    License, Version 2.0 -- see the LICENSE file next to it, or
+    http://www.apache.org/licenses/LICENSE-2.0. It always will be: it is the
+    artefact you run when we are gone, so it carries no conditions of ours.
+
+  * The archive format specifications (the specs/ directory of the source
+    repository, embedded in this wheel under renest/specs/) are likewise
+    Apache License, Version 2.0.
+
+The hosted service at https://renest.ai is operated by the authors of
+this project.

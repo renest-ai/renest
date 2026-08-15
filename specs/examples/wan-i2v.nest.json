@@ -1,0 +1,122 @@
+{
+  "format_version": "2.0",
+  "id": "01J8ZZAB3C5D7E9F1G3H5J7K9M",
+  "created_at": "2026-07-05T14:30:00Z",
+  "name": "Wan 2.2 image-to-video with VideoHelperSuite",
+  "base_image": {
+    "ref": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "runtime": {
+    "python_version": "3.11.9",
+    "cuda_version": "12.4",
+    "gpu_model": "RTX 4090"
+  },
+  "fingerprint": {
+    "fingerprint_version": "1",
+    "python": {
+      "version": "3.11.9"
+    },
+    "torch": {
+      "version": "2.5.1+cu124",
+      "cuda_version": "12.4"
+    },
+    "os": {
+      "name": "Ubuntu",
+      "version": "22.04.4 LTS"
+    },
+    "critical_packages": {
+      "torch": "2.5.1+cu124",
+      "xformers": "0.0.28.post3",
+      "numpy": "1.26.4"
+    }
+  },
+  "code_deps": [
+    {
+      "name": "ComfyUI",
+      "repo_url": "https://github.com/comfyanonymous/ComfyUI",
+      "commit": "0123456789abcdef0123456789abcdef01234567",
+      "archive": {
+        "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "size_bytes": 24500000
+      },
+      "install_path": "ComfyUI",
+      "role": "host"
+    },
+    {
+      "name": "ComfyUI-VideoHelperSuite",
+      "repo_url": "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite",
+      "commit": "89abcdef0123456789abcdef0123456789abcdef",
+      "archive": {
+        "sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+        "size_bytes": 1200000
+      },
+      "install_path": "ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite",
+      "role": "extension"
+    }
+  ],
+  "python_lock": {
+    "tool": "uv",
+    "lockfile": {
+      "sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+      "size_bytes": 22118
+    },
+    "wheels_archived": false
+  },
+  "files": [
+    {
+      "path": "ComfyUI/models/checkpoints/wan2.2_i2v_14B_fp8.safetensors",
+      "blob": {
+        "sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+        "size_bytes": 15032385536
+      },
+      "license": {
+        "shareable": true,
+        "spdx": "Apache-2.0",
+        "tag": "permissive",
+        "serving_scope": "open"
+      },
+      "origin_url": "https://huggingface.co/Wan-AI",
+      "kind": "checkpoint"
+    },
+    {
+      "path": "ComfyUI/input/ref_portrait.png",
+      "blob": {
+        "sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+        "size_bytes": 2411520
+      },
+      "license": {
+        "shareable": true,
+        "tag": "permissive",
+        "note": "The user's own material.",
+        "serving_scope": "private"
+      },
+      "kind": "input_asset"
+    }
+  ],
+  "adapters": {
+    "comfyui": {
+      "workflow": {
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "size_bytes": 9812
+      },
+      "workflow_name": "wan22-i2v-720p",
+      "verified_run": {
+        "queue_completed_at": "2026-07-05T14:28:44Z",
+        "duration_seconds": 187.4,
+        "output_samples": [
+          {
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "size_bytes": 8912345
+          }
+        ]
+      }
+    }
+  },
+  "creation": {
+    "cloud": "vast",
+    "region": "us-west",
+    "upload_bandwidth_mbps": 96.3,
+    "agent_version": "0.0.1-manual"
+  }
+}

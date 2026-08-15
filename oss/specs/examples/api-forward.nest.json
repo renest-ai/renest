@@ -1,0 +1,109 @@
+{
+  "format_version": "2.0",
+  "id": "01JAPFRWRD5EEDANCE88888888",
+  "created_at": "2026-07-08T03:20:00Z",
+  "name": "External API forwarding (an example of the honest boundary)",
+  "base_image": {
+    "ref": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "runtime": {
+    "python_version": "3.11.9",
+    "cuda_version": "12.4",
+    "gpu_model": "RTX 4090"
+  },
+  "fingerprint": {
+    "fingerprint_version": "1",
+    "python": {
+      "version": "3.11.9"
+    },
+    "torch": {
+      "version": "2.4.0+cu124",
+      "cuda_version": "12.4"
+    },
+    "os": {
+      "name": "Ubuntu",
+      "version": "22.04.4 LTS"
+    }
+  },
+  "code_deps": [
+    {
+      "name": "ComfyUI",
+      "role": "host",
+      "repo_url": "https://github.com/comfyanonymous/ComfyUI",
+      "commit": "0123456789abcdef0123456789abcdef01234567",
+      "archive": {
+        "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "size_bytes": 24500000
+      },
+      "install_path": "ComfyUI"
+    },
+    {
+      "name": "ComfyUI-Seedance-API",
+      "role": "extension",
+      "repo_url": "https://github.com/example/ComfyUI-Seedance-API",
+      "commit": "fedcba9876543210fedcba9876543210fedcba98",
+      "archive": {
+        "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "size_bytes": 86000
+      },
+      "install_path": "ComfyUI/custom_nodes/ComfyUI-Seedance-API"
+    }
+  ],
+  "python_lock": {
+    "tool": "uv",
+    "lockfile": {
+      "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "size_bytes": 15900
+    }
+  },
+  "files": [
+    {
+      "path": "ComfyUI/input/driving_pose.png",
+      "blob": {
+        "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "size_bytes": 1884160
+      },
+      "license": {
+        "shareable": true,
+        "tag": "permissive",
+        "note": "The user's own material.",
+        "serving_scope": "private"
+      },
+      "kind": "input_asset"
+    }
+  ],
+  "adapters": {
+    "comfyui": {
+      "workflow": {
+        "sha256": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+        "size_bytes": 6400
+      },
+      "workflow_name": "seedance-i2v-api",
+      "verified_run": {
+        "queue_completed_at": "2026-07-08T03:18:52Z",
+        "duration_seconds": 42.7,
+        "output_samples": [
+          {
+            "sha256": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+            "size_bytes": 5320011
+          }
+        ]
+      }
+    }
+  },
+  "api_deps": [
+    {
+      "node_name": "SeedanceVideoGenerate",
+      "service": "seedance-2.0",
+      "endpoint_hint": "...  (the key is never packed; supply your own after rebuilding)",
+      "note": "This node calls an external API to generate video. The byte-for-byte reproduction promise does not cover that dependency: whether it works after a rebuild depends on the provider still existing and on your own key. What is packed is the source and the workflow, not the service."
+    }
+  ],
+  "creation": {
+    "cloud": "runpod",
+    "region": "CN-HK-1",
+    "upload_bandwidth_mbps": 220.4,
+    "agent_version": "0.0.1-manual"
+  }
+}

@@ -1,0 +1,96 @@
+{
+  "format_version": "2.0",
+  "id": "01J8ZY3V7Q2K4M6N8P0R2T4V6X",
+  "created_at": "2026-07-05T10:00:00Z",
+  "name": "Minimal SDXL text-to-image",
+  "base_image": {
+    "ref": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "runtime": {
+    "python_version": "3.11.9",
+    "cuda_version": "12.4",
+    "gpu_model": "RTX 4090"
+  },
+  "fingerprint": {
+    "fingerprint_version": "1",
+    "python": {
+      "version": "3.11.9"
+    },
+    "torch": {
+      "version": "2.4.0+cu124",
+      "cuda_version": "12.4"
+    },
+    "os": {
+      "name": "Ubuntu",
+      "version": "22.04.4 LTS"
+    },
+    "critical_packages": {
+      "torch": "2.4.0+cu124",
+      "torchvision": "0.19.0",
+      "numpy": "1.26.4"
+    }
+  },
+  "code_deps": [
+    {
+      "name": "ComfyUI",
+      "repo_url": "https://github.com/comfyanonymous/ComfyUI",
+      "commit": "0123456789abcdef0123456789abcdef01234567",
+      "archive": {
+        "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "size_bytes": 24500000
+      },
+      "install_path": "ComfyUI",
+      "role": "host"
+    }
+  ],
+  "python_lock": {
+    "tool": "uv",
+    "lockfile": {
+      "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "size_bytes": 18432
+    }
+  },
+  "files": [
+    {
+      "path": "ComfyUI/models/checkpoints/sd_xl_base_1.0.safetensors",
+      "blob": {
+        "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "size_bytes": 6938078334
+      },
+      "license": {
+        "shareable": false,
+        "tag": "rail",
+        "note": "CreativeML Open RAIL++-M: re-hosting counts as distribution, so this is stripped on hand-off.",
+        "serving_scope": "gated"
+      },
+      "origin_url": "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0",
+      "kind": "checkpoint"
+    }
+  ],
+  "adapters": {
+    "comfyui": {
+      "workflow": {
+        "sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+        "size_bytes": 4096
+      },
+      "workflow_name": "sdxl-txt2img-base",
+      "verified_run": {
+        "queue_completed_at": "2026-07-05T09:58:31Z",
+        "duration_seconds": 11.2,
+        "output_samples": [
+          {
+            "sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+            "size_bytes": 1843201
+          }
+        ]
+      }
+    }
+  },
+  "creation": {
+    "cloud": "runpod",
+    "region": "EU-RO-1",
+    "upload_bandwidth_mbps": 840.5,
+    "agent_version": "0.0.1-manual"
+  }
+}

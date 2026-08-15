@@ -1,0 +1,4 @@
+
+# Build products of the rules release, signed or not: not tracked here.
+oss/src/renest/data/*.signed.json
+oss/src/renest/data/*.public.json

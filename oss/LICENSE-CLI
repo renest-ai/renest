@@ -1,0 +1,97 @@
+Renest CLI Source-Available Licence
+Version 1.0, 9 August 2026
+
+Copyright (c) 2026 the Renest authors.
+
+This licence covers the Renest command-line tool and its supporting modules.
+It does NOT cover:
+
+  * the escape hatch (src/renest/escape/), which is Apache-2.0 and always will
+    be — it is the artefact you run when we are gone, so it carries no
+    conditions of ours;
+  * the archive format specifications (specs/), which are Apache-2.0;
+  * the ComfyUI panel, which is a separate repository under GPL-3.0.
+
+Each of those ships with its own licence text. Where this licence and one of
+those disagree about a file, the file's own licence wins.
+
+------------------------------------------------------------------------------
+1. WHAT YOU MAY DO
+------------------------------------------------------------------------------
+
+Subject to section 2, you may use, copy, modify, and redistribute this
+software and works derived from it, for any purpose, with or without charge,
+including inside a business.
+
+You may read the source. You may audit it, fork it, patch it, and run your
+patched copy. You may publish your modifications.
+
+------------------------------------------------------------------------------
+2. THE ONE THING YOU MAY NOT DO
+------------------------------------------------------------------------------
+
+You may not use this software, or any work derived from it, to provide to
+third parties a commercial service that competes with the Renest hosted
+service, and you may not redistribute it for that purpose.
+
+A "commercial service that competes with the Renest hosted service" means
+offering to third parties, for a fee or as part of a paid product, the
+storage, transfer, deduplication, cataloguing, or transfer-of-custody of
+machine environments or their component files, where this software or a
+derivative of it provides a material part of that offering.
+
+Everything else is permitted. In particular, none of the following is
+competing: internal use inside any organisation of any size; consulting or
+support work where the customer runs the software themselves; teaching;
+research; packaging this software for a distribution; or building tools that
+interoperate with it.
+
+------------------------------------------------------------------------------
+3. THE PERMANENT CARVE-OUT (this one cannot be taken away)
+------------------------------------------------------------------------------
+
+Any individual may, permanently and unconditionally, use this software to
+pack, sign links for, restore, verify, and export THEIR OWN data.
+
+This permission does not depend on the continued existence of the Renest
+project, of any company operating it, on you holding an account, on an account
+being in good standing, or on anything else. It survives the discontinuation
+of the hosted service and the dissolution of its operator. Nothing elsewhere
+in this licence, and no later version of it, may narrow this section for a
+copy you already have.
+
+The reason this section exists: the whole point of the software is that a
+setup you got working can be brought back later. A right to your own data that
+lapses when we do is not a right.
+
+------------------------------------------------------------------------------
+4. NOTICES
+------------------------------------------------------------------------------
+
+If you redistribute this software or a derivative, keep this licence file and
+the copyright notice with it, and state plainly what you changed.
+
+------------------------------------------------------------------------------
+5. NO WARRANTY
+------------------------------------------------------------------------------
+
+The software is provided "as is", without warranty of any kind, express or
+implied, including but not limited to the warranties of merchantability,
+fitness for a particular purpose, and non-infringement. In no event shall the
+authors or copyright holders be liable for any claim, damages, or other
+liability, whether in an action of contract, tort, or otherwise, arising from,
+out of, or in connection with the software or the use or other dealings in the
+software.
+
+------------------------------------------------------------------------------
+6. IF SECTION 2 IS UNENFORCEABLE WHERE YOU ARE
+------------------------------------------------------------------------------
+
+If a court of competent jurisdiction holds section 2 unenforceable, that
+holding does not affect sections 3, 4, or 5, which remain in force.
+
+------------------------------------------------------------------------------
+
+This licence grants no rights in trade marks. "Renest" is a trade mark of its
+owner; this licence does not permit you to use it to name your fork or your
+service.

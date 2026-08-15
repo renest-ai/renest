@@ -1,0 +1,28 @@
+{
+  "apache-2.0": {
+    "sha256": "074e6e32c86a4c0ef8b3ed25b721ca23aca83df277cd88106ef7177c354615ff",
+    "size_bytes": 10280,
+    "source": "https://raw.githubusercontent.com/spdx/license-list-data/main/text/Apache-2.0.txt"
+  },
+  "mit": {
+    "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5",
+    "size_bytes": 1078,
+    "source": "https://raw.githubusercontent.com/spdx/license-list-data/main/text/MIT.txt"
+  },
+  "cc-by-4.0": {
+    "sha256": "d557539df68e771cc1eedcc91d13f70fca930e508d11eedcafa4b15db49e3744",
+    "size_bytes": 17023,
+    "source": "https://raw.githubusercontent.com/spdx/license-list-data/main/text/CC-BY-4.0.txt"
+  },
+  "openrail++": {
+    "sha256": "19b6998b569b53ac1fc2158a8a3202c8699a9a4605b47075715d9c96be7fb6d0",
+    "size_bytes": 14109,
+    "source": "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/raw/main/LICENSE.md"
+  },
+  "creativeml-openrail-m": {
+    "sha256": "be351ebe7ac01bcdbb018639aadcfd38f136b7dc3f2a3d4d3a24db51d1b210ef",
+    "size_bytes": 14385,
+    "source": "https://raw.githubusercontent.com/CompVis/stable-diffusion/main/LICENSE",
+    "note": "The model author's own source repository; the third line is the CreativeML Open RAIL-M licence, including its use-restriction annex."
+  }
+}

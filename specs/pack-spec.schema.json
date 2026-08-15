@@ -1,0 +1,181 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ai.renest.pack-spec",
+  "schema_version": "1.1",
+  "x-version-policy": "Versioning discipline, the same rule as the manifest. **This project's actual precedent is that additive changes bump the minor version too** (2.0 to 2.1 added a single optional field and still got a number), because the version has to answer \"which revision is this\", not only \"can you read it\". So: adding an optional field = minor bump; changing a field's meaning, adding a required field, or narrowing an enum = minor bump plus the fixed change procedure; a breaking change = major bump. Reader obligations match the manifest: within one major version an unrecognised optional field must be ignored and must not cause rejection; a different major version is refused explicitly and clearly.",
+  "title": "pack-spec — the input list for `renest pack --spec`",
+  "description": "The shape of packing input. It governs **the list handed to the packer**, not the manifest that comes out -- that belongs to `manifest.schema.json`. Strictness trade-off: the top level tolerates extra keys (a key the packer does not read is harmless); `role` is a closed enum, word-for-word identical to `manifest.schema.json` and pinned by a consistency test -- change one side and you must change the other. **`kind` stopped being closed in format 2.7**: an enumerated list cannot keep up with an open ecosystem, so it is now an open string sharing that file's shape rule (lower case, digits, underscores, 64 characters at most), also pinned by the same test. A real incident from when it was closed: hand-writing `kind: \"text_encoder\"` (the name that carries the shared-part licence rule is `clip`) cost a paid cloud run before it blew up. That class of mistake can no longer be refused here, so the linter warns about it instead and `renest pack` prints the warning before anything is rented.\n\n**1.1 (2026-08-13)** -- purely additive, two optional fields, so every existing pack-spec still validates: `python_lock.from_environment` (already in use, never written down until now) and `python_lock.from_installed` (new -- for an environment whose own Python cannot be run on the packing machine). Neither reaches the nest: both are resolved into a real lock file while packing.",
+  "type": "object",
+  "required": [
+    "name"
+  ],
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "base_image": {
+      "type": "object",
+      "properties": {
+        "ref": {
+          "type": "string"
+        },
+        "digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "properties": {
+        "python_version": {
+          "type": "string"
+        },
+        "cuda_version": {
+          "type": "string"
+        },
+        "gpu_model": {
+          "type": [
+            "string",
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "GPU of the packing machine. Either a string, or a list of candidates (a harness may offer candidates in price order and let the provider pick whichever is in stock, in which case the output is a list). Relaxed to allow the list form after calibrating against 14 real historical pack specs."
+        }
+      }
+    },
+    "code_deps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "install_path"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "role": {
+            "enum": [
+              "host",
+              "extension",
+              "user_code"
+            ],
+            "description": "`host` = the application that gets run; `extension` = something installed into it (a ComfyUI plugin); `user_code` = the user's own scripts. Stated explicitly, never guessed from the path."
+          },
+          "repo_url": {
+            "type": "string"
+          },
+          "commit": {
+            "type": "string"
+          },
+          "install_path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "exclude": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Paths excluded from this source archive. Semantics: entries are anchored to the archive root -- `exclude: ['models']` removes only the top-level `models/` and leaves deeper directories that happen to share the name (such as `comfy/ldm/models/`) alone. Measured the hard way on an early real run: matching a bare name globally also stripped source code, producing a nest that verified green by hash and died on start-up. Ordinary junk (`.git`, `__pycache__`) is removed automatically and need not be declared."
+          },
+          "post_install": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "python_lock": {
+      "type": "object",
+      "description": "Where the dependency list comes from. Exactly one of the three ways: `lockfile_path` names a lock file already in the environment; `from_environment` names an interpreter to ask; `from_installed` names an installed-packages folder to read off disk. The last two are resolved during packing and never appear in the nest — the nest always carries a real lock file.",
+      "properties": {
+        "tool": {
+          "const": "uv"
+        },
+        "lockfile_path": {
+          "type": "string"
+        },
+        "from_environment": {
+          "type": "object",
+          "description": "Ask this interpreter what it has installed. For environments that ship no lock file at all (the ComfyUI desktop build is one).",
+          "required": [
+            "python"
+          ],
+          "properties": {
+            "python": {
+              "type": "string",
+              "description": "Path to the interpreter that runs this environment."
+            }
+          }
+        },
+        "from_installed": {
+          "type": "object",
+          "description": "Read the installed packages' own metadata files instead of running anything. The last resort, for an environment whose interpreter cannot be run on the packing machine — a shared all-in-one bundle carrying its own Windows Python, packed from elsewhere. Weaker than asking the interpreter: a package installed from a source folder cannot be expressed this way.",
+          "required": [
+            "site_packages"
+          ],
+          "properties": {
+            "site_packages": {
+              "type": "string",
+              "description": "Path to the site-packages folder to read."
+            }
+          }
+        }
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_]*$",
+            "maxLength": 64,
+            "description": "Asset type; **an open string since format 2.7**, with the same shape rule as `manifest.schema.json` (lower case, digits and underscores, 64 characters at most) and no list of permitted values.\n\nOnly four values mean anything to a program: `clip`/`vae`/`tokenizer` mark a **shared part**, whose licence record must not speak for a base model, and `input_asset` marks the user's own material. Everything else is a label for people to read.\n\n**The value most often got wrong by hand is still worth knowing: the name that carries the shared-part rule for a text encoder is `clip`, not `text_encoder`.** Writing the latter is no longer refused -- an open ecosystem cannot be chased with a list -- so the linter says so as a warning instead."
+          },
+          "license": {
+            "type": [
+              "string",
+              "object",
+              "null"
+            ],
+            "description": "Licence. Both real forms are accepted: a string (for example `'Apache-2.0'`), or the result object of a licence adjudication (`shareable` / `serving_scope` / `tag` / `note`, which is what the adjudication code produces). This schema was first written to accept only a string and went red the moment it was checked against a real pack spec -- so it was relaxed to match reality, and the lesson recorded: **a new schema does not count until it has been calibrated against real historical output.**"
+          },
+          "origin_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sha256": {
+            "not": {},
+            "description": "Do not fill in hashes by hand -- the packer computes them. A hand-written hash overwrites the truth."
+          }
+        }
+      }
+    },
+    "adapters": {
+      "type": "object"
+    },
+    "creation": {
+      "type": "object"
+    }
+  }
+}

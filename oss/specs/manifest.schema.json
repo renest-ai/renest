@@ -1,0 +1,1109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://renest.ai/schemas/manifest.v2.json",
+  "title": "Renest Nest Manifest v2.7",
+  "description": "A complete, self-contained description of one run that was verified to work.\n\nCore fields are scenario-neutral; anything specific to a particular tool lives under the `adapters.*` namespace. The core layer never names a specific tool. Any change to this format must bump the version and update the escape-hatch script and the linter in the same change.\n\n**Reader obligations (fixed in 2.3).** Within one major version (2.x), a reader that meets an optional field it does not recognise MUST ignore it and MUST NOT reject the nest; a reader that meets a newer minor version than it knows MUST warn and continue rather than refuse. Strict validation is the linter's job, not the restore path's. Across major versions, refuse: a major bump means breaking changes, and guessing is just guessing. This is not laxness -- it repairs a real failure, where a purely additive minor bump still caused the escape hatch to reject perfectly good nests.\n\n**v2.3 (2026-08-08)** -- final-shape release, purely relaxing and purely additive; every 2.0/2.1/2.2 nest still reads. Five changes: (1) `base_image` becomes optional (a container cannot see its own image name, and rebuilding does not need it); (2) `python_lock.lockfile` becomes optional (a packer that finds no lockfile says so instead of inventing one); (3) `fingerprint.os.machine` added (CPU architecture of the packing machine -- ARM GPU instances now exist on the major clouds, and x86 wheel URLs and images are worthless there while the error message points nowhere near the real cause); (4) the wording for `gpu.torch_cuda_arch_list` changes from \"will fail\" to \"will probably fail\"; (5) a reserved in-nest path for the escape-hatch script (see `files[].path`).\n\n**v2.0 (2026-07-26)** -- widened the format to cover fine-tuning frameworks alongside image generation. Four changes: (1) `files[].root` -- assets no longer have to live under the environment root; three controlled roots (`env`, `hf_hub`, `hf_home`), the latter two each carrying a path allowlist in the schema itself, because the two ways of getting this wrong are not symmetric: a missing allowlist entry means a rebuild is short one file and the user notices, while a missing denylist entry means a user's dataset gets uploaded and nobody notices. (2) `entrypoint` -- how the working run was started, externalised. (3) `code_deps[].role` becomes required and `repo_url`/`commit` become optional (a fine-tuning user's config and launch script are often in no git repository at all). (4) `adapters` opens up under control: known adapters validate strictly, unknown keys pass through as opaque objects, so supporting a fourth framework needs no version bump.\n\n**1.x nests are refused outright**, and must be refused with a clear \"unsupported version\", not a crash somewhere else. Within 2.x everything reads. The authoritative list of accepted versions is the `format_version` enum below -- do not restate it in prose, or there are two sources of truth and one of them will go stale.",
+  "type": "object",
+  "required": [
+    "format_version",
+    "id",
+    "created_at",
+    "runtime",
+    "code_deps",
+    "python_lock",
+    "files"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": {
+      "enum": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7"
+      ],
+      "description": "Format version of this nest. **This enum is the single source of truth for the version list**; do not copy it anywhere else.\n\nOnly 2.x is accepted; 1.x nests are refused.\n\n**2.2 (2026-07-29)** -- eight fields added at once, so that poisoning disclosure and licence adjudication shipped in a single release. Every version bump requires a human to run the escape hatch end to end by hand, and splitting the release would mean doing that twice.\n\n**2.3 (2026-08-08)** -- purely relaxing and purely additive: two required fields become optional (`base_image`, `python_lock.lockfile`), one optional field is added (`fingerprint.os.machine`), plus two wording corrections and the reserved in-nest path for the escape hatch. Nothing was tightened, so all older nests still read.\n\n**2.4 (2026-08-11)** -- purely additive, all optional, so older nests still read. Machine facts that measurement showed do change from machine to machine: how much video memory a run was seen to use (with the sampling interval and the number of readings beside it, because the figure means nothing alone), whether the machine shares video memory with the system, how many cards there are and whether they can reach each other, the C library version, and the platform tag. Plus one reserved field, `derived_from`, for a feature not yet built.\n\nWhy these and not others: every field here was picked by enumerating what four machines could report and keeping only what actually differed between them -- not by listing what seemed likely to matter. Fields whose meaning is still unclear were left out on purpose.\n\n**Versioning discipline:** additive changes bump the minor version too. 2.0 to 2.1 added a single optional field and still got a number. The version answers \"which revision is this\", not only \"can you read it\".\n\n**2.5 (2026-08-11)** -- one optional field, plus two wording corrections; purely additive, so every 2.0-2.4 nest still reads. The field records **how** a machine's GPUs reach each other, because recording only *whether* they do turned out to hide the difference that matters. Measured on four machines the same night: two of them both answered \"yes\", but one had a dedicated 25 GB/s link between the cards and the other merely shared the PCIe bus. For the question people actually ask -- can these two cards act as one bigger card -- those are not the same answer.\n\nWhy a whole version for one field: the rule on this page is that an optional addition still gets a number (2.0 to 2.1 did). Editing 2.4 in place would leave one number describing two different formats.\n\n**2.6 (2026-08-12)** -- purely additive, all optional, so every 2.0-2.5 nest still reads. Four fields, all of the same kind: **something packing knew and then threw away**. Where the recipe file sat (`adapters.comfyui.workflow_path`) and where the dependency lock sat (`python_lock.lockfile_path`), so a rebuild can put them back instead of parking them in a staging folder; what packing deliberately left out of each source archive (`code_deps[].exclude`), so a recipient can tell a complete source tree from a trimmed one; and which operating-system libraries the successful run needed from the machine (`runtime.native_libs`), because those belong to the distribution and cannot travel inside the nest -- a machine missing one restores every byte and still loses whole plugins.\n\nWhy four at once and not one at a time: the expensive part of a version bump is not the field. It is the eight-step checklist, keeping both copies of the escape hatch byte-identical, and a human running the whole thing on a real machine afterwards. Splitting these would have paid that twice.\n\n**2.7 (2026-08-12)** -- one change, purely relaxing: `files[].kind` stops being a closed list of categories and becomes an open string with a shape constraint. Every value that was legal before is still legal, so every 2.0-2.6 nest reads unchanged.\n\nWhy: that field's only job is to mark which files are a **shared part** whose licence must not speak for a base model, and one closed list was being asked to keep up with an open ecosystem. Three assets met while building a deliberately messy test nest on 2026-08-12 had no honest slot -- the models of a top-five image-generation extension, quantised weights, and video-model weights; the last two could only be filed as `checkpoint`, which is not what they are. Each miss cost a whole version bump, and a version bump costs the eight-step checklist, two byte-identical copies of the escape hatch, and a human running it on a real machine.\n\n**Reader obligation: a value you do not recognise is an ordinary asset.** Never refuse a nest over it, never guess what it means, and show it exactly as written. Only `clip`/`vae`/`tokenizer` (shared parts) and `input_asset` (the user's own material, never packed) carry behaviour; every other value is a label for people to read."
+    },
+    "id": {
+      "type": "string",
+      "description": "Unique identifier for the nest. A ULID is recommended.",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "name": {
+      "type": "string",
+      "maxLength": 120,
+      "description": "Human-chosen name."
+    },
+    "base_image": {
+      "type": "object",
+      "description": "The foundation the environment sits on: the container image. Pinned by digest (the content fingerprint the registry computed for this image); the tag (something like `:2.4.0`) is a human-readable hint only.\n\n**Optional since v2.3, but the format of the two sub-fields is unchanged.** Why it was relaxed: a container cannot see its own image name, so the packer cannot ask for it -- while the rebuild does not need it at all. Making it required forced packers to write placeholder text, and placeholder text does not satisfy this schema's own `^sha256:[a-f0-9]{64}$` check. The honest fix was on this side.\n\n**Packing rule: if you cannot obtain it, omit the whole block. Never write a placeholder.** Same discipline as `repo_url`/`commit` below -- not knowing is expressed by absence, not by the words \"fill this in\".\n\n**Two honest notes about longevity, stated in the format itself:**\n1. **The image bytes are not archived.** What the nest stores is the record of which image the run sat on, not the image itself. So the system layer of a rebuild -- OS, drivers, CUDA runtime -- depends on the image still being available upstream; if it is deleted or overwritten, this field is only of archaeological value. Same character as the `pinned_wheel_urls` disclosure: archive what can be archived, say plainly what cannot, never pretend the coverage is total.\n2. **For a multi-architecture image this records the platform digest, not the index digest.** One tag covers a different image on x86 and on ARM, with an index layer above them, each with its own fingerprint. Record whichever one you actually obtained (`digest_kind` says which) -- do not convert and do not guess. Get the layer wrong and pulling by that digest fetches a different architecture, and that failure mode's error message points nowhere near the cause.",
+      "required": [
+        "ref",
+        "digest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "ref": {
+          "type": "string",
+          "description": "For example `runpod/pytorch:2.4.0-py3.11-cuda12.4`. **No placeholder text** -- if it cannot be determined, omit the whole `base_image` block."
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$",
+          "description": "The content fingerprint computed by the registry. **Still required inside the block, with the format unchanged** -- v2.3 relaxed \"this block may be absent entirely\", not \"it may be present but half-filled\". Half a foundation misleads worse than none: downstream will try to pull an image that cannot be found."
+        },
+        "digest_kind": {
+          "type": "string",
+          "enum": [
+            "platform",
+            "index"
+          ],
+          "description": "Which layer the digest above refers to (optional, added in v2.3). `platform` = the digest of the image for one specific CPU architecture (**this is the one you want**); `index` = the digest of the index that ties several architectures together.\n\n**Why the distinction matters:** a multi-architecture tag covers both an x86 and an ARM image, and both layers' fingerprints look identical (`sha256:` plus 64 hex characters) -- you cannot tell them apart by value. Without this field, downstream may pull the wrong architecture. **Record whichever layer you actually got; if you cannot tell, omit this field.**"
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "required": [
+        "python_version"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "python_version": {
+          "type": "string",
+          "pattern": "^3\\.\\d+\\.\\d+$"
+        },
+        "cuda_version": {
+          "type": "string"
+        },
+        "gpu_model": {
+          "type": "string",
+          "description": "GPU present at creation time, e.g. RTX 4090. Informational; not a rebuild constraint."
+        },
+        "driver_version": {
+          "type": "string"
+        },
+        "libc_version": {
+          "type": "string",
+          "description": "C library version of the packing machine, e.g. `2.35`.\n\nWhy it is here: pre-built Python wheels are chosen against it, so a nest packed on a newer C library can hold wheels an older machine cannot install. Measured spread across four machines: 2.35 and 2.39.\n\nAdvisory only -- warn, never refuse."
+        },
+        "platform_tag": {
+          "type": "string",
+          "description": "Platform tag of the packing machine's Python, e.g. `linux-aarch64`.\n\nRead together with the Python and C library versions, this is what decides whether a given pre-built wheel can install at all. **The authority is the tag, not the C library alone** -- one machine reported 690 acceptable tags, and the C library is only one of the things that shapes that list.\n\nAdvisory only -- warn, never refuse."
+        },
+        "native_libs": {
+          "type": "object",
+          "description": "Which operating-system libraries the successful run needed the machine to provide (v2.6).\n\n**Why the format carries this:** these libraries belong to the machine's distribution, not to the nest, so they cannot be packed. A rebuild where one is missing restores every byte correctly and still loses whole plugins -- measured 2026-08-12, an image with no graphics libraries restored green, the app started and answered, and two extensions were skipped with nothing but a warning buried in the app's own log. Recording the list is what lets a reader say so **before** the user spends the download.\n\n**Names are copied exactly as the program asked for them, and are normalised in neither direction.** Measured 2026-08-12 on two chip families: most entries name a file that does not exist under that name -- what is asked for is `libcuda.so.1` while the file on disk carries the driver version, and one package asks for a name that already carries a minor version.",
+          "additionalProperties": false,
+          "required": [
+            "method",
+            "names"
+          ],
+          "properties": {
+            "method": {
+              "enum": [
+                "loaded",
+                "declared"
+              ],
+              "description": "How the list was collected. **A reader must branch on this**, because the two are not the same kind of statement.\n\n`loaded` = the running application was asked what it had actually loaded. This is the authoritative list: everything on it was genuinely in use by the run that worked, so **a reader may refuse a rebuild when one of these is missing**.\n\n`declared` = fallback: the compiled files in the installed packages were read for the dependencies they declare. Used whenever no running process could be established as the application of the run that worked -- either none was found, or what one had loaded did not look like that run (measured 2026-08-12: packing is normally started from inside the environment it is packing, so a naive match caught **the packing tool itself** and recorded its own C-library entries as the run's). **A thin authoritative list is more dangerous than an honest fallback**, so anything short of proof lands here. Measured 2026-08-12, that covers 44-68% of what was really loaded, and it also lists libraries that are never loaded at all -- one machine was missing four of them while producing images perfectly well. So **`declared` may only ever warn, never refuse**."
+            },
+            "names": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "The library names, exactly as asked for. Machine-provided only: a library that the nest carries itself is not listed, and **which is which is decided by where it actually loaded from at pack time, never by looking the name up**. Measured twice on two chip families: one common compression library sits under the same name inside an installed package while the run loaded the machine's copy, so a name lookup gets it wrong every time."
+            }
+          }
+        }
+      }
+    },
+    "gpu": {
+      "type": "object",
+      "description": "GPU generation block. This is what distinguishes the \"files match byte for byte but the kernel will not load\" class of failure. Optional: omit the whole block when the packing machine has no GPU tooling. The agent uses it for a blocking pre-flight check; the escape hatch only reports.",
+      "additionalProperties": false,
+      "properties": {
+        "captured_on": {
+          "type": "object",
+          "description": "Model and architecture of the packing machine's GPU.",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "For example `NVIDIA RTX A4000`."
+            },
+            "sm_arch": {
+              "type": "string",
+              "description": "For example `sm_86`.",
+              "pattern": "^sm_[0-9]+$"
+            },
+            "cuda_compute": {
+              "type": "string",
+              "description": "Compute capability, e.g. `8.6`.",
+              "pattern": "^[0-9]+\\.[0-9]+$"
+            }
+          }
+        },
+        "torch_cuda_arch_list": {
+          "type": "array",
+          "description": "The GPU generations the packing environment's PyTorch build actually contains compiled code for.\n\nHow the pre-flight check uses it: if the target machine's GPU generation is absent from this list *and* newer than the highest entry, the rebuild will **probably** hit a \"no kernel image\" failure.\n\n**v2.3 changed \"certainly\" to \"probably\" and states the real mechanism. This is a wording correction, not a behaviour change.**\n\n**What actually makes newer cards work is binary compatibility within a generation:** code compiled for an earlier step of the same generation runs on newer cards of that generation; across generations it does not. Confirmed by sampling real hardware (2026-08-08): a card reporting `sm_121` ran fine on a PyTorch build whose highest compiled target was `sm_120` and which did not list `sm_121` at all.\n\n**Do not rely on intermediate PTX code.** In principle a package can also ship an intermediate representation that the driver compiles on the spot; in practice the same sampling found no PTX at all in mainstream PyTorch's CUDA libraries. It is a rare fallback, not the normal explanation, and writing it up as the normal explanation makes readers count on something that is usually absent.\n\n**Consequently no field records PTX targets, and adding one is not recommended** -- it would be empty in mainstream cases, and an always-empty field only enlarges the format. Compare compiled targets (this field) **within a generation**.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "min_vram_gb": {
+          "type": "number",
+          "description": "Performance expectation only; takes no part in deciding success or failure.\n\n**Never written by the packer, on purpose** -- how much video memory the packing machine happened to have is not a requirement: an 80 GB card can pack a nest a 8 GB card would run. For what a run was actually seen to use, read `observed_use` instead.\n\n**2.4 note:** kept for nests that already carry it. Nothing writes it today."
+        },
+        "observed_use": {
+          "type": "object",
+          "description": "How much video memory a run was **seen** to use, sampled from outside while it ran.\n\n**This is an observed maximum, not a high-water mark.** The application keeps no counter of its own and the sampler is a separate process, so all it can do is ask how much memory is free every few seconds and keep the largest use it saw. Readings that far apart can miss a short burst, so the true high point can only be higher, never lower.\n\n**Therefore all three fields are required together.** The figure alone is misleading, and measurement showed exactly how: one run reported 3523 MiB from 68 readings (meaningful), another reported 1 MiB from 5 readings because it crashed before touching the card at all. A reader given only \"1 MiB\" would conclude the job needs almost no video memory.\n\n**A shortfall against this figure may only warn, never turn a machine away** -- it is a floor that is too low by design.\n\n**Absent means not measured. It does not mean the run needs none.** On a machine that shares video memory with the system, the usual query returns nothing at all, so absence is the normal case there, not an error.",
+          "additionalProperties": false,
+          "required": [
+            "max_used_bytes",
+            "sample_interval_s",
+            "samples"
+          ],
+          "properties": {
+            "max_used_bytes": {
+              "type": "integer",
+              "description": "Largest use seen across the readings, in bytes, for the busiest card.",
+              "minimum": 0
+            },
+            "sample_interval_s": {
+              "type": "number",
+              "description": "Seconds between readings. Required beside the figure: it is what tells a reader how big a burst could have slipped through.",
+              "exclusiveMinimum": 0
+            },
+            "samples": {
+              "type": "integer",
+              "description": "How many readings answered. A small count means the figure is weak evidence -- see the 1 MiB case in this block's description.",
+              "minimum": 1
+            }
+          }
+        },
+        "shares_system_memory": {
+          "type": "boolean",
+          "description": "True when the machine has no separate video memory and draws from system memory instead.\n\nWhy it has to be recorded next to any memory figure: on such a machine the reported total is the whole system memory (measured: 121.7 GiB on one), and the usual per-card query returns nothing. A memory figure measured there is not comparable with one from a machine that has its own card.\n\nOmitted when nothing in the reading says either way -- a guess here would put a wrong flag in the archive, and a wrong flag is worse than an empty one."
+        },
+        "device_count": {
+          "type": "integer",
+          "description": "How many GPUs the packing machine had.\n\nWhy it matters: a training recipe can pin the work across several cards, and rebuilding that on one card fails. Absent means unknown -- treat as one.",
+          "minimum": 1
+        },
+        "peer_access": {
+          "type": "boolean",
+          "description": "On a machine with several cards, whether they can reach each other's memory directly.\n\n**Card count alone misleads, and measurement showed why:** a machine with two 24 GB cards reported no direct link between them in either direction, so those two are not one 48 GB pool, and a recipe that splits a model across them fails even though the count looks right.\n\n**It must be measured, never inferred.** Two machines were tested, both with their cards merely on the PCIe bus and no direct bridge fitted: on the pair of consumer cards the link was **off**, on the pair of workstation cards of the same memory size it was **on**. Same layout, opposite answer -- so reading this off the card count, the bus topology, or whether a bridge is present would have been wrong on one of the two.\n\nOmitted on a single-card machine, or when it was not probed.\n\n**v2.5: read this together with `peer_link`.** On its own it hides the difference that matters -- two pairs of cards both answered \"yes\" here while one had a dedicated 25 GB/s link and the other only shared the PCIe bus."
+        },
+        "total_bytes_rounded_gib": {
+          "type": "number",
+          "description": "Video memory per card, **rounded to whole GiB on purpose**.\n\nWhy rounded: two machines carrying the same card model reported totals 7 MB apart (12,478,906,368 against 12,486,246,400), because reserved amounts differ by host. Compared byte for byte, two identical cards look different. Round first, compare after."
+        },
+        "package_native_archs": {
+          "type": "array",
+          "description": "**Per-binary GPU targets for the pre-compiled extensions among the Python dependencies.** Same idea and same honesty rule as `node_native_archs` (if the target cannot be probed, it is not recorded), applied to packages installed by pip.\n\nWhat measurement on real hardware established:\n1. **Record per shared object, not per package** -- different binaries inside one package can carry different targets.\n2. **Reading PyTorch alone is wrong in both directions.** One attention library shipped a binary built only for `sm_90`, far narrower than PyTorch; a quantisation library shipped binaries covering targets *wider* than PyTorch's list. The most striking case: a library's main binary covered `sm_60/70/75/80/90` and **omitted `sm_86`** -- which was the packing machine's own GPU. That is precisely the \"byte-identical yet will not run\" class.\n3. **Being unable to probe is normal, not exceptional** -- roughly three in five binaries yield nothing: pure-CPU libraries, non-NVIDIA variants, C++ glue. Honest omission is a required branch, not an optional one.\n4. **Note for consumers:** a package may ship one binary per CUDA version and pick at runtime, so you cannot naively intersect every entry of a package. The pre-flight check should intersect only the ones that would actually be loaded.",
+          "items": {
+            "type": "object",
+            "required": [
+              "package",
+              "path",
+              "sm_list"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "package": {
+                "type": "string",
+                "description": "Owning Python package, e.g. `xformers`, `bitsandbytes`, `torch`."
+              },
+              "path": {
+                "type": "string",
+                "description": "Path of the shared object relative to `site-packages`."
+              },
+              "sm_list": {
+                "type": "array",
+                "description": "Compiled GPU targets found by probing the binary.",
+                "items": {
+                  "type": "string",
+                  "pattern": "^sm_[0-9]+$"
+                }
+              }
+            }
+          }
+        },
+        "node_native_archs": {
+          "type": "array",
+          "description": "GPU targets of pre-compiled binaries vendored by extensions and kept as-is. Best-effort probing; if nothing can be read, nothing is recorded (honest omission, never invention). Same pre-flight purpose as `torch_cuda_arch_list`, aimed at binaries an extension brought with it and for which no source build path exists.",
+          "items": {
+            "type": "object",
+            "required": [
+              "code_dep",
+              "path",
+              "sm_list"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "code_dep": {
+                "type": "string",
+                "description": "The `code_deps[].name` this belongs to."
+              },
+              "path": {
+                "type": "string",
+                "description": "Path of the shared object relative to the environment root."
+              },
+              "sm_list": {
+                "type": "array",
+                "description": "Compiled GPU targets found by probing the binary.",
+                "items": {
+                  "type": "string",
+                  "pattern": "^sm_[0-9]+$"
+                }
+              }
+            }
+          }
+        },
+        "peer_link": {
+          "type": "string",
+          "enum": [
+            "nvlink",
+            "pcie"
+          ],
+          "description": "On a machine with several cards, **what carries the traffic between them** (v2.5).\n\n`nvlink` = a dedicated link between the cards; `pcie` = they only share the host bus.\n\n**Why this is not the same question as `peer_access`, measured on four machines:** two pairs both reported that the cards could reach each other -- one over a dedicated link (12 links per card at 25 GB/s each, the topology map showing them bundled), the other over PCIe alone. A third pair sat across the CPU interconnect and could not reach each other at all; a fourth, consumer pair, had the capability switched off by its driver. So neither field predicts the other, and **only the pair of them answers \"can these two cards act as one bigger card\"**.\n\nRead from the driver tool's topology map: a marker like `NV4` between two cards means a dedicated link; `PHB` / `NODE` / `SYS` mean the host bus or worse. Omitted on a single-card machine, or when the map could not be read -- **absent is not `pcie`**."
+        }
+      }
+    },
+    "fingerprint": {
+      "type": "object",
+      "description": "Environment fingerprint, first layer: used for a success-likelihood check before restoring. It carries only scenario-neutral, functionally reproducible fields. Its job is \"can this be installed at all\", which does not overlap with the recipe fields describing \"what to install\" -- so the host application's commit is not repeated here; `code_deps[].commit` already pins it, and recording it twice creates two sources of truth. Collected after packing completes and the application has started cleanly. The escape hatch reports without blocking; graded blocking lives in the agent.",
+      "required": [
+        "fingerprint_version",
+        "python"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "fingerprint_version": {
+          "const": "1"
+        },
+        "python": {
+          "type": "object",
+          "required": [
+            "version"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "version": {
+              "type": "string",
+              "description": "For example `3.11.9`."
+            }
+          }
+        },
+        "torch": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The single most common cause of extension conflicts.",
+          "properties": {
+            "version": {
+              "type": "string",
+              "description": "For example `2.4.1+cu121`."
+            },
+            "cuda_version": {
+              "type": "string",
+              "description": "CUDA version PyTorch was built against, e.g. `12.1`."
+            }
+          }
+        },
+        "os": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            },
+            "machine": {
+              "type": "string",
+              "description": "CPU architecture of the packing machine (optional, added in v2.3), taken from Python's `platform.machine()`; values look like `x86_64` (most cloud hosts) or `aarch64` (ARM).\n\n**Why it exists:** ARM GPU instances are now sold on the major clouds. Across architectures, the pinned wheel URLs in the lockfile and the recorded container image are all void -- and the resulting error **points nowhere near the real cause**: the user sees a package that will not install or a library that will not load, and does not think \"this machine's chip is not the same kind as the original\".\n\n**Crossing chip families is a certain failure, not a risk.** Python dependency binaries are built per chip family, one build per family; an archive packed on an x86 machine simply will not install on an ARM one. So the right strength for a consumer of this field is a **hard stop**, not a \"heads up, you may continue\" -- continuing has only one outcome.\n\n**This version only records the fact; the hard stop belongs to the pre-flight check and is not implemented yet.** The record itself takes no part in deciding success or failure. **If it cannot be determined, omit the field** -- the same honesty rule used throughout this format."
+            }
+          }
+        },
+        "critical_packages": {
+          "type": "object",
+          "description": "Versions of packages known to break rebuilds. Key = package name, value = version.",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "code_deps": {
+      "type": "array",
+      "description": "Code dependencies: the host application, its extensions, and the user's own scripts and config. Source is archived in full, so a rebuild does not depend on upstream still existing. Since v2.0 it is no longer assumed that every entry comes from a git repository.",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "role",
+          "archive",
+          "install_path"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "host",
+              "extension",
+              "user_code"
+            ],
+            "description": "Required since v2.0; three scenario-neutral values (deliberately not named after any one tool). `host` = the application that gets run; `extension` = something installed into the host; `user_code` = the user's own scripts and config, usually in no git repository. Making it required is what let consumers delete the path-sniffing heuristic that used to guess the role from the install path."
+          },
+          "repo_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Optional since v2.0: a fine-tuning user's dataset config and launch script are frequently in no git repository. The escape hatch never clones -- it unpacks by content hash -- so making this optional does not weaken the rule that the escape hatch depends on nothing of ours."
+          },
+          "commit": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{40}$",
+            "description": "Optional since v2.0, for the same reason as `repo_url`."
+          },
+          "archive": {
+            "$ref": "#/$defs/blob",
+            "description": "Archived copy of that source tree."
+          },
+          "install_path": {
+            "type": "string",
+            "description": "Install path, relative to the environment root."
+          },
+          "post_install": {
+            "type": "string",
+            "description": "Post-install command specific to this dependency. Use sparingly."
+          },
+          "exclude": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What packing deliberately left out of this source archive (v2.6). Copied from the pack spec, plus anything packing decided to drop by itself (compiled `.so` files it expects to be rebuilt, and `build/`).\n\n**This is disclosure, not an instruction.** A reader unpacks the archive as it is; nothing here is replayed. It exists because without it **nobody can tell a complete source tree from a trimmed one**: same repository, same commit, one directory missing, and the manifest looks perfectly healthy. The pack spec's own note records the run this cost us -- a bare name matched globally stripped source directories too, and the nest verified green by hash and died on start-up.\n\nEntries mean what they mean in the pack spec: anchored to the archive root. Ordinary junk (`.git`, `__pycache__`) is removed automatically and is not listed."
+          },
+          "upstream_match": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Whether this code **matches the upstream version it claims to be** (v2.2).\n\n**This is the one line of disclosure that catches \"take a popular extension and add three lines\"** -- which is the most typical poisoning technique there is.\n\n`no_upstream` is an honest value, not a failure: a fine-tuning user's config and launch script legitimately live in no git repository. **When no repository identity can be established, omit the whole block rather than guess** -- a directory without its own repository metadata will otherwise resolve to an enclosing repository and attribute the host's identity to an extension, and wrong provenance is more dangerous than none.",
+            "required": [
+              "state"
+            ],
+            "properties": {
+              "state": {
+                "type": "string",
+                "enum": [
+                  "clean",
+                  "modified",
+                  "no_upstream"
+                ]
+              },
+              "changed_files": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "When `state` is `modified`, how many uncommitted changes there are."
+              }
+            }
+          },
+          "license": {
+            "$ref": "#/$defs/license",
+            "description": "Licence of this code (added in v2.2 to close a structural gap).\n\n**Before this, models carried licence fields and code carried none.** The host application is GPL, extensions vary widely, and some forbid commercial use or carry stronger copyleft terms. Handing a nest to someone else redistributes all of that source.\n\nOn the GPL side we happen to comply -- the full source travels with the nest, which is what the licence asks for -- **but that was luck, not design**: before this field, nothing could flag or stop a non-commercial extension being passed to a commercial user."
+          }
+        }
+      }
+    },
+    "python_lock": {
+      "type": "object",
+      "description": "A deterministic dependency lock produced by `uv`, the Python resolver and installer this project standardises on.\n\n**Since v2.3, `lockfile` is optional.** Some environments have no lockfile at all (the desktop build of ComfyUI produces one such). The schema used to demand one, so packers had to either fail or fabricate. **Packing discipline from 2.3 onward, in order:** (1) a lockfile exists -> archive it as-is; (2) no lockfile, but the interpreter that runs this environment can be found -> **ask it for the installed package list** (reading a fact, not guessing), archive that, and say where it came from in the report; (3) not even the interpreter can be found -> **leave this field empty and warn**, rather than invent.\n\nA nest with this empty **cannot rebuild its Python environment**. That is its own honest labelling, not a defect -- the linter warns that the information is incomplete, and the restore path says so at the first step.",
+      "required": [
+        "tool"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "tool": {
+          "const": "uv"
+        },
+        "lockfile": {
+          "$ref": "#/$defs/blob",
+          "description": "Content pointer to the lockfile itself (optional since v2.3, for the reason given on the block above). **If there is none, omit this field entirely**; never write an empty shell or a placeholder."
+        },
+        "lockfile_path": {
+          "$ref": "#/$defs/relpath",
+          "description": "Where that lockfile sat in the environment, relative to the environment root (v2.6).\n\nUntil 2.6 the manifest did not carry it, so both restore paths landed the lock at `requirements.lock` in the environment root by fixed convention. **The fine-tuning frameworks keep theirs in a sub-directory**, and packing them moved the file somewhere the framework does not look.\n\n**Absent = keep the old fixed landing spot**, which is what every 2.0-2.5 nest gets. Written only when the lock really was a file in the environment: when the list was read out of the running interpreter instead, there is no original path and this field stays out rather than naming one that never existed."
+        },
+        "pinned_wheel_urls": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How many packages in the lockfile are pinned to a direct wheel URL. Packages carrying a local version segment (for example `torch==2.4.1+cu124`) exist only on a vendor's private index and not on PyPI, so packing must pin them to a direct URL or the rebuild fails during dependency installation. This is an honest field: it also tells downstream that this lock's reproducibility depends on that wheel host staying up."
+        },
+        "wheels_archived": {
+          "type": "boolean",
+          "default": false,
+          "description": "`true` = the wheels themselves are archived as well (maximum resistance to link rot, at a cost in size)."
+        },
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "**Which hosts installing the dependencies will reach out to** during a rebuild (v2.2). Host names only, never full URLs.\n\nWhy only host names: the host name is enough to answer \"who will my machine talk to\", while full URLs would blow up the disclosure surface.\n\nWhy it exists at all: those addresses are buried inside the lockfile, **invisible on the disclosure surface**. An unfamiliar host name is the plainest possible signal. It pairs with the hard allowlist of trusted sources -- **disclosure is the advance notice for that hard stop, not a substitute for it**: disclosing without blocking is a disclaimer, and blocking without disclosing leaves someone facing an unexplained failure in front of the machine."
+        }
+      }
+    },
+    "files": {
+      "type": "array",
+      "description": "Large assets: models, LoRAs, VAEs, tokenizers, input material. All content-addressed.\n\n**v2.2 caps this at 50,000 entries.** This is not a security limit but a sanity limit: a malicious manifest does not need to include a single byte, entry count alone is enough -- the escape hatch spawns two helper processes per entry, so a hundred thousand entries is two hundred thousand process launches, spinning a machine all night without moving one useful byte. The size cap (32 MB on the manifest) guards against reading it all into memory; **size and entry count are two different amplification surfaces**. Real nests have had at most single-digit file counts, so 50,000 is orders of magnitude of headroom. The same number appears in the restore path, the linter and the escape hatch, with tests pinning all three.",
+      "items": {
+        "type": "object",
+        "required": [
+          "path",
+          "blob",
+          "license"
+        ],
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "root": {
+                  "const": "hf_hub"
+                }
+              },
+              "required": [
+                "root"
+              ]
+            },
+            "then": {
+              "properties": {
+                "path": {
+                  "pattern": "^models--[^/]+/(refs/[^/]+|snapshots/[0-9a-f]{40}/.+)$",
+                  "description": "Allowlist for the `hf_hub` root: only a model repository's `refs/` pointers and the real files under `snapshots/<commit>/`. Datasets are structurally unable to appear here -- training writes user datasets into the cache's `datasets/` directory, and those must never be packed."
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "root": {
+                  "const": "hf_home"
+                }
+              },
+              "required": [
+                "root"
+              ]
+            },
+            "then": {
+              "properties": {
+                "path": {
+                  "pattern": "^accelerate/[^/]+\\.yaml$",
+                  "description": "Allowlist for the `hf_home` root: only the launcher configuration, which real fine-tuning runs showed to be required."
+                }
+              }
+            }
+          }
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Install path, relative to the root named by `root`. Note the pattern is only an allowlist and does not provide traversal protection -- rejection of `..` happens at the write gate (escape hatch, restore path, linter) and applies to every root.\n\n**v2.3 reserves one path: `.renest/escape/restore.sh`.** At pack time the recovery script -- the one that unpacks a nest without any of our code -- is placed in the nest as **an ordinary file entry** (root `env`, kind `other`), so its content hash and size are recorded by the existing machinery.\n\nWhy: the entire reason that script exists is \"even if this company is gone, your work comes back\". Until now it **was not in the nest**, so two years later a user would have to find our repository and dig out the version from back then -- **which requires us to still be around**, contradicting the premise. With it inside, opening your own nest reveals the version of the script that matches that nest. The cost is near zero: tens of kilobytes, content-addressed, one copy stored no matter how many nests reference it.\n\n**A cost worth stating plainly:** the copy inside a nest is frozen, so later fixes never reach older nests. Honest framing, two layers -- the in-nest copy is the floor, always able to get your work back; our current version is better, having been fixed and able to read several generations of older formats; **use the current one when you can reach us**.\n\n**Safety note:** never run the script from a nest someone else gave you without thinking -- that is running their code. Your own nests are fine. For someone else's nest, use your own copy, or check the content hash first, which is recorded right here in this entry.\n\n**Version information lives in the script's own header comment; this version adds no top-level field for it.**"
+          },
+          "root": {
+            "type": "string",
+            "enum": [
+              "env",
+              "hf_hub",
+              "hf_home"
+            ],
+            "default": "env",
+            "description": "Which root this file lands under. `env` (default when absent) = the rebuild target directory, unchanged from earlier semantics; `hf_hub` = the model cache hub directory; `hf_home` = the model cache home. The latter two each carry the path allowlist pattern defined in the `allOf` above."
+          },
+          "blob": {
+            "$ref": "#/$defs/blob"
+          },
+          "license": {
+            "$ref": "#/$defs/license"
+          },
+          "origin_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Original source, for provenance and cross-checking. Required when `serving_scope` is `gated` -- it is the recipient's only lead for fetching the asset themselves with their own credentials."
+          },
+          "sources": {
+            "type": "array",
+            "description": "Ordered list of alternative sources, nearest or fastest first. The agent races them and verifies by hash, so whichever wins is equally correct. The escape hatch does not read this field: it uses the authoritative source only. Reserved here in the format; present or absent, it does not affect a rebuild.",
+            "items": {
+              "type": "object",
+              "required": [
+                "url",
+                "kind"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "url": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "authoritative",
+                    "mirror",
+                    "provider_cache",
+                    "torrent",
+                    "magnet"
+                  ],
+                  "description": "`authoritative` = the source we guarantee exists and do not outsource; everything else is an optional accelerator, verified by hash."
+                },
+                "note": {
+                  "type": "string",
+                  "maxLength": 200
+                }
+              }
+            }
+          },
+          "kind": {
+            "type": "string",
+            "description": "What kind of asset this is. **An open string since v2.7, not a closed list.**\n\n**Only four values mean anything to a program:**\n\n- `clip`, `vae`, `tokenizer` -- **shared parts**. One text encoder or VAE sits inside dozens of unrelated models, so a content-hash hit on such a file identifies merely *some bundle containing it*, and that bundle's base model says nothing about this file. Licence adjudication therefore refuses to let a shared part's record speak for a base model (live case 2026-08-09: the Qwen3-4B encoder shipping with FLUX.2-klein matched a stranger's \"Z Image Turbo\" upload).\n- `input_asset` -- the user's own material. Listed, never packed.\n\n**Every other value is a label for people**: shown in listings, counted in summaries, and nothing branches on it.\n\n**Why the enum went away (v2.7):** one closed list was chasing an open ecosystem, and every asset family it missed cost a whole version bump -- the eight-step checklist, two byte-identical copies of the escape hatch, a human on a real machine. On 2026-08-12 three real assets had no honest slot: a top-five image-generation extension's models, quantised weights, and video-model weights; the last two could only be filed as `checkpoint`, which is not what they are.\n\n**Consumer rule: a value you do not recognise is an ordinary asset.** Never refuse a nest over it, never guess a meaning, and display it exactly as written -- not blank, not \"unknown\".\n\n**The shape constraint is not a disguised list.** Lower case, digits and underscores only, 64 characters at most: it keeps this a machine token rather than a sentence, so nobody has to decide whether `IPAdapter` and `ipadapter` are the same thing. Every value legal before 2.7 satisfies it.\n\nValues in common use, none of them special: `checkpoint`, `lora`, `controlnet`, `embedding`, `upscaler`, `model_config`, `runtime_config`, `other`, and `license_text` (added v2.2 -- the licence text that travels with the nest, because some licences require the usage restrictions to be delivered along with the asset; it is an ordinary file, so content addressing, deduplication and verification come free, and `license.text` points at it).",
+            "pattern": "^[a-z0-9][a-z0-9_]*$",
+            "maxLength": 64
+          },
+          "serialization": {
+            "type": "string",
+            "enum": [
+              "safetensors",
+              "pickle",
+              "other"
+            ],
+            "description": "Whether loading this file **executes code** (v2.2).\n\nThe `pickle` family (`.ckpt`, `.pt`) is a Python serialisation format that **executes on load** -- the classic route for a poisoned model. `safetensors` is data only and has no such property.\n\n**Note this is not the same axis as `kind`:** `kind` describes purpose (checkpoint, lora, vae); this describes format. A LoRA can be either.\n\nDetermined by reading the file header at pack time, at no cost. **If it cannot be determined, omit the field** (honest omission, never invention -- the same rule as binary architecture probing). When everything is clean this is a positive signal and should be surfaced: \"all 40 models are pure-data format\"."
+          },
+          "declared_base_model": {
+            "type": "object",
+            "description": "What **this file's own header says** about the model it was trained on (v2.4).\n\n**This is a transcription, not a judgement.** The trainer writes these values into the file when it saves it; we copy them across and name where they came from. We do not decide whether an asset and a base model go together -- that stays outside this tool.\n\nWhy it earns a place: measured end to end on 2026-08-11. A LoRA trained locally recorded its base model's **whole-file sha256**, and it matched the sha256 of the file that was actually fed to the trainer, character for character. Two LoRAs by different authors recorded the same base-model hash, and asking a public index by that hash returned the expected model. So \"which base model does this asset want\" can be answered **by bytes**, without guessing and without recommending anything.\n\n**`sha256` is the whole-file digest and nothing else.** Five different digests circulate in this ecosystem under the same name: the whole file; its first 10 characters; a 64 KiB window one mebibyte in, truncated to 8 characters (32 bits -- collisions are a real risk); and two variants that skip the file header and cover only tensor bytes. Only the first is comparable with the addresses used elsewhere in this manifest. **Lower case, always** -- one public index answers in upper case while trainers write lower, and a plain string comparison then fails.\n\n**Absent means the header said nothing, or was not read. It does not mean the asset has no base model.**",
+            "additionalProperties": false,
+            "properties": {
+              "sha256": {
+                "type": "string",
+                "description": "Whole-file digest of the base model, exactly as the header states it, lower case.",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "family": {
+                "type": "string",
+                "description": "Base-model family as the header names it, e.g. `flux1` or `sd_v1`. Free text on purpose: it is the trainer's word, not ours, and normalising it would be us deciding what things are."
+              },
+              "stated_by": {
+                "type": "string",
+                "enum": [
+                  "safetensors_header"
+                ],
+                "description": "Where the claim was read. Required whenever anything else here is present: a transcribed claim without its source is indistinguishable from our own conclusion, and only one of those is allowed here."
+              }
+            },
+            "required": [
+              "stated_by"
+            ]
+          }
+        }
+      },
+      "maxItems": 50000
+    },
+    "post_install": {
+      "type": "string",
+      "description": "Global post-install command: system-level operations outside the image (package installs and the like) go here, written by hand."
+    },
+    "entrypoint": {
+      "type": "object",
+      "description": "Externalises how the working run was started, instead of hard-coding it in the restore path. Both shapes were exercised on real runs: fine-tuning is `oneshot` (success = exit code), an image-generation server is `service` (success = an HTTP probe). Optional; when absent the restore path falls back to its previous behaviour.\n\n**Security-sensitive.** This is the only block in the manifest describing *what gets executed on this machine*, so `env` is allowlisted (see that field) and `cwd` and `argv` are validated by the restore path under the same rules as the file write gate.",
+      "required": [
+        "kind",
+        "argv"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "oneshot",
+            "service"
+          ],
+          "description": "`oneshot` = runs to completion and exits; success is judged by `success.exit_code`. `service` = long-running; success is judged by `ready_probe`."
+        },
+        "cwd": {
+          "$ref": "#/$defs/relpath",
+          "description": "Working directory, relative to the environment root. Both fine-tuning frameworks measured had to run from their repository root."
+        },
+        "argv": {
+          "type": "array",
+          "description": "The command line, as an array rather than a string -- this avoids shell quoting problems and lets `redactions` address elements by index.",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        },
+        "env": {
+          "type": "object",
+          "description": "**Allowlisted keys, and for path-shaped keys the values are constrained too.**\n\n**Key allowlist:** only the six keys in `propertyNames` below; everything else is rejected. **`PATH` and `HOME` are explicitly not accepted** -- they are host-specific and the rebuild computes its own, while the environment is the most common hiding place for secrets, and accepting the whole environment would pack credentials along with it. The allowlist itself comes from real runs; one entry is present on upstream documentation alone and is therefore permitted without being given any required meaning.\n\n**Value constraints:** the four path-shaped keys must be **relative paths inside the rebuild directory** -- no absolute paths, no `~`, no `..`, and every colon-separated segment of the library search path must satisfy this too (an empty segment means the current directory and is rejected likewise).\n\n**Why pin this down now, when nothing reads the field yet:** precisely because nothing reads it yet. The field permits these keys while the values are arbitrary strings; the day someone wires it up and actually exports them, the library search path becomes a **library hijacking** entry point (point it at a shared object inside the nest and it loads ahead of the system one) -- and by then the format is frozen and old nests exist, so adding the constraint becomes a breaking change. This is what \"format before implementation\" is for: **constraints must be fixed before a field is consumed**, and right now it costs nothing.\n\n**Hard requirement on future consumers:** before exporting any of these values, validate them again under the same rules as the file write gate and join them beneath the rebuild root. The schema guards against a nest being written wrong; the consumer guards against a nest someone else handed you.",
+          "propertyNames": {
+            "enum": [
+              "VIRTUAL_ENV",
+              "CUDA_VERSION",
+              "LD_LIBRARY_PATH",
+              "HF_HOME",
+              "HF_HUB_CACHE",
+              "FORCE_TORCHRUN"
+            ]
+          },
+          "properties": {
+            "VIRTUAL_ENV": {
+              "$ref": "#/$defs/env_path"
+            },
+            "HF_HOME": {
+              "$ref": "#/$defs/env_path"
+            },
+            "HF_HUB_CACHE": {
+              "$ref": "#/$defs/env_path"
+            },
+            "LD_LIBRARY_PATH": {
+              "$ref": "#/$defs/env_path_list"
+            }
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "success": {
+          "type": "object",
+          "description": "Success criterion for `kind: oneshot`.\n\n**v2.1: an exit code is not enough.** A real fine-tuning run produced a false pass -- the trainer logged that it had found no data, yet still exited with code 0, so \"exit code 0 means it worked\" reported success while nothing had been trained. Hence the optional `expect_artifact`: **if it is declared, that artefact must exist for the run to count**. The criterion still comes from the nest; the restore path never guesses at framework behaviour.",
+          "additionalProperties": false,
+          "properties": {
+            "exit_code": {
+              "type": "integer"
+            },
+            "expect_artifact": {
+              "$ref": "#/$defs/relpath",
+              "description": "The artefact that **should exist** after a successful run, relative to the environment root. Declaring it makes it mandatory: without it the run does not count, even with the right exit code.\n\nThis does not conflict with the rule that outputs never travel: what is recorded here is *where the artefact should appear*. The artefact itself, like user data, is never packed."
+            }
+          }
+        },
+        "ready_probe": {
+          "type": "object",
+          "description": "Readiness and smoke-test criteria for `kind: service`. Externalises what the restore path used to hard-code for one particular application.",
+          "additionalProperties": false,
+          "properties": {
+            "http_get": {
+              "type": "string",
+              "description": "Readiness probe path. Path only -- host and port are chosen by the restore path."
+            },
+            "smoke_get": {
+              "type": "string",
+              "description": "Smoke-test probe path."
+            },
+            "timeout_s": {
+              "type": "number",
+              "minimum": 1
+            }
+          }
+        },
+        "redactions": {
+          "type": "array",
+          "description": "Redaction record: which positions held values pointing at outputs or user datasets and therefore do not travel with the nest. **The record of redaction lives in the core layer; the knowledge of what to redact lives in the adapter layer** -- no general-purpose redaction language is invented, because only someone who understands a given framework knows which parameter is an output path.",
+          "items": {
+            "type": "object",
+            "required": [
+              "locator",
+              "role"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "locator": {
+                "description": "**Both addressing forms must be supported:** one framework's redaction points sit at argv indices, while its dataset path hides inside a key within a config file -- neither form covers the other.",
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "required": [
+                      "argv_index"
+                    ],
+                    "additionalProperties": false,
+                    "properties": {
+                      "argv_index": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "required": [
+                      "file",
+                      "key"
+                    ],
+                    "additionalProperties": false,
+                    "properties": {
+                      "file": {
+                        "type": "string",
+                        "description": "Points at an entry in `files[].path` or in an adapter's `config_files`."
+                      },
+                      "key": {
+                        "type": "string",
+                        "description": "Key path inside that file, e.g. `datasets[0].subsets[0].image_dir`."
+                      }
+                    }
+                  }
+                ]
+              },
+              "role": {
+                "type": "string",
+                "enum": [
+                  "output_dir",
+                  "output_name",
+                  "log_dir",
+                  "dataset"
+                ],
+                "description": "Every value here comes from real runs: fine-tuning frameworks point at outputs through output-directory, output-name and logging arguments, and at user datasets through a dataset argument or a key inside a referenced config file."
+              },
+              "placeholder": {
+                "type": "string",
+                "description": "Placeholder text left for whoever rebuilds. User-facing wording: plain language."
+              },
+              "note": {
+                "type": "string",
+                "maxLength": 300
+              }
+            }
+          }
+        }
+      }
+    },
+    "adapters": {
+      "type": "object",
+      "description": "Adapter namespace. Everything tool-specific outside the core fields lives here.\n\n**Opened up under control since v2.0:** known adapters each validate strictly; unknown keys are allowed but treated as opaque objects -- so supporting a fourth framework needs no version bump, while stray data still cannot leak into the core fields.",
+      "additionalProperties": {
+        "type": "object",
+        "description": "Unknown adapter: required to be an object; contents are not validated."
+      },
+      "properties": {
+        "comfyui": {
+          "type": "object",
+          "required": [
+            "workflow"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "workflow": {
+              "$ref": "#/$defs/blob",
+              "description": "The workflow definition from the run that worked."
+            },
+            "workflow_path": {
+              "$ref": "#/$defs/relpath",
+              "description": "Where that workflow file sat in the environment, relative to the environment root (v2.6).\n\n**Why it was added:** packing read the path, hashed the bytes and then threw the path away, so restore had nowhere to put the file back and parked it in a staging folder instead. The user journey \"restore, change one thing, pack again\" breaks right there -- the recipe is not where the app looks for it.\n\n**Obligations on a reader, all three:** put the bytes back at this path; **if something is already there with different content, keep the user's copy** and leave ours in staging with a line saying so; and when this field is absent (every nest older than 2.6) **leave it in staging and say so -- never invent a path**.\n\nPutting a file down is not starting the application: the 2026-08-12 ruling that keeps the escape hatch out of the business of launching apps does not touch this, and a nest whose recipe cannot be recovered is not a complete nest."
+            },
+            "workflow_name": {
+              "type": "string"
+            },
+            "verified_run": {
+              "type": "object",
+              "description": "Evidence for the \"it worked\" judgement.",
+              "additionalProperties": false,
+              "properties": {
+                "queue_completed_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "duration_seconds": {
+                  "type": "number"
+                },
+                "output_samples": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/blob"
+                  },
+                  "description": "Output samples from the run that worked.\n\n**Never written (2026-08-11 ruling), and the reason is not technical.** Keeping a sample would mean holding the user's own artwork and handing it on with the nest, and comparing against it would mean us looking at what they drew -- which is not ours to examine, still less to judge. So the run gate after a rebuild answers only \"this environment still produces something\", never \"it produces the same picture\".\n\nThe field stays for nests that already carry it. **Absent is the normal case, not missing information.**"
+                }
+              }
+            }
+          }
+        },
+        "kohya": {
+          "$ref": "#/$defs/training_adapter",
+          "description": "kohya_ss / sd-scripts, exercised on a real run. The recipe lives in two places: the command line and the dataset config file."
+        },
+        "llamafactory": {
+          "$ref": "#/$defs/training_adapter",
+          "description": "LLaMA-Factory, exercised on a real run. The recipe is a single YAML file; the command line is minimal."
+        }
+      }
+    },
+    "creation": {
+      "type": "object",
+      "description": "Metadata about where the nest was created.",
+      "additionalProperties": false,
+      "properties": {
+        "cloud": {
+          "type": "string",
+          "description": "runpod / vast / tensordock / other"
+        },
+        "region": {
+          "type": "string"
+        },
+        "upload_bandwidth_mbps": {
+          "type": "number"
+        },
+        "agent_version": {
+          "type": "string"
+        }
+      }
+    },
+    "derived_from": {
+      "type": "object",
+      "description": "Which nest this one was made from, when splitting or merging nests produced it.\n\n**Reserved. The packer of this version never writes it** -- the feature that would is not built yet. It is here so that the first implementation does not have to bump the format again.\n\n**Absent means \"not derived from anything\". It does not mean \"unknown\".** Read it the other way and every ordinary nest looks like it has lost its parentage.\n\n**It is a dead snapshot: it names one specific version of the parent and does not follow the parent's later versions.** Anything that resolves this to \"whatever the parent is now\" is a different product, and a surprising one -- the point of a nest is that it does not move.\n\nBoth fields are required when the object is present: a parent without a version cannot be resolved to bytes.",
+      "additionalProperties": false,
+      "required": [
+        "nest_id",
+        "version"
+      ],
+      "properties": {
+        "nest_id": {
+          "type": "string",
+          "description": "The parent nest's identifier, in the same form as this nest's own `id`.",
+          "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "version": {
+          "type": "string",
+          "description": "Which version of the parent this was taken from. Pinned, not tracked."
+        }
+      }
+    },
+    "api_deps": {
+      "type": "array",
+      "description": "Dependencies on external API services -- the part that cannot be archived. An honest-boundary field: the byte-for-byte reproduction promise does not cover this list, and after a rebuild these nodes work only for as long as the service provider does. Filled in automatically when the capture pass recognises an API-forwarding node.",
+      "items": {
+        "type": "object",
+        "required": [
+          "node_name",
+          "service"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "node_name": {
+            "type": "string",
+            "description": "Name of the node calling the external service."
+          },
+          "service": {
+            "type": "string",
+            "description": "Service identifier, or a custom base URL."
+          },
+          "endpoint_hint": {
+            "type": "string",
+            "description": "Endpoint hint, never a key -- so the user can check for themselves after a rebuild."
+          },
+          "note": {
+            "type": "string",
+            "maxLength": 300
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "relpath": {
+      "type": "string",
+      "minLength": 1,
+      "description": "A relative path inside the environment root: no absolute paths, no leading `~`, no `..` segment. The write gate (escape hatch, restore path, linter) rejects the same things independently -- the schema guards against a malformed nest, the write gate guards against someone else's bytes.",
+      "not": {
+        "anyOf": [
+          {
+            "pattern": "^[/~]"
+          },
+          {
+            "pattern": "(^|/)\\.\\.(/|$)"
+          }
+        ]
+      }
+    },
+    "env_path": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Value of a path-shaped key in `entrypoint.env`: a relative path inside the rebuild directory. Same rule as `relpath`; it gets its own name so the reasoning can be attached to `entrypoint.env`, where it is explained.",
+      "not": {
+        "anyOf": [
+          {
+            "pattern": "^[/~]"
+          },
+          {
+            "pattern": "(^|/)\\.\\.(/|$)"
+          }
+        ]
+      }
+    },
+    "env_path_list": {
+      "type": "string",
+      "minLength": 1,
+      "description": "A colon-separated search path. **Every segment** must be a relative path inside the rebuild directory. Empty segments (`a::b`, or a leading/trailing colon) mean \"the current directory\" and are rejected too -- that is the search location people most easily overlook.",
+      "not": {
+        "anyOf": [
+          {
+            "pattern": "(^|:)[/~]"
+          },
+          {
+            "pattern": "(^|[/:])\\.\\.([/:]|$)"
+          },
+          {
+            "pattern": "(^|:):"
+          },
+          {
+            "pattern": ":$"
+          }
+        ]
+      }
+    },
+    "training_adapter": {
+      "type": "object",
+      "description": "Shape shared by fine-tuning framework adapters, taken from real runs of both supported frameworks. Recipe files introduce no new concept -- they are ordinary `files[]` entries, so content addressing, verification and deduplication come for free; the adapter only names which of them are the recipe.",
+      "additionalProperties": false,
+      "properties": {
+        "config_files": {
+          "type": "array",
+          "description": "Points at `files[].path` entries, marking which files are the recipe.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "verified_run": {
+          "type": "object",
+          "description": "Evidence for the \"it worked\" judgement. For fine-tuning the standard criterion is an exit code of zero, demonstrated on real runs of both supported frameworks.",
+          "additionalProperties": false,
+          "properties": {
+            "completed_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "duration_seconds": {
+              "type": "number"
+            },
+            "exit_code": {
+              "type": "integer"
+            }
+          }
+        }
+      }
+    },
+    "blob": {
+      "type": "object",
+      "description": "A content-addressed file pointer. Physical location is `<bucket>/blobs/sha256/<first two hex characters>/<full hash>`.",
+      "required": [
+        "sha256",
+        "size_bytes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "license": {
+      "type": "object",
+      "description": "Licence annotation, driving the rules for handing off and for serving bytes. Two orthogonal switches: `shareable` governs hand-off (does this byte travel with the nest), `serving_scope` governs supply (may this byte be served across users from the deduplication pool).",
+      "required": [
+        "shareable",
+        "serving_scope"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "shareable": {
+          "type": "boolean",
+          "description": "`false` = removed automatically on hand-off; the recipient gets self-service instructions for obtaining it."
+        },
+        "serving_scope": {
+          "type": "string",
+          "enum": [
+            "private",
+            "open",
+            "gated"
+          ],
+          "description": "Three-way supply routing by licence, decided at capture time, fixed when the nest is sealed, and executed as written by the restore path with no on-the-spot discretion. `private` = the sharer's own asset (self-trained weights, workflows, own material), served directly to authorised recipients. `open` = the licence itself permits redistribution (Apache-2.0, MIT, redistributable OpenRAIL), so the cross-user pool may serve it as an accelerator. `gated` = restricted licence, where a copy serves only its owner's rebuild and bytes are never served across users; downstream gets the origin URL and hash and fetches it with their own credentials. **When no licence can be determined, the default is `gated`** -- deny by default. `gated` implies `shareable` must be false."
+        },
+        "spdx": {
+          "type": "string",
+          "description": "For example `Apache-2.0`; left empty for custom licences."
+        },
+        "tag": {
+          "type": "string",
+          "enum": [
+            "permissive",
+            "capped",
+            "rail",
+            "restricted",
+            "unknown"
+          ],
+          "description": "Coarse classification: permissive, capped, RAIL-family, restricted, unknown."
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "declared_by": {
+          "type": "string",
+          "enum": [
+            "detected",
+            "user"
+          ],
+          "description": "Whether this licence was **looked up** or **stated by the user** (v2.2).\n\n**Why this is a standing need rather than an edge case:** before v2.2 every licence in a nest was an unverified claim written into the pack spec by the packer and copied into the manifest as though it were an adjudicated result. Without this field, a completed adjudication cannot be told apart from a transcription.\n\nAbsent = unknown (as in older nests). In a dispute, this answers \"who said so\"."
+        },
+        "gated_form": {
+          "type": "string",
+          "enum": [
+            "none",
+            "auto",
+            "manual"
+          ],
+          "description": "The **two shapes** of \"gated\"; do not collapse them into one word (v2.2).\n\n`auto` = click to accept and download, a few seconds. `manual` = request access from the author, **possibly days**. For a recipient these are completely different waiting expectations.\n\nConfirmed by checking real model repositories (2026-07-29): some widely used image models are `auto`, some large language models are `manual`, and many popular models are neither."
+        },
+        "attribution": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Attribution requirements (v2.2). Some licences permit any use including commercial redistribution, **on the single condition of attribution** -- without this field, that class of licence can never be enabled. Recording it is not enough; the recipient's side has to actually display it.",
+          "properties": {
+            "author": {
+              "type": "string",
+              "maxLength": 200
+            },
+            "url": {
+              "type": "string",
+              "format": "uri",
+              "description": "Link to the source."
+            }
+          }
+        },
+        "text": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/blob"
+            }
+          ],
+          "description": "Where this asset's **licence text** is (v2.2).\n\nThe OpenRAIL family requires the usage restrictions to be **delivered together with** the asset, and the most direct, least error-prone way is to let the licence text travel with the bytes rather than mention it in terms of service.\n\n**Approach: carry the standard text, do not scrape it from the source.** Three cases were observed, and the third rules out fetching from the repository: the text is in the repository and was downloaded locally (fetchable); the text is in the repository but is not included when the model is downloaded; and **the repository has no licence file at all**. There are only a handful of licences on the list and one canonical text each, so the tool ships them.\n\nThis points at an ordinary `files[]` entry with kind `license_text` -- content addressing, deduplication and verification all free, and one copy of each licence text stored no matter how many nests reference it."
+        }
+      }
+    }
+  }
+}

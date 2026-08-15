@@ -1,0 +1,57 @@
+{
+  "schema": "ai.renest.rules.doctor",
+  "schema_version": "1",
+  "updated": "2026-08-10",
+  "provenance": "Factory baseline. The driver lower bounds come from the vendor's official release notes (checked 2026-08-08); every other rule came out of a real run, with its source in the entry's own note.",
+  "cuda_driver_floors": {
+    "cu124": {
+      "floor": [
+        525,
+        60
+      ],
+      "note": "Measured basis, same as cu128: driver 535.154.05 ran a cu128 wheel with a real matmul on the card, so the vendor family minimum for self-contained runtimes (12.x ≥525.60) is the right number for the wheel path; the figure that used to be here came from the CUDA **toolkit** table, a different scenario. An older CUDA cannot need a newer driver than a newer CUDA does. Evidence: a probe run on rented hardware, its pass/fail criteria written down before it started."
+    },
+    "cu126": {
+      "floor": [
+        525,
+        60
+      ],
+      "note": "Measured basis, same as cu128: driver 535.154.05 ran a cu128 wheel with a real matmul on the card, so the vendor family minimum for self-contained runtimes (12.x ≥525.60) is the right number for the wheel path; the figure that used to be here came from the CUDA **toolkit** table, a different scenario. An older CUDA cannot need a newer driver than a newer CUDA does. Evidence: a probe run on rented hardware, its pass/fail criteria written down before it started."
+    },
+    "cu128": {
+      "floor": [
+        525,
+        60
+      ],
+      "note": "Measured 2026-08-10 on a rented RTX A4000 with driver **535.154.05**: pip-installed cu128 torch 2.11.0 reported CUDA 12.8, torch.cuda.is_available() was true, and a real matmul ran on the card and matched the CPU result (not just the self-report). So the vendor's family minimum for **applications that carry their own CUDA runtime** -- 11.x ≥450, 12.x ≥525, 13.x ≥580 -- holds for the path we actually take, and it is the number to use here. The earlier 570.26 (and then 550.54) came from the vendor's minimum-driver table for the **CUDA toolkit**, which is a different scenario; 535 is the most common long-term-support driver on rented GPUs, so that mistake blocked most machines. Evidence: a probe run on rented hardware, its pass/fail criteria written down before it started. PTX-JIT on a card newer than the wheel is a real exception, and it is checked separately by check_gpu_arch -- this row only answers the CUDA-family question."
+    },
+    "cu130": {
+      "floor": [
+        580,
+        65
+      ],
+      "note": "CUDA 13.x needs driver ≥580 on Linux. **Checked 2026-08-10 and kept deliberately**: this one happens to match the vendor's toolkit table because the family minimum for self-contained runtimes is also 580 for 13.x -- so unlike the 12.x rows it was never wrong. Source: the vendor's driver-compatibility notes; no measurement of our own yet, which is why it is not lowered."
+    }
+  },
+  "required_cpu_flags": {
+    "flags": [
+      "avx2"
+    ],
+    "note": "Measured on a real run: the restore was byte-for-byte identical, yet importing a numerical library raised an illegal-instruction fault -- the host CPU was older and lacked the instruction set the wheel was built for."
+  },
+  "egress": {
+    "reject_below_mbps": 20.0,
+    "warn_below_mbps": 100.0,
+    "probe_url": "https://github.com/peak/s5cmd/releases/download/v2.2.2/s5cmd_2.2.2_Linux-64bit.tar.gz",
+    "note": "Measured on a real run: a machine being alive is not the same as a machine being usable -- egress to the code host was slow enough that cloning timed out. Threshold matched to the harness's fast-failure limit."
+  },
+  "cuda_family_consistency": {
+    "package_pattern": "^nvidia-",
+    "level": "warn",
+    "note": "Measured on a real run: PyTorch was pinned to a CUDA 12.4 build, while an editable install with extras resolved a companion audio package to a CUDA 13 build from the default index -- two CUDA lines in one environment, ending in a missing runtime library. Pinning PyTorch alone is not enough; every CUDA-bound package in the family has to stay on the same line."
+  },
+  "lock_cuda_vs_driver": {
+    "level": "reject",
+    "note": "Measured on a real run: following the framework's own README installed a PyTorch build for CUDA 13, while the host driver only supported CUDA 12.4. What the user sees is \"your setup doesn't support bf16/gpu\", which reads as \"my graphics card is too old\" -- when the real cause is a PyTorch build too new for the driver, and has nothing to do with the card. This happened on the officially documented installation path, not on an improvised one."
+  }
+}
