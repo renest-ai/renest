@@ -16,9 +16,11 @@ hashes and no original index, so private indexes and vendor builds (torch's
 
 from __future__ import annotations
 
+
 import re
 import subprocess
 from pathlib import Path
+from .uvbin import uv_executable
 
 __all__ = [
     "LOCK_FROM_INSTALLED_HEADER",
@@ -105,7 +107,7 @@ def _uv_freeze(python_exe: str | Path) -> str | None:
     venv = Path(python_exe).parent.parent
     try:
         out = subprocess.run(  # noqa: S603
-            ["uv", "pip", "freeze", "--python", str(python_exe)],
+            [uv_executable(), "pip", "freeze", "--python", str(python_exe)],
             capture_output=True, text=True, timeout=300, check=False,
         )
     except (OSError, subprocess.SubprocessError):

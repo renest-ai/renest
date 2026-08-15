@@ -76,6 +76,7 @@ from .roots import (
     unsafe_relpath,
 )
 from .wheels import audit_lock_urls, dead_wheel_fallback
+from .uvbin import uv_executable
 
 __all__ = [
     "FORMAT_VERSION",
@@ -2601,7 +2602,7 @@ def restore(
             )
         # idempotence: wipe first (uv hard-fails on a half-dead dir, --clear is a placebo)
         shutil.rmtree(venv, ignore_errors=True)
-        r = runner(["uv", "venv", "--python", plan.python_version, str(venv)])
+        r = runner([uv_executable(), "venv", "--python", plan.python_version, str(venv)])
         if r.returncode == 127:
             raise NestFailure("S3", ErrorClass.UNKNOWN, "uv is not available — install it and it must be on PATH")
         if r.returncode != 0:
@@ -2640,13 +2641,13 @@ def restore(
                 stage="S3",
             )
         _t_deps = time.monotonic()
-        r = runner(["uv", "pip", "sync", str(lock_path)], env=_deps_env)
+        r = runner([uv_executable(), "pip", "sync", str(lock_path)], env=_deps_env)
         if r.returncode != 0:
             # Pinned wheel withdrawn? Fall back to the generic version and try
             # once more (warn, never silently; details in wheels.py)
             fallback = _wheel_fallback(lock_path, client, narrate, report)
             if fallback:
-                r = runner(["uv", "pip", "sync", str(fallback)], env=_deps_env)
+                r = runner([uv_executable(), "pip", "sync", str(fallback)], env=_deps_env)
         if r.returncode != 0:
             stderr = r.stderr or ""
             klass, why = classify_deps_failure(stderr)

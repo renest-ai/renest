@@ -38,6 +38,7 @@ from .events import EventEmitter
 from .fingerprint import Fingerprint, collect, collect_wheel_env
 from .rules import DOCTOR_RULES, FINGERPRINT_MATRIX, load_rules
 from .syslibs import missing_native_libs
+from .uvbin import uv_executable
 
 __all__ = [
     "LEVEL_PASS",
@@ -1068,8 +1069,10 @@ def check_uv() -> CheckResult:
     So this belongs in the check that answers "will this machine do?", and it has
     to answer with the command that fixes it, not just with the word "missing".
     """
-    found = shutil.which("uv")
-    if found:
+    # Ask the same question the rebuild will ask. A check that looks somewhere else
+    # can pass while the real call fails -- worse than having no check at all.
+    found = uv_executable()
+    if found != "uv" or shutil.which("uv"):
         return CheckResult("uv", LEVEL_PASS, "uv is installed.", {"path": found})
     return CheckResult(
         "uv",
