@@ -920,6 +920,54 @@ def _has_placeholder(node: object) -> bool:
     return False
 
 
+#: What the manifest schema accepts as an image fingerprint. Same string in both
+#: schemas; kept here so the check below reads as the rule it enforces.
+_DIGEST_SHAPE = re.compile(r"^sha256:[a-f0-9]{64}$")
+
+
+def _base_image_for_manifest(spec_img: object, warnings: list[str]) -> dict | None:
+    """The image block to write into the manifest, or None to leave it out.
+
+    A pack-spec may carry a ``ref`` with no ``digest`` (its schema allows that),
+    while the manifest requires both -- so copying the block through produced an
+    archive that fails our own ``renest lint``, silently. The fingerprint is
+    lookup-able from the name, so look it up; if the registry cannot answer,
+    drop the whole block, because half an image record is worse than none.
+
+    **A blank fingerprint beside a real name is the normal case, not an unfilled
+    one**: the pack skeleton asks the human for the name only, leaving the digest
+    out of its ``needs_manual`` list precisely because it can be looked up. So
+    only an absent or still-blank *name* means the block cannot be written.
+    """
+    if not isinstance(spec_img, dict) or not spec_img:
+        return None
+    ref = str(spec_img.get("ref") or "").strip()
+    if not ref or _has_placeholder(ref):
+        return None
+    digest = str(spec_img.get("digest") or "").strip()
+    # Anything still carrying a blank is dropped; ref and digest are re-added below
+    # from the values this function actually established.
+    out = {k: v for k, v in spec_img.items() if not _has_placeholder(v)}
+    out["ref"] = ref
+    if _DIGEST_SHAPE.match(digest):
+        out["digest"] = digest
+        return out
+    from .capture import resolve_image_digest
+
+    found = resolve_image_digest(ref, timeout=10.0)
+    if not found:
+        warnings.append(
+            f"This pack-spec names the image {ref} but carries no usable fingerprint for "
+            f"it, and the registry could not be asked for one. The image line is left out "
+            f"of the manifest rather than written half-filled — a nest carrying a name "
+            f"without a fingerprint fails our own `renest lint`. To keep it, put the "
+            f"fingerprint (sha256: plus 64 hex characters) into base_image.digest."
+        )
+        return None
+    out["digest"] = found
+    return out
+
+
 def _foreign_env_kernel(root: Path, env_python: str | None) -> str | None:
     """The other machine's name when the environment being packed was built for one.
 
@@ -973,9 +1021,12 @@ def _build_manifest(
     # from format 2.3 on. **Write it if we have it, omit the block if we don't,
     # never write placeholder text** — a placeholder fails the schema's format
     # check (sha256: plus 64 hex characters) and invalidates the whole archive.
-    _img = spec.get("base_image")
-    if isinstance(_img, dict) and _img and not _has_placeholder(_img):
+    _said = len(warnings)
+    _img = _base_image_for_manifest(spec.get("base_image"), warnings)
+    if _img is not None:
         manifest["base_image"] = _img
+    elif len(warnings) > _said:
+        pass  # it already said the precise thing; the blanket line below would muddy it
     else:
         warnings.append(
             "We can't tell which container image this environment runs on, so that line is "
