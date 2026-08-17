@@ -25,17 +25,25 @@ from .uvbin import uv_executable
 __all__ = [
     "LOCK_FROM_INSTALLED_HEADER",
     "LOCK_FROM_ENV_HEADER",
+    "canonical_name",
     "env_dir_of",
     "find_env_python",
     "find_launchers",
     "find_site_packages",
     "freeze_environment",
     "freeze_from_installed",
+    "installed_dist_infos",
     "interpreter_kernel",
     "launcher_interpreter_dir",
     "interpreter_python_series",
     "venv_python_candidates",
 ]
+
+
+def canonical_name(name: str) -> str:
+    """One spelling for a distribution name (PEP 503): ``Opencv_Python`` and
+    ``opencv-python`` are the same package and must compare equal."""
+    return re.sub(r"[-_.]+", "-", name).strip().lower()
 
 #: Header lines of the generated file, so whoever receives the nest can see at a
 #: glance where this list came from.
@@ -219,6 +227,18 @@ def _name_and_version(dist_info: Path) -> tuple[str, str] | None:
     except OSError:
         return None
     return (name, version) if name and version else None
+
+
+def installed_dist_infos(site_packages: Path) -> dict[str, Path]:
+    """Canonical distribution name -> its ``*.dist-info`` folder, for everything
+    installed under ``site_packages``. Read off disk, so it works for an
+    environment whose interpreter cannot run here."""
+    found: dict[str, Path] = {}
+    for d in sorted(site_packages.glob("*.dist-info")):
+        pair = _name_and_version(d)
+        if pair:
+            found.setdefault(canonical_name(pair[0]), d)
+    return found
 
 
 def freeze_from_installed(site_packages: Path) -> str | None:

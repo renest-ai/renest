@@ -104,12 +104,12 @@ __all__ = [
     "restore",
 ]
 
-FORMAT_VERSION = "2.7"
+FORMAT_VERSION = "2.8"
 # 2.0 made `code_deps[].role` mandatory and dropped 1.3, so that the consumer
-# side need not sniff /custom_nodes/ paths forever. 2.1 through 2.7 only added
+# side need not sniff /custom_nodes/ paths forever. 2.1 through 2.8 only added
 # fields or relaxed required ones, so **every 2.x package still reads** —
 # nothing here may tighten without a version bump.
-SUPPORTED_FORMAT_VERSIONS = ("2.0", "2.1", "2.2", "2.3", "2.4", "2.5", "2.6", "2.7")
+SUPPORTED_FORMAT_VERSIONS = ("2.0", "2.1", "2.2", "2.3", "2.4", "2.5", "2.6", "2.7", "2.8")
 GRANT_VERSION = "1"
 GRANT_ENVELOPE_VERSION = "2"  # grant-code envelope (server token); redeems to a v1 payload
 # When the free-tier retention window has this many days or fewer left, print a
@@ -388,6 +388,10 @@ class RestorePlan:
     #: not installing that one library -- it is booting this image, which brings all of
     #: them. Recorded since v2.0 and, until 2026-08-12, never once read on this side.
     base_image_ref: str | None = None
+    #: v2.8 `runtime.contested_modules`: for each folder several packages write,
+    #: which one the working run's copy came from and that file's fingerprint as
+    #: installed. Read after the dependency install; absent = older nest, no-op.
+    contested_modules: list[dict] = field(default_factory=list)
 
     @property
     def total_bytes(self) -> int:
@@ -538,6 +542,10 @@ class RestorePlan:
             app_dir=app_dir,
             entrypoint=entrypoint if isinstance(entrypoint, dict) else None,
             base_image_ref=(manifest.get("base_image") or {}).get("ref") or None,
+            contested_modules=[
+                e for e in ((manifest.get("runtime") or {}).get("contested_modules") or [])
+                if isinstance(e, dict)
+            ],
         )
 
 
@@ -982,6 +990,14 @@ class RestoreReport:
     #: This makes "do I need to go accept something right now" answerable before
     #: the run starts, instead of discovering missing files at the end.
     gated: list[dict] = field(default_factory=list)
+    #: Contested modules (several packages shipping the same top-level module,
+    #: overwriting each other's files): system libraries the installed survivor
+    #: needs that this machine lacks. Known only after install; warn-only.
+    contested_module_gaps: dict = field(default_factory=dict)
+    #: v2.8: per contested module, whether the installed copy is the one the
+    #: working run used -- `match` (first try), `reinstalled` (forced the winner
+    #: to write last, then it matched) or `mismatch` (still differs; warn-only).
+    contested_modules: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -1003,6 +1019,8 @@ class RestoreReport:
             "checks_after_deps": self.checks_after_deps,
             "setup_skipped": self.setup_skipped,
             "gated": self.gated,
+            "contested_module_gaps": self.contested_module_gaps,
+            "contested_modules": self.contested_modules,
         }
 
 
@@ -1276,6 +1294,89 @@ def _wheel_fallback(
         level="warning",
     )
     return fallback
+
+
+def _site_packages_dirs(venv: Path) -> list[Path]:
+    return sorted((venv / "lib").glob("python3*/site-packages"))
+
+
+def _contested_gaps(venv: Path) -> dict[str, list[str]]:
+    """System libraries the installed copy of each contested module lacks on
+    this machine. Empty when nothing contested is installed, or off Linux."""
+    from .syslibs import contested_module_missing_libs
+    out: dict[str, list[str]] = {}
+    for sp in _site_packages_dirs(venv):
+        for mod, gaps in contested_module_missing_libs(sp).items():
+            out.setdefault(mod, gaps)
+    return out
+
+
+def _installed_sha256(venv: Path, rel: str) -> str | None:
+    """sha256 of a file under this environment's site-packages, or None if absent."""
+    for sp in _site_packages_dirs(venv):
+        f = sp / rel
+        if f.is_file():
+            return _sha256_file(f)
+    return None
+
+
+def _enforce_contested_winners(
+    entries: list[dict],
+    venv: Path,
+    lock_text: str,
+    runner: Callable[..., subprocess.CompletedProcess],
+    env: dict,
+    narrate: Callable[..., None],
+    report: "RestoreReport",
+) -> None:
+    """v2.8 `runtime.contested_modules`: make the installed copy of each contested
+    module the one the working run used.
+
+    Hash the recorded file; equal -> ``match``. Otherwise reinstall the winner
+    alone (its own pin from the lock, no dependencies) so it writes last, and hash
+    again: equal -> ``reinstalled``, still different -> ``mismatch``. **Never
+    blocks** -- this is a declared-level statement (see syslibs), so it may only
+    warn; the exit code is untouched either way."""
+    from .syslibs import lock_requirement_for
+    for e in entries:
+        mod, winner = e.get("module"), e.get("winner")
+        ev = e.get("winner_evidence") or {}
+        rel, want = ev.get("file"), ev.get("sha256")
+        if not (mod and winner and rel and want):
+            continue
+        if _installed_sha256(venv, rel) == want:
+            report.contested_modules[mod] = "match"
+            continue
+        req = lock_requirement_for(lock_text, winner)
+        status, why = "mismatch", ""
+        if not req:
+            why = (f"`{winner}` is not pinned in this nest's dependency list, so it "
+                   f"could not be reinstalled")
+        else:
+            r = runner([uv_executable(), "pip", "install", "--reinstall", "--no-deps", req], env=env)
+            if r.returncode != 0:
+                why = f"reinstalling `{winner}` failed: {(r.stderr or '').strip()[-200:]}"
+            elif _installed_sha256(venv, rel) == want:
+                status = "reinstalled"
+            else:
+                why = (f"`{winner}` was reinstalled and now writes last, but its `{rel}` "
+                       f"is a different build from the one your working setup had")
+        report.contested_modules[mod] = status
+        if status == "reinstalled":
+            narrate(
+                f"The copy of `{mod}` that ended up installed was not the one your working "
+                f"setup used; reinstalled `{winner}` so it is.",
+                stage="S3",
+                level="warning",
+            )
+        else:
+            narrate(
+                f"⚠ The copy of `{mod}` installed here is not the one your working setup "
+                f"used, and {why}. Carrying on: anything that imports `{mod}` may behave "
+                f"differently from the run that worked.",
+                stage="S3",
+                level="warning",
+            )
 
 
 def _hosts_of(urls: list[str]) -> list[str]:
@@ -2710,6 +2811,33 @@ def restore(
             if verdict.level != "pass":
                 narrate(f"⚠ {verdict.reason}", stage="S3", level="warning")
 
+        # Contested modules, v2.8: the nest says which copy of `cv2/` the working
+        # run used. First make the installed one that copy (reinstall the winner
+        # so it writes last), then read what the final copy needs below.
+        if plan.contested_modules:
+            _enforce_contested_winners(
+                plan.contested_modules, venv, lock_text, runner, _deps_env, narrate, report
+            )
+
+        # Contested modules: several packages in the lock write the same `cv2/`
+        # folder, and which copy survives is **not stable** -- measured 2026-08-17,
+        # the same nest on the same machine installed a different survivor on
+        # back-to-back restores, and `pip list` looked identical every time.
+        # So the lock cannot tell us what got installed; only the file can. Read
+        # what the survivor declares it needs and name what this machine lacks
+        # -- warn-only, this is a declared-method statement (see syslibs).
+        for mod, gaps in _contested_gaps(venv).items():
+            report.contested_module_gaps[mod] = gaps
+            narrate(
+                f"⚠ The copy of `{mod}` that ended up installed needs "
+                f"{len(gaps)} system librar{'y' if len(gaps) == 1 else 'ies'} this "
+                f"machine does not have ({', '.join(gaps)}). Anything that imports "
+                f"`{mod}` will fail to load. "
+                + missing_library_advice(gaps, plan.base_image_ref),
+                stage="S3",
+                level="warning",
+            )
+
         journal.mark_stage("S3:deps", lock_sha256=plan.lock_sha256)
         return (
             f"Python environment ready (python {plan.python_version})"
@@ -3007,6 +3135,11 @@ def restore(
         # declared. A check nobody can see is a check that does not exist, so it
         # goes on the stream too, not only onto the report object.
         checks_after_deps=report.checks_after_deps,
+        contested_module_gaps=report.contested_module_gaps,
+        # v2.8: whether the installed copy of each contested module is the one
+        # the working run used (match / reinstalled / mismatch). Same rule as
+        # above -- a verdict only on the report object is invisible to --json.
+        contested_modules=report.contested_modules,
         evidence_dir=str(evidence),
         blobs={
             "total": report.blobs_total,

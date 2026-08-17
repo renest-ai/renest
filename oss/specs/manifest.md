@@ -1,4 +1,4 @@
-# manifest v2.7 · Nest manifest specification
+# manifest v2.8 · Nest manifest specification
 
 <!-- Version tripwire: the line "current version **x.y**" below is parsed by
      oss/tests/consistency/test_format_version_pinned.py and must agree with
@@ -6,11 +6,11 @@
      top line of the change log. This is the fifth place the version appears --
      the prose is not allowed to drift from the other four. -->
 
-> Status: **current version 2.7** (2026-08-12). Any field change is a format
+> Status: **current version 2.8** (2026-08-17). Any field change is a format
 > change: bump the version and update `manifest.schema.json`, `restore.sh` and
 > `renest lint` in the same change.
 >
-> **Readable versions**: `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7`, plus **any future minor
+> **Readable versions**: `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8`, plus **any future minor
 > version of the same major** (a reader meeting a newer minor number warns and
 > continues; it does not reject the nest -- see §2).
 > **1.x is refused outright** (a one-time clean break taken while there were no
@@ -22,8 +22,9 @@
 > relaxing and purely additive: two fields the packer cannot obtain went from
 > required to optional), 2.4 in §14 and 2.5 in §15 (machine facts that differ
 > from machine to machine), 2.6 in §12 (four things packing knew and threw away),
-> 2.7 in §13 (`files[].kind` became an open string). **Every 2.x nest still
-> reads**: no version after 2.0 tightened anything.
+> 2.7 in §13 (`files[].kind` became an open string), 2.8 in §16 (which copy of a
+> module the working run used when several packages write the same folder).
+> **Every 2.x nest still reads**: no version after 2.0 tightened anything.
 >
 > This document is the **frozen description** of the format: written field by
 > field against `manifest.schema.json` (authoritative for shape) and against
@@ -68,7 +69,7 @@ have restored perfectly into a brick.
 
 | Field | Required | Type | One line |
 |---|---|---|---|
-| `format_version` | ✔ | enum `2.0` … `2.7` | Format version (the schema enum is the only source of truth) |
+| `format_version` | ✔ | enum `2.0` … `2.8` | Format version (the schema enum is the only source of truth) |
 | `id` | ✔ | string (ULID) | Nest identifier, 26-character Crockford base32 |
 | `created_at` | ✔ | date-time | When it was packed |
 | `name` | | string ≤120 | Human-chosen name |
@@ -111,7 +112,7 @@ of truth.
 
 ## 2. Identity and metadata
 
-### `format_version` — enum `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` `[schema]`
+### `format_version` — enum `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` `[schema]`
 
 **The `enum` in the schema is the only source of truth.** Everywhere else,
 including this document, is a restatement. Changing the version means changing
@@ -220,6 +221,7 @@ Bare-metal and container-less packing: see §9. Since 2.3 that case has an answe
 | `driver_version` | | Driver version |
 | `libc_version` / `platform_tag` | | **Added in 2.4**: what decides whether a pre-built wheel installs here |
 | `native_libs` | | **Added in 2.6**: which operating-system libraries the working run needed the machine to provide |
+| `contested_modules` | | **Added in 2.8**: for every folder several installed packages write into, which package the working run's copy came from |
 
 `gpu_model` is explicitly marked as not a rebuild constraint -- rebuilding on a
 different card is legitimate.
@@ -245,6 +247,68 @@ this field, each of them the result of a measurement that went the other way:
 | Names are **copied exactly as the program asked for them**, normalised in neither direction | Most entries name a file that does not exist under that name -- the driver library is asked for as `libcuda.so.1` while the file on disk carries the driver version, and one package asks for a name that already carries a minor version `[measured]` |
 | **Machine-provided is decided by where the library actually loaded from at pack time**, never by looking the name up | A common compression library sits under the same name inside an installed package while the run loads the machine's copy; the name lookup got it wrong on both chip families tested `[measured]` |
 | `method: "loaded"` may block a rebuild; **`method: "declared"` may only ever warn** | `declared` is the fallback used when no running application could be found, and it covers only part of what is really loaded while also listing libraries never loaded at all -- one machine was missing four of them while producing images perfectly well `[measured]` |
+
+**`contested_modules` (2.8)** -- an array; each entry describes one top-level
+module that several packages in the lock all write into:
+
+```jsonc
+{
+  "module": "cv2",                        // the import name = the folder they all write
+  "candidates": ["opencv-python", "opencv-contrib-python", "opencv-python-headless"],
+                                          // every such package the lock installs, in lock order (2 or more)
+  "winner": "opencv-python-headless",     // which one the working run's copy belonged to; one of candidates
+  "winner_evidence": {
+    "file": "cv2/cv2.abi3.so",            // relative to site-packages: the compiled file whose bytes decide behaviour
+    "sha256": "9e29…(64 hex)",            // that file **as installed** on the packing machine
+    "method": "record_hash"               // how the winner was told apart: record_hash | libs_dir
+  }
+}
+```
+
+**Why the format carries it `[measured]`.** The OpenCV family all unpack into
+one `cv2/` folder, so whichever installs last is the one that runs -- and the
+survivor decides which operating-system libraries the module needs (the two
+windowed variants ask the machine for `libGL.so.1` and `libxcb.so.1`; the
+headless one does not). The lock pins names and versions, **not install
+order**, and the installer runs in parallel: one nest restored three times
+back-to-back on one machine got a different survivor on one of the three, while
+`pip list` was identical every time. So neither the lock nor the package list
+can say which copy will run; only the packing machine knows which copy the
+working run used, and only the installed file's bytes identify it. On the
+packing machine the survivor was told apart two ways, in this order:
+`record_hash` -- one candidate's own installation record lists this file with
+exactly the hash on disk; `libs_dir` -- the survivor's own search path names one
+candidate's bundled-libraries folder (`opencv_python.libs`, and so on). Neither
+worked -> the packer writes no entry and says so in its report.
+
+**The hash is of the file as installed on the packing machine, never of a
+wheel's copy, and it is not a promise about other machines `[measured]`.** One
+package version ships several builds -- one per chip architecture, and for the
+OpenCV family two Linux builds of the same version on the same architecture --
+and which one lands depends on the machine installing. So the same package
+measured on an ARM machine and on an x86 machine gives two different
+fingerprints, and a consumer on a different chip (or whose installer picked the
+other Linux build) may still see a different hash **after** reinstalling the
+winner. That outcome is "same package, different build": said out loud, never
+refused. (What the installer does not do is rewrite the file: measured on a
+uv-installed environment, the survivor's bytes equal its package's own
+installation record exactly, which is what makes `record_hash` the first method.)
+
+**Consumer rule (both restore paths, and any reader you write).** After
+installing dependencies, hash `winner_evidence.file` under site-packages. Equal
+to `sha256` -> nothing to do. Different -> reinstall the `winner` **alone**, at
+the pin the lock gives it and without its dependencies, so it writes last; hash
+again. Equal now -> say that you reinstalled it. Still different -> say so and
+carry on (on another chip architecture, or with another Linux build of the same
+version, the bytes legitimately differ; the winner now writes last either way). **Never refuse a nest on this field**: it is a declared-level
+statement, so it may only ever warn (the same rule `native_libs.method:
+"declared"` lives under). A nest without the field behaves exactly as before.
+
+**Writer rules.** `winner` MUST be one of `candidates`; every candidate MUST be a
+package the lock installs; `candidates` has at least two entries (one package
+is not a contest); when the survivor cannot be identified, write **no entry**
+rather than a guess. `renest lint` refuses a winner outside its candidates and,
+when it can read the lock, a candidate the lock does not install.
 
 ### 3.2 `gpu` (optional) — what the packing machine's cards were `[schema]` `[measured]`
 
@@ -1376,3 +1440,38 @@ bigger card", those are not the same answer.
 **Why a whole version for one field.** The rule on this page is that an optional
 addition still gets a number (2.0 to 2.1 did). Editing 2.4 in place would leave
 one version number describing two different formats.
+
+---
+
+## 16. What 2.8 changed (2026-08-17)
+
+**One optional field, purely additive**: `runtime.contested_modules` (§3).
+Every 2.0-2.7 nest reads unchanged; a nest without the field behaves exactly as
+before on both restore paths.
+
+| # | Change | Breaks compatibility? | Why |
+|---|---|---|---|
+| ① | `runtime.contested_modules[]` -- for each folder several packages in the lock write into, which package the working run's copy came from, identified by the installed file's fingerprint | No (additive, optional) | Same lock, same machine, back-to-back installs -> a different survivor on one of three tries, `pip list` identical every time. Only the packing machine knows which copy worked, and only the installed bytes name it `[measured]` |
+
+**What forced it `[measured]`.** A real user environment carried
+`opencv-python-headless` and `opencv-python` side by side; the windowed one had
+won only because it was installed four hours later, seven extensions imported
+`cv2` through it, and on a cloud machine without `libGL.so.1` all seven would
+die with an error that names the library and not the cause. The environment
+was alive by luck of install order -- and a lock cannot pin luck.
+
+**Two steps, and why the first was not enough.** Step one (a tool change in the
+same release, no format change): after installing, name what the survivor needs
+that this machine lacks -- it turned a silent failure into a warning. Step two (this version): make the survivor the one that worked. A
+warning alone cannot do that, because the packing machine itself may install a
+different survivor next time; there is no stable "original" to check against
+unless the nest pins it.
+
+### Explicitly not done (2.8)
+
+| Not done | Why |
+|---|---|
+| Not a general "install order" record | Order is not what a lock can promise and not what decides the outcome; the surviving bytes are. Recording the file is smaller and exact |
+| No refusal on a mismatch | The statement is declared-level (read off installed files, not off the working run), and declared-level statements may only warn -- the same line `native_libs` draws |
+| The list of contested families is not in the format | Which packages collide is world knowledge that changes without the format changing; it ships with the tool's rules today (`cv2` first) and can move to the signed rules bundle without a version bump |
+| No per-file list, one file per module | The compiled module is what decides behaviour; the rest of the folder follows it |

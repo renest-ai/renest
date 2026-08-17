@@ -2,10 +2,10 @@
 # =============================================================================
 # Renest restore.sh — the escape hatch
 #
-# Nest formats this copy reads: 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7  (and, with a warning,
+# Nest formats this copy reads: 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8  (and, with a warning,
 #   any later 2.x — a higher minor version only ever adds optional fields, and
 #   refusing one would turn a nest whose bytes restore perfectly into a brick).
-#   Written for format 2.7, 2026-08-12. Keep this line: from format 2.3 on a
+#   Written for format 2.8, 2026-08-17. Keep this line: from format 2.3 on a
 #   copy of this script travels inside every nest at .renest/escape/restore.sh,
 #   and this comment is how you tell which copy you are holding — there is no
 #   version field anywhere else.
@@ -268,11 +268,19 @@ FV=$(jq -r '.format_version' "$MANIFEST")
 # never read that field and still does not — where a file lands is decided by its
 # path and its root, never by its category. Nothing to do here beyond letting the
 # version through, and every 2.0–2.6 nest restores unchanged.
+# 2.8 (2026-08-17) adds one optional field, and **this script acts on it**: which
+# copy of a module the working run used when several packages in the lock all write
+# the same folder (the OpenCV family all write cv2/). The installer decides who
+# writes last, and not stably — measured, one lock on one machine gave a different
+# survivor on back-to-back installs. So after installing, this script checks the
+# recorded file's hash and, if it differs, reinstalls that one package so it writes
+# last (section 5b). Still different → it says so and carries on. Every 2.0–2.7 nest
+# restores unchanged: the field is absent there, and absent means "do nothing".
 case "$FV" in
-  2.0|2.1|2.2|2.3|2.4|2.5|2.6|2.7) ;;
+  2.0|2.1|2.2|2.3|2.4|2.5|2.6|2.7|2.8) ;;
   2.*)
-    warn "This nest says format $FV; this script knows up to 2.7. Same major version, so it only adds optional fields this script does not use — carrying on. A newer Renest will make full use of them." ;;
-  *) die FORMAT-VERSION "Unrecognised nest format version: $FV — this script reads format 2.x (knows 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6 and 2.7). Nests in the older 1.x format cannot be read here. Pack the environment again with a current Renest." ;;
+    warn "This nest says format $FV; this script knows up to 2.8. Same major version, so it only adds optional fields this script does not use — carrying on. A newer Renest will make full use of them." ;;
+  *) die FORMAT-VERSION "Unrecognised nest format version: $FV — this script reads format 2.x (knows 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7 and 2.8). Nests in the older 1.x format cannot be read here. Pack the environment again with a current Renest." ;;
 esac
 
 # ---- Where the files may land ------------------------------------------------
@@ -783,6 +791,48 @@ VIRTUAL_ENV="$TARGET/.venv" uv pip sync "$TARGET/.renest/requirements.lock" || d
        (3) a pinned wheel link returns 404 because that build was removed upstream.
            The Renest agent falls back to the generic version automatically; this
            script does not. Edit that line to name==version and run it again."
+
+# ---- 5b. Several packages wrote the same folder: make the survivor the one that worked (format 2.8)
+# The OpenCV family (opencv-python / -contrib / -headless) all write cv2/, and the
+# installer decides who writes last — not stably: measured 2026-08-17, one lock on
+# one machine gave a different survivor on back-to-back installs, and the survivor
+# decides which machine libraries the module needs. The nest records which copy the
+# working run used, as the hash of the installed file. Differ → reinstall that one
+# package alone (its own line from the lock, no dependencies) so it writes last,
+# then check again. Still different → say so. **This script tells you, it never refuses.**
+_N_CM=$(jq -r '(.runtime.contested_modules // []) | length' "$MANIFEST")
+_i=0
+while [ "$_i" -lt "$_N_CM" ]; do
+  _MOD=$(jq -r ".runtime.contested_modules[$_i].module" "$MANIFEST")
+  _WIN=$(jq -r ".runtime.contested_modules[$_i].winner" "$MANIFEST")
+  _REL=$(jq -r ".runtime.contested_modules[$_i].winner_evidence.file" "$MANIFEST")
+  _WANT=$(jq -r ".runtime.contested_modules[$_i].winner_evidence.sha256" "$MANIFEST")
+  _i=$((_i + 1))
+  _F=$(ls "$TARGET"/.venv/lib/python3*/site-packages/"$_REL" 2>/dev/null | head -1 || true)
+  _GOT=""; [ -n "$_F" ] && [ -f "$_F" ] && _GOT=$(sha256_of "$_F")
+  if [ "$_GOT" = "$_WANT" ]; then
+    log "The installed copy of $_MOD is the one your working setup used."
+    continue
+  fi
+  # The winner's own line from the lock (name==version or name @ url), hash options
+  # dropped; spelling of the name is matched loosely (- _ . are interchangeable).
+  _REQ=$(grep -iE "^${_WIN//[-_.]/[-_.]}[[:space:]]*(==|@)" "$TARGET/.renest/requirements.lock" 2>/dev/null | head -1 | sed -E 's/[[:space:]]+--hash=.*//; s/[[:space:]]+#.*//; s/[[:space:]]*\\$//' || true)
+  if [ -z "$_REQ" ]; then
+    warn "The copy of $_MOD installed here is not the one your working setup used, and $_WIN is not pinned in this nest's dependency list, so it could not be reinstalled. Carrying on: anything that imports $_MOD may behave differently from the run that worked."
+    continue
+  fi
+  if ! VIRTUAL_ENV="$TARGET/.venv" uv pip install --reinstall --no-deps "$_REQ"; then
+    warn "The copy of $_MOD installed here is not the one your working setup used, and reinstalling $_WIN failed (uv's output above says why). Carrying on: anything that imports $_MOD may behave differently from the run that worked."
+    continue
+  fi
+  _F=$(ls "$TARGET"/.venv/lib/python3*/site-packages/"$_REL" 2>/dev/null | head -1 || true)
+  _GOT=""; [ -n "$_F" ] && [ -f "$_F" ] && _GOT=$(sha256_of "$_F")
+  if [ "$_GOT" = "$_WANT" ]; then
+    warn "The copy of $_MOD that ended up installed was not the one your working setup used; reinstalled $_WIN so it is."
+  else
+    warn "The copy of $_MOD installed here is not the one your working setup used; $_WIN was reinstalled and now writes last, but its $_REL is a different build from the one your working setup had. Carrying on: anything that imports $_MOD may behave differently from the run that worked."
+  fi
+done
 fi
 T_DEPS_END=$(date +%s)
 

@@ -25,9 +25,11 @@ from pathlib import Path, PurePosixPath
 
 import httpx
 
+from .envlock import canonical_name
 from .errors import ExitCode
 from .integrity import probe_model_bytes
 from .roots import MAX_MANIFEST_FILES, bad_entrypoint_env
+from .syslibs import lock_requirements
 
 #: URLs inside the lock text. Same shape as ``wheels._ANY_URL``; lint does not
 #: import wheels, to keep its dependency surface thin.
@@ -312,6 +314,21 @@ def lint(
              "needed, and then lists none. Collecting nothing means writing nothing: an "
              "empty list reads as 'this run needed no libraries from the machine', which "
              "is a claim, not an absence.")
+    # Format 2.8: contested modules. The schema holds the shape (the fingerprint
+    # must be 64 lower-case hex characters, the method one of two words); this is
+    # the one relation the schema cannot say. The winner is what a restore
+    # reinstalls, so a winner outside the candidate list would reinstall a
+    # package that never wrote that folder -- and change nothing.
+    _cm = [e for e in ((m.get("runtime") or {}).get("contested_modules") or [])
+           if isinstance(e, dict)]
+    for _i, _e in enumerate(_cm):
+        _cands = [c for c in (_e.get("candidates") or []) if isinstance(c, str)]
+        if _e.get("winner") not in _cands:
+            err("contested-winner-not-a-candidate",
+                f"runtime.contested_modules[{_i}] ({_e.get('module')}): the winner "
+                f"{_e.get('winner')!r} is not one of the candidates {_cands}. A restore "
+                f"reinstalls the winner to make it write last; a package that never wrote "
+                f"this folder cannot be that.")
 
     # Cross-field checks the schema cannot express (format 2.4). The writing side
     # already gets these right; this catches nests built by anything else.
@@ -604,6 +621,17 @@ def lint(
         lock_blob = (m.get("python_lock") or {}).get("lockfile") or {}
         lock_path = base / str(lock_blob.get("sha256", ""))[:2] / str(lock_blob.get("sha256", ""))
         if lock_blob.get("sha256") and lock_path.exists():
+            # Format 2.8: every candidate of a contested module must be a package
+            # this lock installs -- the field describes a contest between packages
+            # in the lock, and a name outside it describes nothing.
+            _in_lock = {n for n, _ in lock_requirements(lock_path.read_text(errors="replace"))}
+            for _i, _e in enumerate(_cm):
+                for _c in (_e.get("candidates") or []):
+                    if isinstance(_c, str) and canonical_name(_c) not in _in_lock:
+                        err("contested-candidate-not-in-lock",
+                            f"runtime.contested_modules[{_i}] ({_e.get('module')}): candidate "
+                            f"{_c!r} is not in this nest's dependency lock, so it cannot be "
+                            f"one of the packages competing for that folder.")
             wheel_urls = [
                 u for u in _ANY_URL_IN_LOCK.findall(lock_path.read_text(errors="replace"))
                 if u.endswith(".whl")

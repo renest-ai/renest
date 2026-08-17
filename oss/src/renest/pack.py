@@ -55,7 +55,7 @@ from .errors import NestFailure, ErrorClass, ExitCode
 from .events import EventEmitter
 from .doctor import LEVEL_PASS, check_lock_cuda_family
 from .fingerprint import collect, collect_gpu, collect_wheel_env
-from .syslibs import collect_native_libs
+from .syslibs import collect_native_libs, contested_winners, interpreter_site_packages
 from .integrity import (
     declared_base_model,
     dirty_gap,
@@ -968,6 +968,15 @@ def _base_image_for_manifest(spec_img: object, warnings: list[str]) -> dict | No
     return out
 
 
+def _site_packages_for(root: Path, env_python: str | None) -> Path | None:
+    """The installed-packages folder of the environment being packed: asked of its
+    interpreter when one can run here, found by layout when not."""
+    cand = root / ".venv" / "bin" / "python"
+    py = env_python or (str(cand) if cand.exists() else None)
+    sp = interpreter_site_packages(py) if py else None
+    return sp if sp is not None else find_site_packages(root)
+
+
 def _foreign_env_kernel(root: Path, env_python: str | None) -> str | None:
     """The other machine's name when the environment being packed was built for one.
 
@@ -1009,7 +1018,7 @@ def _build_manifest(
     # from "hung".
     tracker = _ProgressTracker(emitter, root, spec) if (emitter and not dry_run) else None
     manifest: dict = {
-        "format_version": "2.7",
+        "format_version": "2.8",
         "id": nest_id,
         "created_at": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "runtime": spec["runtime"],
@@ -1516,6 +1525,20 @@ def _build_manifest(
             manifest["python_lock"]["pinned_wheel_urls"] = len(pinned)
         if pl.get("wheels_archived"):
             manifest["python_lock"]["wheels_archived"] = True
+        # Contested modules (format 2.8): several packages in this lock write the
+        # same folder, and the installer decides who writes last -- **not stably**
+        # (measured 2026-08-17: one lock, one machine, a different survivor on
+        # back-to-back installs). Only this machine knows which copy the working
+        # run used, so record it: the file as installed and which package it
+        # came from. Nothing found -> nothing written; the note says why.
+        _sp = _site_packages_for(root, env_python)
+        if _sp is not None:
+            _won, _notes = contested_winners(_sp, lock_text_for_audit)
+            if _won:
+                rt = dict(manifest.get("runtime") or {})
+                rt.setdefault("contested_modules", _won)
+                manifest["runtime"] = rt
+            warnings.extend(_notes)
         # Do not add convenience fields here. The manifest schema forbids any key
         # it does not define, so a new field is a format change: version bump
         # plus a human running the escape hatch end to end by hand. A CUDA tag,

@@ -16,21 +16,34 @@ carries itself as missing, and got the direction wrong on others.
 
 from __future__ import annotations
 
+import base64
+import csv
+import hashlib
 import os
 import re
 import struct
 import subprocess
 from pathlib import Path
 
+from .envlock import canonical_name, installed_dist_infos
+
 __all__ = [
+    "CONTESTED_MODULES",
     "collect_native_libs",
+    "contested_module_missing_libs",
+    "contested_winners",
     "elf_needed",
+    "elf_runpaths",
     "elf_soname",
+    "interpreter_site_packages",
+    "lock_requirement_for",
+    "lock_requirements",
     "looks_like_the_working_run",
     "missing_native_libs",
 ]
 
 _DT_NULL, _DT_NEEDED, _DT_STRTAB, _DT_STRSZ, _DT_SONAME = 0, 1, 5, 10, 14
+_DT_RPATH, _DT_RUNPATH = 15, 29
 
 #: Where a distribution keeps its shared libraries. Used to answer "is this name on
 #: this machine", never to decide what a nest needs -- that question is answered by
@@ -62,8 +75,8 @@ def _is_lib(name: str) -> bool:
 
 
 def _read_elf(path: Path) -> tuple[str | None, list[str]] | None:
-    """Return (this file's own name, the names it declares it needs), or None when
-    the file is not a shared object we can read.
+    """Return (this file's own name, the names it declares it needs, the folders it
+    says to search first), or None when the file is not a shared object we can read.
 
     Parsed by hand rather than shelled out to, because the escape hatch's dependency
     promise is the model here: no new tool on the machine, and no import of anything
@@ -109,6 +122,7 @@ def _read_elf(path: Path) -> tuple[str | None, list[str]] | None:
             data = f.read(dyn[1])
             step, fmt = (16, end + "Qq") if is64 else (8, end + "Ii")
             needed_at: list[int] = []
+            runpath_at: list[int] = []
             soname_at: int | None = None
             strtab_v = strsz = None
             for i in range(0, len(data) - step + 1, step):
@@ -119,6 +133,8 @@ def _read_elf(path: Path) -> tuple[str | None, list[str]] | None:
                     needed_at.append(val)
                 elif tag == _DT_SONAME:
                     soname_at = val
+                elif tag in (_DT_RPATH, _DT_RUNPATH):
+                    runpath_at.append(val)
                 elif tag == _DT_STRTAB:
                     strtab_v = val
                 elif tag == _DT_STRSZ:
@@ -137,7 +153,9 @@ def _read_elf(path: Path) -> tuple[str | None, list[str]] | None:
                 end_at = strtab.find(b"\0", pos)
                 return strtab[pos:end_at if end_at >= 0 else None].decode("utf-8", "replace")
 
-            return (s(soname_at) if soname_at is not None else None, [s(o) for o in needed_at])
+            runpaths = [seg for o in runpath_at for seg in s(o).split(":") if seg]
+            return (s(soname_at) if soname_at is not None else None,
+                    [s(o) for o in needed_at], runpaths)
     except (OSError, struct.error, ValueError, IndexError):
         return None
 
@@ -150,6 +168,13 @@ def elf_soname(path: Path) -> str | None:
 def elf_needed(path: Path) -> list[str]:
     got = _read_elf(path)
     return got[1] if got else []
+
+
+def elf_runpaths(path: Path) -> list[str]:
+    """The search folders a shared object names for its own libraries (RPATH /
+    RUNPATH), ``$ORIGIN`` left as written."""
+    got = _read_elf(path)
+    return got[2] if got else []
 
 
 def _under(path: Path, roots: list[Path]) -> bool:
@@ -335,6 +360,16 @@ def _interpreter_home(python: str | os.PathLike[str]) -> Path | None:
     return _interpreter_prefixes(python)[1]
 
 
+def interpreter_site_packages(python: str | os.PathLike[str]) -> Path | None:
+    """The site-packages folder of the environment this interpreter runs in,
+    asked of the interpreter itself; None when it cannot be asked."""
+    prefix, _ = _interpreter_prefixes(python)
+    if prefix is None:
+        return None
+    hits = sorted(prefix.glob("lib/python*/site-packages")) or sorted(prefix.glob("Lib/site-packages"))
+    return hits[0] if hits else None
+
+
 def collect_native_libs(
     env_root: str | os.PathLike[str], python: str | os.PathLike[str] | None = None
 ) -> dict | None:
@@ -391,3 +426,208 @@ def missing_native_libs(names: list[str] | tuple[str, ...]) -> list[str]:
     return [n for n in names
             if isinstance(n, str) and n
             and not any((Path(d) / n).exists() for d in LIB_DIRS)]
+
+
+#: Package families that all ship the same top-level module, so installing them
+#: together makes the later ones overwrite the earlier ones' files. Which copy
+#: survives decides which system libraries the module needs -- and the survivor
+#: is not stable: measured 2026-08-17, the same lock on the same machine produced
+#: a different survivor on back-to-back installs.
+CONTESTED_MODULES: dict[str, tuple[str, ...]] = {
+    "cv2": ("opencv-python", "opencv-contrib-python", "opencv-python-headless"),
+}
+
+
+def contested_module_missing_libs(site_packages: Path) -> dict[str, list[str]]:
+    """For each contested module actually installed: system libraries its
+    installed binaries declare they need, that the environment does not carry
+    and this machine does not have.
+
+    A declared-method statement (see module docstring): it may only ever warn.
+    Names satisfied by files the environment carries next to the module (the
+    ``*.libs`` convention wheels use) are not missing -- that mistake is exactly
+    why ``ldd`` was rejected above."""
+    out: dict[str, list[str]] = {}
+    carried = {p.name: p for p in site_packages.glob("*.libs/*") if p.is_file()}
+    for mod in CONTESTED_MODULES:
+        mod_dir = site_packages / mod
+        if not mod_dir.is_dir():
+            continue
+        # Walk **through** the libraries the wheel carries: `cv2.abi3.so` itself
+        # asks for the bundled Qt, and it is Qt that asks the machine for
+        # `libxcb.so.1` -- measured 2026-08-17, reading only the top level said
+        # "nothing missing" on a machine where `import cv2` died on exactly that.
+        # Names the machine has are not descended into: nothing to find there.
+        seen: set[str] = set()
+        needed: set[str] = set()
+        queue = [so for so in mod_dir.glob("*.so")]
+        while queue:
+            so = queue.pop()
+            for name in elf_needed(so):
+                if name in seen:
+                    continue
+                seen.add(name)
+                if name in carried:
+                    queue.append(carried[name])
+                else:
+                    needed.add(name)
+        gaps = missing_native_libs(sorted(n for n in needed if _is_lib(n)))
+        if gaps:
+            out[mod] = gaps
+    return out
+
+
+# --------------------------------------------------------------------------
+# Contested modules, pack side (format 2.8): which candidate won on this machine
+# --------------------------------------------------------------------------
+#: One requirement line of a lock: ``name==version`` or ``name @ url``, with an
+#: optional ``[extras]``. Hash options and continuation backslashes come after.
+_LOCK_REQ = re.compile(
+    r"^\s*([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)(?:\[[^\]]*\])?\s*(?:==|@)\s*\S"
+)
+
+
+def lock_requirements(lock_text: str) -> list[tuple[str, str]]:
+    """``(canonical name, requirement)`` for every requirement line of a lock, in
+    file order. The requirement is the line with hash options, comments and the
+    trailing continuation backslash removed -- exactly what an installer accepts
+    on its command line."""
+    out: list[tuple[str, str]] = []
+    for line in (lock_text or "").splitlines():
+        m = _LOCK_REQ.match(line)
+        if not m:
+            continue
+        req = line.split(" #", 1)[0]
+        req = re.split(r"\s+--hash=", req, 1)[0]
+        req = req.rstrip().rstrip("\\").strip()
+        if req:
+            out.append((canonical_name(m.group(1)), req))
+    return out
+
+
+def lock_requirement_for(lock_text: str, name: str) -> str | None:
+    """The requirement line pinning ``name`` in this lock, or None."""
+    want = canonical_name(name)
+    return next((req for n, req in lock_requirements(lock_text) if n == want), None)
+
+
+def _record_hashes(dist_info: Path) -> dict[str, str]:
+    """RECORD rows -> ``{path: sha256 hex}`` for the rows that carry a sha256."""
+    rec = dist_info / "RECORD"
+    out: dict[str, str] = {}
+    try:
+        with rec.open(encoding="utf-8", errors="replace", newline="") as fh:
+            for row in csv.reader(fh):
+                if len(row) < 2 or not row[1].startswith("sha256="):
+                    continue
+                digest = row[1][len("sha256="):]
+                try:
+                    out[row[0]] = base64.urlsafe_b64decode(digest + "=" * (-len(digest) % 4)).hex()
+                except (ValueError, TypeError):
+                    continue
+    except OSError:
+        return {}
+    return out
+
+
+def _sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _survivor_file(mod_dir: Path, module: str) -> Path | None:
+    """The compiled file whose bytes decide the module's behaviour: the extension
+    module itself, whichever suffix this platform gives it."""
+    for pattern in (f"{module}*.so", f"{module}*.pyd", f"{module}*.dylib"):
+        hits = sorted(p for p in mod_dir.glob(pattern) if p.is_file())
+        if hits:
+            return hits[0]
+    return None
+
+
+def contested_winners(site_packages: Path, lock_text: str) -> tuple[list[dict], list[str]]:
+    """For each contested module the lock installs more than one candidate of:
+    which candidate the surviving copy in ``site_packages`` belongs to.
+
+    Returns ``(entries for runtime.contested_modules, notes for the pack report)``.
+    Two ways of telling, tried in this order and recorded in ``winner_evidence.method``:
+    ``record_hash`` -- one candidate's RECORD lists the survivor with the very hash
+    on disk; ``libs_dir`` -- the survivor's own search path (RUNPATH), or the
+    bundled libraries it names, points into one candidate's ``*.libs`` folder.
+    Neither -> no entry, one note. **The hash written is the file as installed**,
+    never the wheel's: measured 2026-08-17, the two differ."""
+    entries: list[dict] = []
+    notes: list[str] = []
+    order = [n for n, _ in lock_requirements(lock_text)]
+    dists: dict[str, Path] | None = None
+    for module, family in CONTESTED_MODULES.items():
+        candidates = sorted(
+            (f for f in family if canonical_name(f) in order),
+            key=lambda f: order.index(canonical_name(f)),
+        )
+        if len(candidates) < 2:
+            continue
+        mod_dir = site_packages / module
+        survivor = _survivor_file(mod_dir, module) if mod_dir.is_dir() else None
+        if survivor is None:
+            notes.append(
+                f"The dependency list installs {len(candidates)} packages that all write "
+                f"`{module}/`, but no compiled `{module}` module was found in this environment, "
+                f"so which one your run used is not recorded. A rebuild installs them in "
+                f"whatever order the installer picks."
+            )
+            continue
+        rel = f"{module}/{survivor.name}"
+        disk = _sha256_of(survivor)
+        if dists is None:
+            dists = installed_dist_infos(site_packages)
+        records = {c: _record_hashes(dists[canonical_name(c)])
+                   for c in candidates if canonical_name(c) in dists}
+        winner, method = None, None
+        by_hash = [c for c, rec in records.items() if rec.get(rel) == disk]
+        if len(by_hash) == 1:
+            winner, method = by_hash[0], "record_hash"
+        else:
+            hint = _libs_dir_family(survivor, site_packages)
+            claimants = [c for c in candidates
+                         if hint is not None
+                         and canonical_name(c).replace("-", "_") == hint
+                         and rel in records.get(c, {})]
+            if len(claimants) == 1:
+                winner, method = claimants[0], "libs_dir"
+        if winner is None:
+            notes.append(
+                f"{len(candidates)} packages in the dependency list all write `{module}/` "
+                f"({', '.join(candidates)}), and we could not tell which one the installed "
+                f"copy came from, so it is not recorded. A rebuild installs them in whatever "
+                f"order the installer picks, and the copy that ends up used may differ."
+            )
+            continue
+        entries.append({
+            "module": module,
+            "candidates": candidates,
+            "winner": winner,
+            "winner_evidence": {"file": rel, "sha256": disk, "method": method},
+        })
+    return entries, notes
+
+
+def _libs_dir_family(survivor: Path, site_packages: Path) -> str | None:
+    """The family a compiled module belongs to, read from the ``<family>.libs``
+    folder it searches (RUNPATH), or failing that from which ``*.libs`` folder
+    holds the bundled libraries it names. Returns the folder stem, or None."""
+    for seg in elf_runpaths(survivor):
+        stem = Path(seg).name
+        if stem.endswith(".libs"):
+            return stem[:-len(".libs")]
+    needed = set(elf_needed(survivor))
+    if not needed:
+        return None
+    holders = [d for d in sorted(site_packages.glob("*.libs")) if d.is_dir()
+               and any((d / n).exists() for n in needed)]
+    if len(holders) == 1:
+        return holders[0].name[:-len(".libs")]
+    return None
