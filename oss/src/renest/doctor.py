@@ -1257,9 +1257,16 @@ def check_observed_vram(nest_gpu: dict | None, local_bytes: int | None = None) -
     use = ((nest_gpu or {}).get("observed_use") or {})
     used, samples = use.get("max_used_bytes"), use.get("samples")
     if not isinstance(used, int) or used <= 0:
+        # **Say which of the two it is.** The old wording ("this nest carries no reading")
+        # reads as though this one nest were old or unusual, while *no* nest carries the
+        # figure: nothing in the tool writes it yet, so this check has never once fired.
+        # A report line that looks like a passed check, on a check that cannot run, is
+        # worse than no line at all -- people read it as "the card was sized up".
         return CheckResult("observed_vram", "skip",
-                           "This nest carries no reading of how much video memory its run "
-                           "used, so there is nothing to compare.", {})
+                           "Renest does not yet measure how much video memory a working "
+                           "run uses, so no nest carries that figure and this check cannot "
+                           "run. Nothing here has sized this card up against the job.",
+                           {"never_measured": True})
     have = local_bytes if local_bytes is not None else _local_vram_bytes()
     every = use.get("sample_interval_s")
     seen = (f"{used / 2**30:.1f} GiB (largest of {samples} readings taken every "
@@ -1397,7 +1404,13 @@ def check_gpu_generation(this_cap: str, captured_on: dict | None) -> CheckResult
     nest's torch was compiled for, this one asks what really ran. The exact generation
     has been recorded on every nest the product ever packed and, until now, nothing read
     it -- so when a nest carries no build-target list this was the only signal available
-    and it went unused."""
+    and it went unused.
+
+    **This one never reassures.** It used to end "allowed and usually fine". Measured
+    2026-08-18: three Blackwell machines read that line, passed the pre-flight, and died
+    on ``no kernel image is available`` -- while the check that could have refused them
+    sat next door reporting "no torch build targets ... unverified". Saying "usually
+    fine" next to "I could not check" is the product guessing on the user's behalf."""
     want = (captured_on or {}).get("cuda_compute") or (captured_on or {}).get("sm_arch") or ""
     reading = {"nest": want or None, "this": this_cap or None,
                "captured_on": (captured_on or {}).get("name")}
@@ -1414,8 +1427,9 @@ def check_gpu_generation(this_cap: str, captured_on: dict | None) -> CheckResult
     return CheckResult(
         "gpu_generation", LEVEL_WARN,
         f"This run worked on an sm_{_arch_num(want)} card and this machine has "
-        f"sm_{_arch_num(this_cap)}. Rebuilding on a different card is allowed and usually "
-        f"fine — but if something behaves oddly later, this is the difference.",
+        f"sm_{_arch_num(this_cap)}. Rebuilding on a different card is allowed, but nothing "
+        f"here says it will work: whether this nest's torch carries kernels for this card is "
+        f"the separate gpu_arch check — read that one.",
         reading)
 
 

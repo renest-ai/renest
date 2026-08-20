@@ -71,6 +71,50 @@ def _rel_to(p: Path, root: Path) -> str | None:
         return None
 
 
+def _abs_from(value: str, anchor: Path) -> Path:
+    """Resolve a path out of a config, which may be absolute or relative to the config."""
+    p = Path(value)
+    return p if p.is_absolute() else anchor / p
+
+
+def _under(parent: Path, child: Path) -> str | None:
+    """``child`` expressed relative to ``parent``, or None when it is not inside it.
+
+    Both sides go through resolve() first: one symlinked folder on either side is enough
+    to make a plain string compare answer "not inside" when it is.
+    """
+    try:
+        return child.resolve().relative_to(parent.resolve()).as_posix()
+    except (ValueError, OSError):
+        return None
+
+
+def _keep_user_data_out(install_path: str, root: Path, user_data: list[str],
+                        gaps: list[str]) -> list[str] | None:
+    """Excludes that keep the user's images and training results out of a code archive.
+
+    Neither your images nor the weights a training run produced travel with a nest.
+    Both are named in the config, and the config usually sits right beside them, so
+    archiving that folder wholesale sweeps them in — measured 2026-08-18: a 3.1 GB
+    dataset became a 3.2 GB "code" archive while the manifest still said the data
+    stayed home. Returns None when the folder *is* the data.
+    """
+    top = root / install_path
+    out: list[str] = []
+    for value in user_data:
+        rel = _under(top, Path(value))
+        if rel is None:
+            continue
+        if rel == ".":
+            gaps.append(
+                f"Your images or training results sit at the top of {install_path}, the same "
+                f"folder your config lives in — we pack the config on its own instead of "
+                f"archiving that folder, because your data never travels with the nest.")
+            return None
+        out.append(rel)
+    return sorted(set(out))
+
+
 def _license_unknown(note: str) -> dict:
     """A licence we cannot confirm always defaults to gated (deny by default)."""
     return {
@@ -187,6 +231,14 @@ def _capture_kohya(rec: dict, root: Path, hub_root: Path, hf_home: Path) -> tupl
     files: list[dict] = []
     redactions: list[dict] = []
     config_files: list[str] = []
+    # Paths that must never end up inside a code archive, collected as we read the run.
+    # Declaring them in redactions is not enough on its own: the folder holding the config
+    # is archived whole further down, and it is usually the folder holding these too.
+    user_data: list[str] = []
+    for flag in ("--train_data_dir", "--reg_data_dir"):
+        val = _flag(argv, flag)
+        if val:
+            user_data.append(str(_abs_from(val, root)))
 
     # ---- Outputs: never packed, but accounted for honestly (never dropped silently) ----
     for flag, role in (("--output_dir", "output_dir"), ("--output_name", "output_name"),
@@ -194,6 +246,8 @@ def _capture_kohya(rec: dict, root: Path, hub_root: Path, hf_home: Path) -> tupl
         val = _flag(argv, flag)
         if val is None:
             continue
+        if flag != "--output_name":
+            user_data.append(str(_abs_from(val, root)))
         idx = next((i for i, a in enumerate(argv)
                     if a == val or a.endswith("=" + val)), None)
         redactions.append({
@@ -249,6 +303,7 @@ def _capture_kohya(rec: dict, root: Path, hub_root: Path, hf_home: Path) -> tupl
                             "note": "Your training recipe — treated as yours."},
             })
             for key, value in _toml_image_dirs(Path(ds_cfg)):
+                user_data.append(str(_abs_from(value, Path(ds_cfg).parent)))
                 redactions.append({
                     "locator": {"file": rel, "key": key},
                     "role": "dataset",
@@ -277,7 +332,7 @@ def _capture_kohya(rec: dict, root: Path, hub_root: Path, hf_home: Path) -> tupl
             ext = (_flag(argv, "--save_model_as") or "safetensors").lstrip(".")
             expect = f"{rel_out}/{out_name}.{ext}"
     return ({"files": files, "redactions": redactions, "config_files": config_files,
-             "expect_artifact": expect}, {"gaps": gaps})
+             "expect_artifact": expect, "user_data_paths": user_data}, {"gaps": gaps})
 
 
 def _toml_image_dirs(path: Path) -> list[tuple[str, str]]:
@@ -339,6 +394,7 @@ def _capture_llamafactory(rec: dict, root: Path, hub_root: Path, hf_home: Path) 
     files: list[dict] = []
     redactions: list[dict] = []
     config_files: list[str] = []
+    user_data: list[str] = []   # never archived — see _keep_user_data_out
 
     # The whole recipe is in that YAML file (argv is minimal here)
     yaml_arg = next((a for a in argv[1:] if a.endswith((".yaml", ".yml"))), None)
@@ -391,6 +447,10 @@ def _capture_llamafactory(rec: dict, root: Path, hub_root: Path, hf_home: Path) 
             "placeholder": "<pick your own output folder after rebuilding>",
             "note": "This pointed at where your training results went.",
         })
+    for key in ("output_dir", "dataset_dir"):
+        val = cfg.get(key)
+        if isinstance(val, str) and val:
+            user_data.append(str(_abs_from(val, ypath.parent)))
 
     # Dataset: **first work out whether the training software ships it**; if it does, the user
     # fills in nothing, because it travels with the nest inside the framework source. Calling
@@ -404,6 +464,10 @@ def _capture_llamafactory(rec: dict, root: Path, hub_root: Path, hf_home: Path) 
                 f"The training data named here ({ds}) ships with the framework itself, "
                 f"so it travels with the nest — nothing for you to point at after rebuilding.")
         else:
+            # A user dataset given as a path has to stay out of the archive as well; given as
+            # a bare name it addresses something inside the framework and there is no path.
+            if isinstance(ds, str) and ("/" in ds or "\\" in ds):
+                user_data.append(str(_abs_from(ds, ypath.parent)))
             redactions.append({
                 "locator": {"file": rel or ypath.name, "key": "dataset"},
                 "role": "dataset",
@@ -427,7 +491,7 @@ def _capture_llamafactory(rec: dict, root: Path, hub_root: Path, hf_home: Path) 
 
     files.extend(_collect_accelerate(hf_home, gaps))
     return ({"files": files, "redactions": redactions, "config_files": config_files,
-             "expect_artifact": expect}, {"gaps": gaps})
+             "expect_artifact": expect, "user_data_paths": user_data}, {"gaps": gaps})
 
 
 
@@ -667,13 +731,19 @@ def capture_training(
 
     # ---- code_deps: the host plus the user's own code (the neutral three-way role) ----
     code_deps: list[dict] = []
+    user_data: list[str] = parsed.get("user_data_paths", [])
     cwd_rel = _rel_to(Path(run_record["cwd"]), root) if run_record.get("cwd") else None
     if cwd_rel:
         host = cwd_rel.split("/", 1)[0]
+        # The name list below only catches the conventional folder names. Anything the run
+        # actually named — output_dir inside the framework checkout is the common one —
+        # has to come off by path, or it rides along under a name nobody guessed.
+        named = _keep_user_data_out(host, root, user_data, gaps) or []
         dep = {
             "name": host, "role": "host", "install_path": host,
             # Outputs and regenerables stay out of the code archive (recipe, not result)
-            "exclude": ["out", "outputs", "logs", "__pycache__", ".venv", "wandb"],
+            "exclude": sorted({"out", "outputs", "logs", "__pycache__", ".venv", "wandb",
+                               *named}),
         }
         # The framework's own revision — **this is what makes "upstream changed and it broke"
         # recognisable**. Written only when it can be read.
@@ -699,8 +769,13 @@ def capture_training(
         top = cfg.split("/", 1)[0]
         if any(d["install_path"] == top for d in code_deps) or "/" not in cfg:
             continue
+        # kohya's own layout is train/dataset.toml beside train/10_name/*.png, so this is
+        # the folder that swallows the user's images unless they are excluded by path.
+        named = _keep_user_data_out(top, root, user_data, gaps)
+        if named is None:
+            continue
         code_deps.append({"name": top, "role": "user_code", "install_path": top,
-                          "exclude": ["__pycache__"]})
+                          "exclude": sorted({"__pycache__", *named})})
 
     ep = _entrypoint(run_record, root, parsed["redactions"], gaps,
                      expect_artifact=parsed.get("expect_artifact"))

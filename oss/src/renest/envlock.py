@@ -26,6 +26,7 @@ __all__ = [
     "LOCK_FROM_INSTALLED_HEADER",
     "LOCK_FROM_ENV_HEADER",
     "canonical_name",
+    "distro_owned_packages",
     "env_dir_of",
     "find_env_python",
     "find_launchers",
@@ -37,7 +38,24 @@ __all__ = [
     "launcher_interpreter_dir",
     "interpreter_python_series",
     "venv_python_candidates",
+    "is_system_interpreter",
 ]
+
+#: Packages the operating system installs into its own Python and that no package index
+#: carries. A lock naming any of them can never be installed on another machine — pinning
+#: to a wheel URL does not help, because no wheel was ever published.
+DISTRO_ONLY_PACKAGES = frozenset({
+    "python-apt", "pygobject", "dbus-python", "launchpadlib", "lazr-restfulclient",
+    "lazr-uri", "python-debian", "distro-info", "command-not-found", "ufw",
+    "ubuntu-drivers-common", "systemd-python", "apt-clone", "unattended-upgrades",
+    "sos", "cloud-init", "netifaces", "pycurl", "python-apt-dbg", "gpg", "louis",
+    "ubuntu-pro-client", "screen-resolution-extra", "xkit",
+})
+
+#: Local-version suffixes a distribution stamps on its own rebuilds (PEP 440 local part).
+#: ``+cu124`` is a vendor build and is a different problem with a different fix, so it is
+#: deliberately not in here.
+DISTRO_LOCAL_MARKERS = ("+ubuntu", "+deb", "+dfsg", "+ds", "+really", "+esm")
 
 
 def canonical_name(name: str) -> str:
@@ -63,6 +81,49 @@ _FREEZE_SNIPPET = (
     "key=lambda kv: kv[0].lower());"
     "print('\\n'.join(f'{n}=={v}' for n, v in seen if v))"
 )
+
+
+def distro_owned_packages(lock_text: str) -> list[str]:
+    """Lines in a lock that only the operating system's own Python could have.
+
+    Two tells, either is enough: a distro local version (``2.4.0+ubuntu4``), or a name
+    no index carries. Kept separate from vendor builds like ``torch==2.4.1+cu124``,
+    which a wheel URL does fix — these cannot be fixed at all, only avoided by building
+    the environment in a venv before packing.
+    """
+    hits: list[str] = []
+    for raw in lock_text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or line.startswith("-") or "==" not in line:
+            continue
+        name, _, version = line.partition("==")
+        name = canonical_name(name.split("[", 1)[0].strip())
+        local = version.split("+", 1)[1].lower() if "+" in version else ""
+        if name in DISTRO_ONLY_PACKAGES or any(
+            ("+" + local).startswith(m) for m in DISTRO_LOCAL_MARKERS if local
+        ):
+            hits.append(line)
+    return hits
+
+
+def is_system_interpreter(python_exe: str | Path) -> bool | None:
+    """Is this the Python the operating system ships, rather than a venv?
+
+    ``None`` when the interpreter would not answer — unknown is reported as unknown, we
+    never guess. RunPod's official images run ComfyUI on the system Python, so this is
+    the common case rather than the odd one.
+    """
+    try:
+        out = subprocess.run(
+            [str(python_exe), "-c", "import sys;print(sys.prefix==sys.base_prefix)"],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    answer = out.stdout.strip()
+    return answer == "True" if answer in ("True", "False") else None
 
 
 def find_env_python(candidates: list[Path]) -> Path | None:

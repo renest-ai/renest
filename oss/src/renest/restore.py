@@ -58,6 +58,7 @@ from .download import (
     classify_source_failures,
     resolve,
 )
+from .envlock import DISTRO_ONLY_PACKAGES
 from .errors import NestFailure, ErrorClass, ExitCode
 from .events import EventEmitter, sanitise_terminal
 from .gated import GatedAsset, check_reach, fetch_from_origin, find_token, gated_assets, summarise
@@ -1408,6 +1409,8 @@ _UPSTREAM_UNREACHABLE_MARKERS = (
 
 #: What a real torch/CUDA clash says: cannot resolve, mismatch, version conflict.
 _TORCH_CONFLICT_MARKERS = ("cuda", "conflict", "no solution", "incompatible", "requires")
+#: uv's wording when a version simply is not on any index it can reach.
+_NO_SOLUTION_MARKERS = ("no solution", "was not found", "not found in the package registry")
 
 #: A package with no ready-made build for this machine falls back to compiling from
 #: source, and that compile needs system libraries and build tools the machine may not
@@ -1496,6 +1499,21 @@ def classify_deps_failure(stderr: str) -> tuple[ErrorClass, str]:
             f"names which). This is not a version clash and not your GPU. Either install those "
             f"system packages and re-run, or — if that package is not something the nest "
             f"actually needs — pack again from an environment that does not carry it.",
+        )
+    named_os_pkgs = [n for n in DISTRO_ONLY_PACKAGES if n in low]
+    if named_os_pkgs and any(m in low for m in _NO_SOLUTION_MARKERS):
+        # Same exit code as any other resolution failure — this only replaces "uv's own
+        # output tells you why", which for this one is a dead end: the package is not on
+        # any index, so re-reading uv's message can never lead anywhere (measured 2026-08-17).
+        return (
+            ErrorClass.UNKNOWN,
+            f"Installing dependencies failed on {', '.join(sorted(named_os_pkgs)[:3])}, which "
+            f"belongs to the operating system of the machine this nest was packed on, not to "
+            f"any package index — so no machine can install it and re-running will not help. "
+            f"**Your nest is not damaged**: its files are restored and verified. This is a "
+            f"dependency list captured from a system Python instead of a virtual environment. "
+            f"The fix is on the packing side: rebuild that environment inside `uv venv` and "
+            f"pack again, or edit these lines out of requirements.lock and re-run.",
         )
     if "torch" in low and any(m in low for m in _TORCH_CONFLICT_MARKERS):
         return (
@@ -3063,6 +3081,18 @@ def restore(
     report.exit_code = int(ExitCode.OK) if failure is None else failure.exit_code
     if failure:
         report.failure = failure.to_error_object()
+    # Machine libraries the working run really loaded that this machine does not have.
+    # Read here as well as in the closing words below, because it decides the exit code.
+    short_libs = _libs_the_working_run_used_but_this_machine_lacks(report.precheck)
+    if failure is None and short_libs:
+        # **Say it in the exit code too, not only in words.** Measured 2026-08-19 on a
+        # machine short of libGL.so.1: this tool named the library, printed the fix --
+        # and returned 0, so any script reading the exit code filed it as a clean success.
+        # 61 is **not** "failed": the rebuild finished and every file is fine. It means
+        # *finished, but this machine is missing something and we could not confirm it
+        # does not matter.* Still a warning, never a refusal (2026-07-15 ruling: this leg
+        # informs, it does not block) -- the work ran to the end, nothing was withheld.
+        report.exit_code = int(ExitCode.S0_WARNING_UNCONFIRMED)
 
     with contextlib.suppress(OSError):
         evidence.mkdir(parents=True, exist_ok=True)
@@ -3092,7 +3122,7 @@ def restore(
         # back byte-perfect, started, answered — and could not run their own recipe.
         # So the closing word carries it too. Still a warning, never a refusal
         # (2026-07-15 ruling: this leg informs, it does not block).
-        _short = _libs_the_working_run_used_but_this_machine_lacks(report.precheck)
+        _short = short_libs  # computed above: it also decides the exit code
         if _short:
             narrate(
                 f"Read this before you call it done: every byte is back, but this machine is "
@@ -3124,6 +3154,13 @@ def restore(
     em.result(
         ok=report.ok,
         exit_code=report.exit_code,
+        # Why ``ok`` stays true next to exit code 61: the rebuild really did finish and
+        # every byte really is back, so calling it failed would be its own lie -- and it
+        # would make our own success-rate measurements count a byte-perfect restore as a
+        # failure. There are three outcomes and only two booleans, so the third one lives
+        # in ``exit_code`` (61) and in this list, which names the libraries outright so a
+        # ``--json`` reader never has to parse the English sentence to find out.
+        machine_libraries_missing=short_libs,
         nest_id=report.nest_id,
         stages={s.name: s.seconds for s in report.stages},
         metrics=report.metrics,

@@ -127,6 +127,48 @@ def manifest_blobs(manifest: dict) -> dict[str, int]:
 #: terminal, so a hostile response cannot inject ANSI/OSC escape sequences.
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
+#: How long to wait for the server's verdict on a freshly uploaded nest.
+#: 120s is generous on purpose: since the check went event-driven (2026-08-18) a
+#: verdict lands in about 4-5 seconds, so this is ~25x headroom and costs nothing
+#: on the normal path. **Revisit if the check ever goes back to polling** — the
+#: old path could take up to an hour, and this default would be far too short.
+_VERDICT_WAIT_SECONDS = 120.0
+_VERDICT_POLL_FIRST = 1.0   # first gap; grows 1.6x per round
+_VERDICT_POLL_MAX = 5.0     # never sit longer than this between asks
+
+
+def _verdict_complaint(status: str, nest_id: str) -> tuple[str, int]:
+    """What to tell the user when the server did not say "stored and verified".
+
+    Every branch has to answer the same question: *do I need to do this all over
+    again?* Getting that wrong is expensive — a nest can be tens of gigabytes, and
+    a wrong "try again" makes someone re-upload all of it for nothing.
+    """
+    check_again = f"renest list {nest_id}"
+    if status == "failed":
+        return (
+            "Your files went up, but the server read them back and they did not match "
+            "what this run said they were, so the nest was not stored. Nothing here is "
+            f"lost — run `{check_again}` to see it, then pack and send again. If it "
+            "fails the same way twice, the copy on this machine is likely damaged.",
+            int(ExitCode.S2_HASH_MISMATCH),
+        )
+    if status == "blocked":
+        return (
+            "The server refused this nest under its safety rules, so it was not stored. "
+            f"Run `{check_again}` to see it. If you think that is wrong, open a support "
+            "ticket — packing and sending again will not change the answer.",
+            int(ExitCode.S2_HASH_MISMATCH),
+        )
+    return (
+        "Your files are already on the server — **do not pack or upload this again**. "
+        "What has not happened yet is the server finishing its check, and we stopped "
+        f"waiting after {int(_VERDICT_WAIT_SECONDS)} seconds. Run `{check_again}` in a "
+        "few minutes: when that version reads 'stored & verified' it is done and there "
+        "is nothing more for you to do.",
+        int(ExitCode.S2_UNKNOWN),
+    )
+
 
 def _clean(text: object) -> str:
     return _CTRL_RE.sub("", str(text))
@@ -236,7 +278,9 @@ class HostedUploader:
             self._report_dead = True
 
     # -- Control plane (carries the token) --------------------------------
-    def _api(self, client: httpx.Client, method: str, path: str, *, json_body: dict) -> httpx.Response:
+    def _api(
+        self, client: httpx.Client, method: str, path: str, *, json_body: dict | None = None
+    ) -> httpx.Response:
         resp = client.request(
             method,
             f"{self._origin}/api/v1{path}",
@@ -263,6 +307,32 @@ class HostedUploader:
         if resp.status_code >= 400:
             raise PackError(f"Hosted storage refused this upload: {_error_message(resp)}")
         return resp
+
+    def _await_verdict(
+        self, client: httpx.Client, version_id: str, *, sleep=time.sleep
+    ) -> str:
+        """Poll until the server stops saying "verifying". Returns the final status.
+
+        Returns ``"verifying"`` if the wait ran out — the caller must treat that as
+        *not* a success. It never guesses: an unreachable server during the wait is
+        also reported as still-unknown rather than quietly turned into a pass.
+        """
+        deadline = time.monotonic() + _VERDICT_WAIT_SECONDS
+        gap = _VERDICT_POLL_FIRST
+        status = "verifying"
+        while time.monotonic() < deadline:
+            try:
+                got = self._api(client, "GET", f"/nest-versions/{version_id}").json()
+                status = str(got.get("status") or status)
+            except (httpx.HTTPError, PackError):
+                # A blip while we wait says nothing about the nest. Keep waiting;
+                # if it never clears we report still-unknown, which is the truth.
+                pass
+            if status != "verifying":
+                return status
+            sleep(min(gap, max(deadline - time.monotonic(), 0.0)))
+            gap = min(gap * 1.6, _VERDICT_POLL_MAX)
+        return status
 
     def _warn_if_name_taken(self, client: httpx.Client, name: str) -> None:
         """Check for a name clash before creating a nest. **Warn only, never
@@ -515,7 +585,6 @@ class HostedUploader:
                 json_body={"manifest_key": plan_m["manifest_key"], "manifest_id": manifest["id"]},
             ).json()
             self.result.nest_version_id = commit["nest_version_id"]
-            self.result.status = commit["status"]
             # The version number is the one humans say out loud (1, 2, 3 ...).
             # An older server does not return it, in which case we say no number
             # at all — never a database primary key dressed up as a version.
@@ -524,10 +593,28 @@ class HostedUploader:
             human_version = f"version {vno} of" if vno else "a new version of"
             self._log(
                 f"Hosted storage has it: {human_version} nest {self.result.nest_id} "
-                "(the server is checking it now)"
+                "— waiting for the server to finish checking it…"
             )
+
+            # **Wait for the real verdict before calling this a success.**
+            # Until 2026-08-18 this reported ok:true the moment the upload landed,
+            # while the server had only queued the check. A nest whose bytes the
+            # server later refused still printed a clean finish, and automated
+            # callers read ok:true and moved on — one of ours did exactly that.
+            # Reporting a success we have not been told about is worse than
+            # reporting a failure: nobody goes back to look at a green run.
+            status = self._await_verdict(client, str(self.result.nest_version_id))
+            self.result.status = status
+            ok = status == "committed"
+            complaint, code = ("", int(ExitCode.OK)) if ok else _verdict_complaint(
+                status, str(self.result.nest_id)
+            )
+            # Only ``ok`` and ``exit_code`` say how this ended, and both are already in
+            # the outbound whitelist (uplink.py). Deliberately **not** adding a "status"
+            # field: anything outside that whitelist is dropped on the way out and again
+            # by the server, so it would look like it was reported when it never was.
             self._report(client, [{
-                "type": "result", "stage": "P3", "ok": True,
+                "type": "result", "stage": "P3", "ok": ok, "exit_code": code,
                 "nest_id": self.result.nest_id,
                 "nest_version_id": self.result.nest_version_id,
                 "uploaded_blobs": self.result.uploaded_blobs,
@@ -535,6 +622,10 @@ class HostedUploader:
                 "uploaded_bytes": self.result.uploaded_bytes,
                 "seconds": round(time.monotonic() - t0, 3),
             }])
+            if not ok:
+                raise PackError(complaint, exit_code=code)
+            self._log(f"The server checked it and it holds up: {human_version} "
+                      f"nest {self.result.nest_id} is stored and verified.")
             return sizes
         except httpx.HTTPError as e:
             raise PackError(

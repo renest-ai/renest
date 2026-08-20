@@ -44,7 +44,9 @@ from .envlock import (
     find_env_python,
     find_launchers,
     find_site_packages,
+    distro_owned_packages,
     freeze_environment,
+    is_system_interpreter,
     freeze_from_installed,
     interpreter_kernel,
     interpreter_python_series,
@@ -977,6 +979,31 @@ def _site_packages_for(root: Path, env_python: str | None) -> Path | None:
     return sp if sp is not None else find_site_packages(root)
 
 
+def _env_python_for(root: Path, env_python: str | None) -> str | None:
+    """The interpreter of the environment being packed, found by layout when the
+    caller does not name one.
+
+    ``<root>/.venv`` is only the common case. kohya keeps its environment inside
+    the checkout it packs (``<root>/sd-scripts/.venv``), and looking only at the
+    root found nothing there: the manifest then carried no torch facts, so the
+    GPU-generation gate had nothing to compare and downgraded itself to
+    "unverified". Measured 2026-08-18 on three Blackwell machines — all three
+    passed the pre-flight and then died on ``no kernel image is available``.
+    """
+    if env_python:
+        return env_python
+    cands = list(venv_python_candidates(root))
+    sp = find_site_packages(root)
+    if sp is not None:
+        # ``env_dir_of`` already returns the environment root, so the interpreter
+        # hangs directly off it — feeding it back through ``venv_python_candidates``
+        # would ask for ``.venv/.venv/bin/python``.
+        env = env_dir_of(sp)
+        cands += [env / "bin" / "python", env / "bin" / "python3", env / "Scripts" / "python.exe"]
+    found = find_env_python(cands)
+    return str(found) if found else None
+
+
 def _foreign_env_kernel(root: Path, env_python: str | None) -> str | None:
     """The other machine's name when the environment being packed was built for one.
 
@@ -1063,8 +1090,7 @@ def _build_manifest(
             f"point --env-python at its own Python."
         )
     if not no_fingerprint and not foreign_kernel:
-        cand = root / ".venv" / "bin" / "python"
-        py = env_python or (str(cand) if cand.exists() else None)
+        py = _env_python_for(root, env_python)
         fp = collect(py)
         manifest["fingerprint"] = fp.to_manifest_dict()
         # The CUDA version we just detected also belongs in ``runtime``: that is the block
@@ -1302,9 +1328,11 @@ def _build_manifest(
                 "can work (see report.gaps). Point --env-python at the Python this "
                 "environment starts with and pack again if you want that list captured."
             )
+    system_python: bool | None = None
     if pl is not None:
         from_env = pl.get("from_environment")
         if from_env:
+            system_python = is_system_interpreter(from_env["python"])
             # No lock file, so ask the running interpreter instead. The generated
             # file goes only into the temporary work directory — not a byte of
             # the user's environment is touched, dry run or not.
@@ -1372,7 +1400,29 @@ def _build_manifest(
                 "(renest pulls in httpx, cryptography and a few more). `uv tool install "
                 "renest` keeps it out of the environment you are capturing."
             )
-        local_ver = [ln for ln in lock_text.splitlines() if "==" in ln and "+" in ln.split("==")[-1]]
+        # The operating system's own packages and a vendor build like torch==2.4.1+cu124
+        # both carry a local version, and the old code warned about them as one thing while
+        # advising --pin-wheels. That advice is wrong for the first group: no index ever
+        # published a wheel for python-apt, so pinning cannot reach it. Split them, because
+        # only one of the two has a fix that works.
+        distro_ver = distro_owned_packages(lock_text)
+        local_ver = [ln for ln in lock_text.splitlines()
+                     if "==" in ln and "+" in ln.split("==")[-1] and ln.strip() not in distro_ver]
+        if distro_ver:
+            names = ", ".join(ln.split("==")[0].strip() for ln in distro_ver[:6])
+            more = f" and {len(distro_ver) - 6} more" if len(distro_ver) > 6 else ""
+            warnings.append(
+                f"{len(distro_ver)} package(s) in this dependency list belong to the operating "
+                f"system, not to a package index ({names}{more})"
+                + (", because this environment runs on the Python that came with the image "
+                   "rather than in a virtual environment" if system_python else "")
+                + ". No machine can install them: the install stops on the first one and the "
+                "rebuild fails there, after the model files have already been downloaded and "
+                "paid for. Build this environment in a virtual environment (`uv venv`, then "
+                "reinstall what it needs) and pack again, or pass --env-python at the Python "
+                "inside one — that list is installable anywhere. Packing continues: the "
+                "archive is still a faithful record of this machine."
+            )
         pinned: list[tuple[str, str]] = []
         if local_ver and pin_wheels and not dry_run:
             # Explicit pinning (--pin-wheels): the one step in pack that touches

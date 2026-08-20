@@ -33,6 +33,11 @@ __all__ = [
 ]
 
 
+#: Most a single text chunk may be read. A damaged or hostile PNG is free to
+#: declare a 4 GB chunk length, and we must not believe it.
+_MAX_TEXT_CHUNK = 32 * 1024 * 1024
+
+
 def png_text_chunks(path: Path) -> dict[str, str]:
     """Every tEXt/iTXt chunk of a PNG, keyed by chunk name.
 
@@ -42,37 +47,49 @@ def png_text_chunks(path: Path) -> dict[str, str]:
     rather than raising: a corrupt or foreign file is "no evidence", not a
     crash.
     """
+    out: dict[str, str] = {}
     try:
-        data = path.read_bytes()
+        with path.open("rb") as fh:
+            if fh.read(8) != b"\x89PNG\r\n\x1a\n":
+                return {}
+            while True:
+                head = fh.read(8)
+                if len(head) < 8:
+                    break
+                (ln,) = struct.unpack(">I", head[:4])
+                typ = head[4:8]
+                if typ == b"IEND":
+                    break
+                if typ in (b"tEXt", b"iTXt") and ln <= _MAX_TEXT_CHUNK:
+                    body = fh.read(ln)
+                    if len(body) < ln:
+                        break
+                else:
+                    # **Skip the picture data outright; it never enters memory.**
+                    # A render is several MB and all we want is a few hundred bytes
+                    # of text, and the scan walks the whole output tree.
+                    fh.seek(ln, 1)
+                    fh.seek(4, 1)  # CRC
+                    continue
+                fh.seek(4, 1)  # CRC
+                if typ == b"tEXt":
+                    k, _, v = body.partition(b"\x00")
+                    out[k.decode("latin1")] = v.decode("utf-8", "replace")
+                else:
+                    k, _, rest = body.partition(b"\x00")
+                    comp = rest[0:1]
+                    rest = rest[1:]
+                    _, _, rest = rest.partition(b"\x00")  # compression method
+                    _, _, rest = rest.partition(b"\x00")  # language tag
+                    _, _, val = rest.partition(b"\x00")  # translated keyword
+                    try:
+                        out[k.decode("latin1")] = (
+                            zlib.decompress(val) if comp == b"\x01" else val
+                        ).decode("utf-8", "replace")
+                    except (zlib.error, OSError):
+                        continue
     except OSError:
         return {}
-    if data[:8] != b"\x89PNG\r\n\x1a\n":
-        return {}
-    out: dict[str, str] = {}
-    i = 8
-    while i + 8 <= len(data):
-        (ln,) = struct.unpack(">I", data[i : i + 4])
-        typ = data[i + 4 : i + 8]
-        body = data[i + 8 : i + 8 + ln]
-        i += 12 + ln
-        if typ == b"tEXt":
-            k, _, v = body.partition(b"\x00")
-            out[k.decode("latin1")] = v.decode("utf-8", "replace")
-        elif typ == b"iTXt":
-            k, _, rest = body.partition(b"\x00")
-            comp = rest[0:1]
-            rest = rest[1:]
-            _, _, rest = rest.partition(b"\x00")  # compression method
-            _, _, rest = rest.partition(b"\x00")  # language tag
-            _, _, val = rest.partition(b"\x00")  # translated keyword
-            try:
-                out[k.decode("latin1")] = (
-                    zlib.decompress(val) if comp == b"\x01" else val
-                ).decode("utf-8", "replace")
-            except (zlib.error, OSError):
-                continue
-        elif typ == b"IEND":
-            break
     return out
 
 
@@ -104,17 +121,27 @@ class ComfyUIEvidence:
 
 
 def scan_comfyui_output(output_dir: Path) -> ComfyUIEvidence:
-    """Read every PNG directly under ``output_dir`` for its recipe chunk.
+    """Read every PNG under ``output_dir`` for its recipe chunk.
 
-    Not recursive into subfolders a user may have made for their own sorting —
-    only the pictures ComfyUI itself wrote there. A PNG with no ``prompt``
-    chunk, or one that fails to parse as JSON, is reported as unreadable and
-    skipped — never guessed at.
+    **Subfolders count.** This used to look only in the top folder, on the idea that
+    a subfolder is a user sorting their own pictures. That idea is wrong: ComfyUI
+    itself writes into ``output/<sub>/`` whenever the save node's filename prefix
+    contains a slash, which is an ordinary thing to set. The cost of being wrong is
+    heavy and silent -- an environment that really has produced pictures packs as
+    "nothing here is confirmed to have worked yet", and every restore of it then
+    skips the one check worth most (does the recipe still run?), forever.
+    Measured 2026-08-20: a picture one folder down was invisible, and did not even
+    show up as unreadable, so nothing on screen hinted anything had been skipped.
+
+    Sorting a user's own pictures in is not a danger: evidence is "this PNG carries
+    a ComfyUI ``prompt`` block", which holiday photos do not have. A PNG with no
+    ``prompt`` chunk, or one that fails to parse as JSON, is reported as unreadable
+    and skipped -- never guessed at.
     """
     recipes: list[RecipeEvidence] = []
     unreadable: list[Path] = []
     if output_dir.is_dir():
-        for p in sorted(output_dir.glob("*.png")):
+        for p in sorted(output_dir.rglob("*.png")):
             raw = png_text_chunks(p).get("prompt")
             if not raw:
                 unreadable.append(p)

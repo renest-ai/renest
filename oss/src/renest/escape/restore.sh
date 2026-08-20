@@ -473,11 +473,13 @@ fi
 STAGE="S1-fetch"
 # ---- Presigned file list (optional) -----------------------------------------
 if [ -n "$BLOB_MANIFEST" ]; then
-  log "Using the presigned file list: $BLOB_MANIFEST"
+  # `%%\?*` drops the query string: a presigned link is a bearer credential, and
+  # this output gets pasted into support tickets. Same rule as FETCH-MISSING above.
+  log "Using the presigned file list: ${BLOB_MANIFEST%%\?*}"
   if [ -f "$BLOB_MANIFEST" ]; then
     cp "$BLOB_MANIFEST" "$BLOBMAP"
   else
-    curl -fsSL "$BLOB_MANIFEST" -o "$BLOBMAP" || die FETCH-BLOBMAP "Could not download the presigned file list: $BLOB_MANIFEST"
+    curl -fsSL "$BLOB_MANIFEST" -o "$BLOBMAP" || die FETCH-BLOBMAP "Could not download the presigned file list: ${BLOB_MANIFEST%%\?*}"
   fi
   jq -e 'type == "object"' "$BLOBMAP" >/dev/null || die BLOBMAP-BAD "The presigned file list is malformed (it should be a {sha256: url} object)"
 fi
@@ -746,14 +748,16 @@ UNSAFE_URLS=$(grep -v '^[[:space:]]*#' "$TARGET/.renest/requirements.lock" 2>/de
 if [ -n "$UNSAFE_URLS" ]; then
   if [ -n "$TRUST_UNSAFE_URLS" ]; then
     warn "Allowing these unrecognised sources because you set TRUST_UNSAFE_URLS=1:"
-    printf '%s\n' "$UNSAFE_URLS" | head -5 | sed 's/^/    /' >&2
+    # Strip the query string before showing a URL: model hosts put the user's own
+    # API token in it, and this output ends up in tickets and forum posts.
+    printf '%s\n' "$UNSAFE_URLS" | head -5 | sed -e 's/?.*//' -e 's/^/    /' >&2
   else
     UNSAFE_HOSTS=$(printf '%s\n' "$UNSAFE_URLS" | while IFS= read -r u2; do
         h="${u2#*://}"; h="${h%%/*}"; h="${h##*@}"; h="${h%%:*}"
         [ -n "$h" ] && printf '%s\n' "$h" || true
       done | tr '[:upper:]' '[:lower:]' | sort -u | head -3 | paste -sd, -)
     die DEPS-UNTRUSTED-URL "This nest wants to install from servers nobody recognises. Stopped — nothing was installed:
-$(printf '%s\n' "$UNSAFE_URLS" | head -5 | sed 's/^/       /')
+$(printf '%s\n' "$UNSAFE_URLS" | head -5 | sed -e 's/?.*//' -e 's/^/       /')
 
        Installing dependencies runs code those servers hand you, on this machine.
        That code can read everything here: the models you just restored, your

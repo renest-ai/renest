@@ -16,14 +16,17 @@ via subprocess ``git`` -- never imported, never vendored.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
 from .integrity import dirty_gap, git_identity, probe_model_bytes, registry_identity
+from .verified import scan_comfyui_output
 
 __all__ = [
     "api_forwarding_nodes",
@@ -510,6 +513,34 @@ class CaptureResult:
     report: dict
 
 
+
+def _comfyui_adapter(comfyui_dir: Path, workflow_relpath: str | None) -> dict:
+    """The comfyui adapter section, **including whether this environment ever
+    produced a picture** (``verified_run``).
+
+    Why it has to be written here and not only in ``pack``'s own flow: a pack-spec
+    built by this function is a **supported user path** (``renest pack --spec``), and
+    on that path nothing else ever looks at the output folder -- ``pack`` merely copies
+    ``verified_run`` through if the incoming spec already carries it. So every nest
+    packed from a captured spec claimed "nothing here is confirmed to have worked yet",
+    even when the environment had been producing pictures all along; restoring such a
+    nest then skips the one check worth most (does the recipe still run?), forever.
+    Found 2026-08-20 while diagnosing a 22.73 GB nest that had exactly this hole.
+    """
+    adapter: dict = {"workflow_path": workflow_relpath}
+    with contextlib.suppress(Exception):
+        evidence = scan_comfyui_output(comfyui_dir / "output")
+        if evidence.verified and evidence.most_recent is not None:
+            adapter["verified_run"] = {
+                "queue_completed_at": _iso_utc_mtime(evidence.most_recent.mtime)
+            }
+    return adapter
+
+
+def _iso_utc_mtime(mtime: float) -> str:
+    return datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def capture(workflow: dict, comfyui_dir: Path,
             workflow_relpath: str | None = None,
             large_file_bytes: int | None = None) -> CaptureResult:
@@ -819,7 +850,7 @@ def capture(workflow: dict, comfyui_dir: Path,
                 "timeout_s": 300,
             },
         },
-        "adapters": {"comfyui": {"workflow_path": workflow_relpath}},
+        "adapters": {"comfyui": _comfyui_adapter(comfyui_dir, workflow_relpath)},
         "creation": {"agent_version": CAPTURE_VERSION},
     }
     # Nodes that hand the work to somebody else's servers. The format calls this an
