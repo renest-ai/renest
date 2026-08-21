@@ -558,6 +558,9 @@ class Grant:
     #: this has nothing to do with the account. Used for a notice only and
     #: **changes no restore behaviour** — the escape hatch informs, never blocks.
     retention_days_left: int | None = None
+    #: Whether signing in restarts that countdown. None = the grant did not say
+    #: (older servers), and then we say nothing about renewal rather than guess.
+    retention_renews_on_sign_in: bool | None = None
     path: Path | None = None
 
     def is_expired(self, *, now: datetime | None = None) -> bool:
@@ -736,6 +739,9 @@ def load_grant(
             None if data.get("handed_off_relayed") is None else bool(data["handed_off_relayed"])
         ),
         retention_days_left=_opt_int(data.get("retention_days_left")),
+        retention_renews_on_sign_in=(data.get("retention_renews_on_sign_in")
+                                     if isinstance(data.get("retention_renews_on_sign_in"), bool)
+                                     else None),
         path=p,
     )
 

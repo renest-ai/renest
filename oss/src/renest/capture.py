@@ -111,6 +111,10 @@ _FACTORY_CATEGORIES: dict[str, tuple[tuple[str, ...], str]] = {
     "upscale_model":   (("models/upscale_models",), "upscaler"),
     "style_model":     (("models/style_models",), "other"),
     "input_asset":     (("input",), "input_asset"),
+    # Read off the extension's own source, 2026-08-20: it registers this folder itself
+    # (`os.path.join(folder_paths.models_dir, "ipadapter")`), so the weights live outside
+    # every folder above and a workflow using them packed nothing at all.
+    "ipadapter":       (("models/ipadapter",), "ipadapter"),
     # Added after measuring again, 2026-08-14: manifest.schema.json 2.7 opened
     # files[].kind into a free string (see the schema's own field description),
     # so a new asset family no longer needs a format version bump -- only a
@@ -142,6 +146,13 @@ _FACTORY_MODEL_REF_MAP: dict[str, list[tuple[str, str]]] = {
     "DiffControlNetLoader":   [("control_net_name", "controlnet")],
     "UpscaleModelLoader":     [("model_name", "upscale_model")],
     "StyleModelLoader":       [("style_model_name", "style_model")],
+    # The one loader in that extension that names a file. Its two siblings cannot be
+    # mapped and are left out on purpose: `IPAdapterUnifiedLoader` takes a preset
+    # string ("PLUS (high strength)") and resolves it to a file at run time, and
+    # `IPAdapterInsightFaceLoader` takes a name from a fixed list in another folder.
+    # A workflow built on either still packs nothing -- naming them here with a made-up
+    # input would be worse than the gap, because it would look answered.
+    "IPAdapterModelLoader":   [("ipadapter_file", "ipadapter")],
     # Added after measuring, 2026-08-13: across 475 official workflow templates (101 of
     # which load a model), 31 load points named a class missing from this table -- and
     # every one of them was an official loader, not a third-party node. The table had
@@ -444,6 +455,11 @@ def resolve_image_digest(ref: str, *, timeout: float = 30.0) -> str | None:
 
     Only Docker Hub is supported; any other registry returns None so the caller asks
     the user rather than guessing.
+
+    **What comes back is always the index digest**, never the per-architecture one:
+    the request asks for the index media types and nothing else. Callers must record
+    that as ``digest_kind: "index"`` rather than leave a reader to guess which layer
+    they are looking at -- the schema treats the two as different things.
     """
     import httpx
 
@@ -669,9 +685,34 @@ def capture(workflow: dict, comfyui_dir: Path,
             f"the right file, and that this node needs nothing else")
 
     for m in missing:
-        gaps.append(f"Missing file: {m['class_type']}.{m['input']} = {m['value']} "
-                    f"(looked in {m['searched_dirs']}). Without it the nest is incomplete — "
-                    f"put the file back before you pack")
+        # **"Missing" is the wrong word when the workflow named a full path.** The file
+        # is usually sitting in the standard folder under that same name; what we refused
+        # to follow is a path from the machine the workflow was built on. Telling someone
+        # to "put the file back" sends them looking for something that never left.
+        outside = "points outside the folder" in (m.get("note") or "")
+        here = ""
+        if outside:
+            base = Path(str(m["value"]).replace("\\", "/")).name
+            for sub in (CATEGORIES.get(str(m.get("category")), ((), ""))[0] or ()):
+                if (comfyui_dir / sub / base).is_file():
+                    here = f"{sub}/{base}"
+                    break
+        if outside:
+            gaps.append(
+                f"{m['class_type']}.{m['input']} names a full path from another machine: "
+                f"{m['value']}. We do not follow paths out of the folder being packed, so "
+                f"this model is **not in the nest**."
+                + (f" The file itself is right here, at {here} — nothing is lost; the "
+                   f"workflow just addresses it the long way. Point that node at the file "
+                   f"by name and pack again."
+                   if here else
+                   " Put the file in the standard folder for its kind, point the node at "
+                   "it by name, and pack again.")
+            )
+        else:
+            gaps.append(f"Missing file: {m['class_type']}.{m['input']} = {m['value']} "
+                        f"(looked in {m['searched_dirs']}). Without it the nest is "
+                        f"incomplete — put the file back before you pack")
 
     # extra_model_paths.yaml: models kept outside the standard directories are followed
     # by _locate above and recorded under the standard models/ directory, so a restored

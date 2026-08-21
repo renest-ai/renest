@@ -82,8 +82,16 @@ LEVEL_REJECT = "reject"
 # The module constants below are a snapshot of that baseline, kept only as
 # defaults for the pure functions and as anchors for test assertions; the engine
 # path reads the data through run_precheck.
+
+#: Fallback floors, used only when the rules file cannot be read. **It deliberately does
+#: not match the rules file; see the guard test before "tidying" that away.** Two runs
+#: disagree: 535.154.05 ran a cu128 wheel fine (2026-08-10), while 545.23 on cu124 died
+#: with Error 803 (2026-07-15). Wheels carry their own CUDA runtime and a full toolkit
+#: image does not -- but no run has settled that, so it stays a guess. The fallback keeps
+#: the higher number on purpose: with the rules unreadable, refusing a machine that would
+#: have worked costs one rental; admitting one that dies costs a whole restore.
 CUDA_DRIVER_FLOOR: dict[str, tuple[int, int]] = {
-    "cu124": (550, 54),  # measured: an older driver made torch die with Error 803
+    "cu124": (550, 54),
 }
 
 # measured: a host without avx2 killed the application with "Illegal instruction"
@@ -2052,6 +2060,23 @@ def doctor(
         parts.append(
             f"we haven't tested {coverage['gpu']}, so this verdict errs on the cautious side"
         )
+    if force:
+        # Refusing is fine; ignoring in silence is not. Either way the user typed
+        # --force and is entitled to know it was read, and what it did or did not buy.
+        if code in _HARD_BLOCK:
+            parts.append(
+                "you asked to go ahead anyway (--force), and this one does not lift: "
+                "the packages themselves will not install on this machine, so the "
+                "download would be spent for nothing. The rebuild script that comes "
+                "with the nest (.renest/escape/restore.sh) never refuses, if you want "
+                "the files here regardless"
+            )
+        elif any(c.level == LEVEL_REJECT for c in precheck.checks):
+            parts.append(
+                "you asked to go ahead anyway (--force), so this rejection is not "
+                "stopping the rebuild: the files will land, and what is written above "
+                "is what to expect when you start it"
+            )
     summary = "Verdict: " + "; ".join(parts) if parts else "Verdict: all clear"
     if emitter is not None:
         emitter.log(summary, stage="S0", level="warning" if code != 0 else "info")

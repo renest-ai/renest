@@ -24,9 +24,11 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "description": "Optional. Leave it out and packing looks it up; write it and packing uses yours as given (and does not label which layer it is, because it does not know)."
         }
-      }
+      },
+      "description": "The image this environment runs on. **Looser here than in the manifest on purpose, and that is not a contradiction**: `digest` may be left out or null, because packing asks the registry for it (a container cannot see its own image name, but once the name is known the fingerprint can be looked up -- nobody should hand-copy 64 hex characters). The manifest requires both, and packing is what bridges the two: it fills the fingerprint in, or, when the registry cannot be asked, leaves the whole block out and says so. So a valid pack-spec never yields an invalid manifest. Reported twice as \"the two schemas disagree\" -- writing it down here so it is not reported a third time."
     },
     "runtime": {
       "type": "object",

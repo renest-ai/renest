@@ -612,6 +612,20 @@ def contested_winners(site_packages: Path, lock_text: str) -> tuple[list[dict], 
             "winner": winner,
             "winner_evidence": {"file": rel, "sha256": disk, "method": method},
         })
+        # **Recording the winner is not the same as the user knowing there was a fight.**
+        # Which variant won decides what the machine has to provide: the desktop build of
+        # cv2 needs X11 libraries, the headless one does not. A rebuild reinstalls this
+        # winner, so nothing is broken -- but the person can only tidy a dependency list
+        # they know is ambiguous, and this is the one moment they are looking at it.
+        others = [c for c in candidates if c != winner]
+        notes.append(
+            f"{len(candidates)} packages in the dependency list all write `{module}/` "
+            f"({', '.join(candidates)}). The copy this environment actually used came from "
+            f"**{winner}**, and that is what this nest records and reinstalls, so rebuilds "
+            f"stay consistent. Worth knowing: which one wins decides what the machine has "
+            f"to provide. If you meant only one of them, dropping "
+            f"{' and '.join(others)} from the list makes this unambiguous."
+        )
     return entries, notes
 
 

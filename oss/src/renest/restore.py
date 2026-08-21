@@ -156,6 +156,59 @@ def recipe_landing_rel(manifest: dict, adapter: str) -> str | None:
     ))
 
 
+#: A string that looks like a full path from some machine: a POSIX one with at least
+#: two components, or a Windows drive letter. Two components is the floor on purpose --
+#: a one-word value like "/upscale" is a label in somebody's node, not a path.
+_LOOKS_ABSOLUTE = re.compile(r"^(?:/[^/\x00]+/[^/\x00]|[A-Za-z]:[\\/])")
+
+
+def paths_from_another_machine(recipe: Path, limit: int = 5) -> list[str]:
+    """Full paths written inside a recipe that do not exist on this machine.
+
+    A workflow built on one machine often names its files the long way
+    (``/workspace/ComfyUI/models/x.safetensors``). Move it to a machine whose root
+    is somewhere else and every one of those goes nowhere -- and the run fails with
+    the app's own message, which says nothing about why. Nothing new is stored to
+    make this possible: the paths are already in the user's own recipe.
+    """
+    try:
+        data = json.loads(recipe.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    seen: set[str] = set()
+    stack: list = [data]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+        elif isinstance(node, str) and _LOOKS_ABSOLUTE.match(node):
+            seen.add(node)
+    # Existence is checked once per distinct string, after the walk: a workflow names
+    # the same file from several nodes, and one stat each would be the same answer.
+    return sorted(n for n in seen if not Path(n).exists())[:limit]
+
+
+def _say_if_the_recipe_points_elsewhere(
+    staged: Path, narrate: Callable[..., None]
+) -> None:
+    """Tell the user when the recipe still addresses another machine's folders."""
+    strays = paths_from_another_machine(staged)
+    if not strays:
+        return
+    narrate(
+        "This recipe still names full paths from the machine it was built on, and they "
+        "do not exist here: " + ", ".join(strays) + ". Nothing is broken in the rebuild "
+        "-- the files it needs are in place under this folder -- but those nodes will "
+        "not find them until you point each one at its file by name, or make the old "
+        "path lead here yourself. We do not create that link for you: it would mean "
+        "writing outside the folder you gave us.",
+        stage="S2",
+        level="warning",
+    )
+
+
 def _land_recipe(
     adapter: str,
     manifest: dict,
@@ -774,6 +827,13 @@ class ComfyUILauncher:
         self.shutdown(handle)
         raise RuntimeError(f"The app did not come up within {timeout_s:.0f}s. Log: {log_path}")
 
+    #: What the last smoke step actually concluded, for --json readers. Three outcomes
+    #: all return ok=true -- really re-ran / skipped because the nest never recorded it
+    #: working / no recipe at all -- and until now the only way to tell them apart was
+    #: to parse the English sentence, which has already been reworded once (it read as
+    #: proof of a render for weeks). None = the step did not run.
+    recipe_outcome: dict | None = None
+
     def smoke(self, handle: LaunchHandle) -> str:
         """Re-run the recipe when the nest carries one; otherwise ask the app if it answers.
 
@@ -794,6 +854,8 @@ class ComfyUILauncher:
         if not isinstance(classes, dict) or not classes:
             raise RuntimeError("The app reports no nodes at all — its node registry did not load")
         if handle.unverified_note:
+            self.recipe_outcome = {"reran": False, "images": None,
+                                   "why": "the nest does not record the recipe ever working"}
             return (
                 f"The app answered and loaded {len(classes)} node types. "
                 f"**Skipped re-running the recipe** — {handle.unverified_note} Re-running it "
@@ -802,6 +864,8 @@ class ComfyUILauncher:
             )
         # Say plainly that nothing was drawn. The old wording ("the app answered
         # normally") was read as evidence of a render for weeks.
+        self.recipe_outcome = {"reran": False, "images": None,
+                               "why": "this nest carries no recipe"}
         return (
             f"The app answered and loaded {len(classes)} node types. "
             f"**Nothing was rendered** — this nest carries no recipe to re-run, "
@@ -851,6 +915,7 @@ class ComfyUILauncher:
                             "the recipe ran to completion but produced no image. Either this "
                             "nest's recipe saves nothing, or the rebuild is not equivalent."
                         )
+                    self.recipe_outcome = {"reran": True, "images": images, "why": None}
                     return (f"Re-ran the packed recipe and it produced {images} image(s) "
                             f"in {time.monotonic() - started:.0f}s")
             time.sleep(3.0)
@@ -991,6 +1056,9 @@ class RestoreReport:
     #: This makes "do I need to go accept something right now" answerable before
     #: the run starts, instead of discovering missing files at the end.
     gated: list[dict] = field(default_factory=list)
+    #: What the recipe step concluded: did it really run again, how many images came
+    #: out, and if it did not run, why. None = the step never got there.
+    recipe: dict | None = None
     #: Contested modules (several packages shipping the same top-level module,
     #: overwriting each other's files): system libraries the installed survivor
     #: needs that this machine lacks. Known only after install; warn-only.
@@ -1021,6 +1089,7 @@ class RestoreReport:
             "setup_skipped": self.setup_skipped,
             "gated": self.gated,
             "contested_module_gaps": self.contested_module_gaps,
+            "recipe": self.recipe,
             "contested_modules": self.contested_modules,
         }
 
@@ -1603,6 +1672,21 @@ def _libs_the_working_run_used_but_this_machine_lacks(precheck: dict | None) -> 
     return []
 
 
+def every_missing_library(hit: list[str], precheck: dict | None) -> list[str]:
+    """The one that tripped this run, **plus every other one this machine lacks**.
+
+    A log can only name what the loader reached first; the pre-check already listed the
+    whole set. Naming one at a time makes someone install it, run again, and hit the
+    next -- measured 2026-08-20: one library named while five were missing, against this
+    module's own rule that the fix is one command, not one round trip per library.
+    """
+    out = list(hit)
+    for lib in _libs_the_working_run_used_but_this_machine_lacks(precheck):
+        if lib not in out:
+            out.append(lib)
+    return out
+
+
 def missing_library_advice(libs: str | list[str], base_image: str | None = None) -> str:
     """What is missing, and the ways out — surest one first.
 
@@ -1768,10 +1852,20 @@ def _validate_manifest(manifest: dict, *, narrate: Callable[..., None] | None = 
             ErrorClass.MANIFEST_UNSUPPORTED,
             f"Unrecognised nest format version: {fv!r} — this version reads "
             f"{', '.join(SUPPORTED_FORMAT_VERSIONS)}. "
-            "Nests packed in the older 1.x format cannot be read here: 2.0 made "
+            + (f"This nest was packed on {str(manifest.get('created_at') or '')[:10]}. "
+               if manifest.get("created_at") else "")
+            + "Nests packed in the older 1.x format cannot be read here: 2.0 made "
             "code_deps[].role a required field, and guessing it would be guessing at "
             "which parts of the nest are the app and which are your own code. "
-            "Pack the environment again with this version. Stopping rather than guessing.",
+            "**There is no upgrade path, and there cannot be one**: that field says which "
+            "parts are the application and which are yours, and nobody can work it out "
+            "after the fact. "
+            + (f"**Your files are not lost.** This nest still lists all "
+               f"{len(manifest.get('files') or [])} of them with their fingerprints, so "
+               f"they can be fetched one by one even though the environment cannot be "
+               f"rebuilt automatically. " if manifest.get("files") else "")
+            + "If you still have the environment, packing it again with this version gives "
+            "you a nest that rebuilds. Stopping rather than guessing.",
         )
     # ``k not in manifest`` is not enough: ``python_lock: null`` means "key
     # present, value absent" and would pass this gate only to raise a TypeError
@@ -2136,9 +2230,17 @@ def restore(
                 narrate(
                     f"Heads up: what you keep on your drive reaches the end of "
                     f"its keeping period in {left} days"
-                    " (the free plan keeps things for 90 days). Signing in to "
-                    "the website once starts the 90 days over, at no cost."
-                    " Restoring on this machine is not affected — carry on.",
+                    " (the free plan keeps things for 90 days)."
+                    # **Only say "sign in and it restarts" when it actually does.**
+                    # For an account that cancelled, the clock runs from the day they
+                    # cancelled and signing in changes nothing -- telling them otherwise
+                    # sends them to do a thing that will not save their files.
+                    + (" Signing in to the website once starts the 90 days over, at no"
+                       " cost." if parsed.retention_renews_on_sign_in is True else
+                       " This countdown runs to a fixed date and signing in does not"
+                       " change it — move anything you want to keep before then."
+                       if parsed.retention_renews_on_sign_in is False else "")
+                    + " Restoring on this machine is not affected — carry on.",
                     stage="S1",
                     level="warning",
                 )
@@ -2299,8 +2401,25 @@ def restore(
         # bucket.** The manifest allows several entries to land on one path (last
         # write wins, S2 checks afterwards), and two threads writing the same
         # file trample each other — one hashing while the other truncates.
-        buckets: dict[Path, list[PlanItem]] = {}
+
+        # **One sha256, one download.** Several paths may point at the same bytes, and
+        # each used to fetch its own copy -- bandwidth times N, on the user's bill.
+        # The extra paths are filled in after the pool, **never inside it**: a copy
+        # scheduled alongside its own source would race it.
+        first_for_sha: dict[str, PlanItem] = {}
+        to_download: list[PlanItem] = []
+        to_copy: list[tuple[PlanItem, PlanItem]] = []
         for it in assets:
+            twin = first_for_sha.get(it.sha256)
+            if twin is not None and twin.dest != it.dest:
+                to_copy.append((it, twin))
+                continue
+            first_for_sha.setdefault(it.sha256, it)
+            to_download.append(it)
+        total_bytes = sum(i.size_bytes for i in to_download)
+
+        buckets: dict[Path, list[PlanItem]] = {}
+        for it in to_download:
             buckets.setdefault(it.dest, []).append(it)
 
         def fetch_bucket(items: list[PlanItem]) -> list[tuple[PlanItem, str, ResolveReport | None, float]]:
@@ -2351,8 +2470,30 @@ def restore(
                 )
         if first_failure is not None:
             raise first_failure
+        # The extra paths, now that every byte has landed exactly once. Copied and then
+        # checked by fingerprint like anything else -- a copy that goes wrong must fail
+        # here, not three stages later as "the download was corrupt".
+        for it, twin in to_copy:
+            t0 = time.monotonic()
+            if not twin.dest.is_file():
+                raise NestFailure(
+                    "S1", ErrorClass.OBJECT_MISSING,
+                    f"{it.label} shares its bytes with {twin.label}, which is not on disk — "
+                    "nothing to copy from.", context={"sha256": it.sha256})
+            it.dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(twin.dest, it.dest)
+            if _sha256_file(it.dest) != it.sha256:
+                raise NestFailure(
+                    "S1", ErrorClass.HASH_MISMATCH,
+                    f"Copying {twin.label} to {it.label} did not produce the same bytes.",
+                    context={"sha256": it.sha256})
+            journal.mark_blob(it.sha256, BLOB_VERIFIED, it.dest)
+            state["blobs_cached"] += 1
+            blob_done(it, "copied", None, time.monotonic() - t0)
         state["transfer_seconds"] = round(time.monotonic() - t_assets, 3)
-        return f"{state['blobs_downloaded']} downloaded, {state['blobs_cached']} already here"
+        copied = f", {len(to_copy)} copied from bytes already here" if to_copy else ""
+        return (f"{state['blobs_downloaded']} downloaded, "
+                f"{state['blobs_cached'] - len(to_copy)} already here{copied}")
 
     # -- S2 layout: full re-verify + self-heal re-pull + unpack --
     def s2_place() -> str:
@@ -2554,6 +2695,7 @@ def restore(
             _staged = target / _staged_rel
             if _staged.is_file():
                 _land_recipe(_adapter, mani, _staged, target, narrate)
+                _say_if_the_recipe_points_elsewhere(_staged, narrate)
 
         post = mani.get("post_install")
         if post:
@@ -2890,6 +3032,26 @@ def restore(
                 "log": str(res.log_path),
             }
             if res.exit_code != want:
+                # Read the log for a missing machine library **before** blaming the run.
+                # Measured 2026-08-18: a training run died on `import cv2` for want of
+                # libGL.so.1, and this branch answered "the environment rebuilt correctly,
+                # what failed is the run itself" -- while the previous screen had already
+                # named that exact library. The service-type branch has scanned for this
+                # all along; only this one did not, so the same machine got two different
+                # diagnoses depending on which kind of nest it was.
+                _libs = missing_system_libraries(_tail(res.log_path, _SYSLIB_SCAN_CHARS))
+                if _libs:
+                    raise NestFailure(
+                        "S4",
+                        ErrorClass.SYSLIB_MISSING,
+                        missing_library_advice(
+                            every_missing_library(_libs, report.precheck),
+                            plan.base_image_ref)
+                        + f" The run's own log: {res.log_path}",
+                        detail=_tail(res.log_path),
+                        context={"missing_system_library": _libs[0],
+                                 "exit_code": res.exit_code},
+                    )
                 raise NestFailure(
                     "S4",
                     ErrorClass.STARTUP_CRASH,
@@ -2956,7 +3118,9 @@ def restore(
                 raise NestFailure(
                     "S4",
                     ErrorClass.SYSLIB_MISSING,
-                    missing_library_advice(_libs, plan.base_image_ref)
+                    missing_library_advice(
+                        every_missing_library(_libs, report.precheck),
+                        plan.base_image_ref)
                     + f" The app's own log: {_log}",
                     detail=_tail(_log) if _log.exists() else None,
                     context={"missing_system_library": _lib},
@@ -2989,9 +3153,13 @@ def restore(
             # A run-to-completion nest has no separate smoke step — the S4 run
             # itself is the evidence (the standard for "it ran" is exit code 0;
             # we do not look at loss, nor at the quality of the output).
+            report.recipe = {"reran": False, "images": None,
+                             "why": "this nest finishes its run rather than staying up"}
             return "not needed: this nest finishes its run rather than staying up"
         try:
-            return launcher.smoke(handle_box["h"])
+            out = launcher.smoke(handle_box["h"])
+            report.recipe = getattr(launcher, "recipe_outcome", None)
+            return out
         except NestFailure:
             raise
         except ImageMismatch as e:
@@ -3016,7 +3184,9 @@ def restore(
                 raise NestFailure(
                     "S5",
                     ErrorClass.SYSLIB_MISSING,
-                    missing_library_advice(_slibs, plan.base_image_ref)
+                    missing_library_advice(
+                        every_missing_library(_slibs, report.precheck),
+                        plan.base_image_ref)
                     + f" The app's own log: {_slog}",
                     detail=_tail(_slog) if _slog.exists() else None,
                     context={"missing_system_library": _slib},
@@ -3167,6 +3337,11 @@ def restore(
         # For a training nest the exit code of that run is the headline fact, so
         # it belongs on the event stream and not only in the logs.
         oneshot=report.oneshot,
+        # Did the packed recipe actually run again, and did anything come out. Three
+        # outcomes all return ok=true, so a --json reader used to have no way to tell
+        # them apart except by matching the English sentence -- and that sentence has
+        # already been reworded once. Same reasoning as machine_libraries_missing above.
+        recipe=report.recipe,
         redactions=report.redactions,
         # The CUDA version torch reports after install versus what the nest
         # declared. A check nobody can see is a check that does not exist, so it

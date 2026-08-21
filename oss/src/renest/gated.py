@@ -122,6 +122,10 @@ def find_token(env: dict[str, str] | None = None, home: Path | None = None) -> s
     return ""
 
 
+#: Content types that mean "this is a page about the file", not the file.
+_PAGE_TYPES = frozenset({"text/html", "application/xhtml+xml", "text/plain"})
+
+
 def check_reach(asset: GatedAsset, *, token: str, client: httpx.Client) -> GatedAsset:
     """Probe whether this asset can be got right now, **on this machine, with
     your own credentials**.
@@ -144,6 +148,29 @@ def check_reach(asset: GatedAsset, *, token: str, client: httpx.Client) -> Gated
         return asset
 
     if code < 400:
+        # **A 200 is not proof the file is there.** Some hosts answer an anonymous
+        # request with a login page and status 200; taking that as "you can get this"
+        # is the one answer this probe must never give, because its whole promise is
+        # "find out in a minute instead of after renting a machine". Two cheap tells,
+        # both from headers we already have: the reply says it is a web page, or it is
+        # far smaller than the file we are asking about. Unsure is reported as unsure.
+        ctype = (r.headers.get("content-type") or "").split(";")[0].strip().lower()
+        try:
+            clen = int(r.headers.get("content-length") or 0)
+        except ValueError:
+            clen = 0
+        looks_like_a_page = ctype in _PAGE_TYPES
+        far_too_small = bool(asset.size_bytes and clen and clen * 100 < asset.size_bytes)
+        if looks_like_a_page or far_too_small:
+            asset.reach = Reach.ERROR
+            asset.detail = (
+                f"the source answered {code}, but with "
+                + (f"a web page ({ctype})" if looks_like_a_page
+                   else f"only {clen} bytes for a {asset.size_bytes}-byte file")
+                + " — that is usually a sign-in page, so we cannot tell from here "
+                  "whether you can really get this one"
+            )
+            return asset
         asset.reach = Reach.FREE
         return asset
     if code in (401, 403):

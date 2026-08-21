@@ -168,8 +168,9 @@ def _sha256_stream(path: Path) -> tuple[str, int]:
     # If the source is written while we read it (ComfyUI or a downloader still
     # running), the fingerprint is void and the restore side would only ever see
     # "corrupt download" — fail loudly here rather than ship a poisoned nest.
-    # Covers the read window only; the hardlink window between hashing and
-    # upload is still open and tracked separately.
+    # Covers the read window. The window between hashing and upload -- the blob is
+    # hard-linked, so whatever writes the original writes the blob -- is closed on the
+    # upload side (see hosted.py, one stat before each send).
     before = path.stat()
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -966,7 +967,14 @@ def _base_image_for_manifest(spec_img: object, warnings: list[str]) -> dict | No
             f"fingerprint (sha256: plus 64 hex characters) into base_image.digest."
         )
         return None
+    # **Say which layer it is.** The lookup only ever asks for the index media types
+    # (see resolve_image_digest), so what comes back is always the index digest, never
+    # the per-architecture one -- and the schema treats those as different things, with
+    # the per-architecture one being the useful one. Writing the digest without saying
+    # which layer leaves a consumer unable to tell, and the schema says not to guess.
+    # A digest the spec supplied stays unlabelled: we do not know where it came from.
     out["digest"] = found
+    out["digest_kind"] = "index"
     return out
 
 
@@ -1147,6 +1155,22 @@ def _build_manifest(
             rt = dict(manifest.get("runtime") or {})
             rt.setdefault("native_libs", libs)
             manifest["runtime"] = rt
+            # Which of the two lists this is decides whether a rebuild stops **before**
+            # downloading anything. Asking a running app what it loaded is exact; reading
+            # the installed packages is a guess that names libraries never used and misses
+            # ones that are, so the restore side only mentions it and never stops on it.
+            # The user is the only one who can turn the weaker list into the stronger one,
+            # and until now nothing told them the difference existed.
+            if libs.get("method") == "declared":
+                warnings.append(
+                    "The machine-library list in this nest is the weaker of the two: it was "
+                    "read off the installed packages, because the application was not "
+                    "running while we packed. A rebuild on a machine short of one of these "
+                    "will only get a mild note, not the stop that happens before any bytes "
+                    "are downloaded. To get the stronger list, start the application, let it "
+                    "load once, and pack again with it still running -- then we ask it what "
+                    "it actually loaded."
+                )
 
     inventory: list[dict] = []
     node_arch_entries: list[dict] = []  # kept-vendored .so target archs -> manifest.gpu
@@ -1904,6 +1928,21 @@ def infer_spec_current_state(
     if extra:
         spec["_extra_recipes"] = extra
     report["unreadable_images"] = [str(p) for p in evidence.unreadable]
+    # **Say which run this nest will re-run, when there was more than one to choose from.**
+    # Every recipe found travels with the nest either way, so nothing is lost -- but the
+    # one picked here is the one a rebuild runs again and the one this nest claims worked,
+    # and picking it silently is how someone ends up shipping a different run than they
+    # meant. The default (the most recent finished run) stays; --workflow overrides it.
+    if len(evidence.recipes) > 1 and driving is not None:
+        import datetime as _dt
+        when = _dt.datetime.fromtimestamp(driving.mtime, _dt.UTC).strftime("%Y-%m-%d %H:%M")
+        where = str(driving.source_path) if driving.source_path else "a picture it produced"
+        report["gaps"].append(
+            f"This environment holds {len(evidence.recipes)} finished runs. The most recent "
+            f"one ({when} UTC, from {where}) is the one recorded as having worked, and the "
+            f"one a rebuild runs again. All of them travel with the nest either way. "
+            f"To pick a different one, pass --workflow with that recipe."
+        )
 
     # Tell the caller which of the two nests they are about to get -- said once,
     # up front, not left for them to notice missing on the other end.

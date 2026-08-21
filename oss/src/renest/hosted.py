@@ -300,7 +300,7 @@ class HostedUploader:
             # 404 from the server; spell out both ways forward.
             raise PackError(
                 f"Your drive has no nest with id {self._nest_id} — it may have been "
-                "deleted, or the id was mistyped. Run `renest nests` to see what's "
+                "deleted, or the id was mistyped. Run `renest list` to see what's "
                 "there, or pack again with --new-nest to start a fresh nest.",
                 exit_code=int(ExitCode.USAGE),
             )
@@ -371,6 +371,48 @@ class HostedUploader:
     @staticmethod
     def _store_put(client: httpx.Client, url: str, content: bytes) -> httpx.Response:
         return store_put(client, url, content, resumable=True)
+
+    @staticmethod
+    def _refuse_a_blob_that_moved_since_it_was_hashed(
+        path: Path, sha: str, declared_size: int, created_at: str | None
+    ) -> None:
+        """Stop if this blob is not the bytes we hashed. One stat, no re-read.
+
+        Packing hashes a file and then hard-links it into the blob tree, so the blob
+        and the live file share an inode: whatever writes the original writes the blob
+        too, and the upload after it sends bytes that no longer match the sha we
+        declared. **The bill arrives days later** -- the restore fails its check and
+        reads as "the transfer was corrupted", while the cause was here.
+        Two cheap tells: the size no longer matches, or a still-shared inode whose
+        content changed after this nest was created.
+        """
+        try:
+            st = path.stat()
+        except OSError:
+            return                        # missing is a different failure, reported elsewhere
+        why = ""
+        if st.st_size != declared_size:
+            why = (f"it is {st.st_size} bytes now and {declared_size} when we hashed it")
+        elif st.st_nlink > 1 and created_at:
+            from datetime import datetime
+            try:
+                made = datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                made = None
+            if made is not None and st.st_mtime > made + 1:
+                why = ("the file it shares its bytes with was written again after we "
+                       "hashed it")
+        if not why:
+            return
+        raise PackError(
+            f"The file behind blob {sha[:12]} changed while we were packing — {why}. "
+            "Nothing was uploaded for it. This happens when the application is still "
+            "running (still writing a model, still finishing a job) while pack reads it. "
+            "**Stop the application and pack again.** Sending it now would store bytes "
+            "that do not match their own fingerprint, and you would only find out days "
+            "later, when a rebuild reports the download as corrupted.",
+            exit_code=int(ExitCode.S1_STORAGE_UNAVAILABLE),
+        )
 
     def _upload_blob(self, client: httpx.Client, path: Path, plan: dict) -> int:
         return upload_blob_multipart(client, path, plan, max_parallel=MAX_PARALLEL_PUT)
@@ -551,6 +593,8 @@ class HostedUploader:
                     )
                 local = blobs_dir / sha[:2] / sha
                 if plan["action"] == "upload":
+                    self._refuse_a_blob_that_moved_since_it_was_hashed(
+                        local, sha, wanted[sha], manifest.get("created_at"))
                     self._log(f"[{i}/{len(plans)}] Sending {sha[:12]} ({wanted[sha]} bytes)…")
                     tb = time.monotonic()
                     sent = self._upload_blob(client, local, plan)

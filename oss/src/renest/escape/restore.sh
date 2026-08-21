@@ -119,9 +119,16 @@ if [[ -n "$GRANT" ]]; then
   # clock — without this line their files could be cleared while still in use.
   # Told, never enforced: this line changes nothing that follows it.
   _DAYS_LEFT="$(jq -r '.retention_days_left // empty' "$_GRANT_RAW")"
+  # Only say "sign in and it restarts" when the server says it does: an account that
+  # cancelled runs to a fixed date, and sending them to sign in would not save a thing.
+  _RENEWS="$(jq -r 'if has("retention_renews_on_sign_in") then (.retention_renews_on_sign_in|tostring) else "unknown" end' "$_GRANT_RAW")"
   if [[ "$_DAYS_LEFT" =~ ^[0-9]+$ ]] && [[ "$_DAYS_LEFT" -le 30 ]]; then
     echo "[renest] Heads-up: what you have stored has ${_DAYS_LEFT} days of keep-time left (free accounts keep files for 90 days)."
-    echo "[renest] Signing in on the website once restarts the 90 days, at no cost. This restore is unaffected — carrying on."
+    case "$_RENEWS" in
+      true)  echo "[renest] Signing in on the website once restarts the 90 days, at no cost. This restore is unaffected — carrying on." ;;
+      false) echo "[renest] This countdown runs to a fixed date and signing in does not change it — move anything you want to keep before then. This restore is unaffected — carrying on." ;;
+      *)     echo "[renest] This restore is unaffected — carrying on." ;;
+    esac
   fi
   MANIFEST_URL="$(jq -r '.manifest_url' "$_GRANT_RAW")"
   jq '.blobmap | map_values(.[0])' "$_GRANT_RAW" > "$TARGET/.renest/grant-blobmap.json"
@@ -139,6 +146,9 @@ BLOBMAP="$TARGET/.renest/blobmap.json"
 
 STAGE="S0-precheck"      # current stage; failures are attributed to it
 FAILFILE="$TARGET/.renest/restore-failure.json"
+# The installer writes a lot and only stdout sees it; close the terminal or drop the
+# ssh connection and the one thing that explains the failure is gone. Keep a copy.
+DEPSLOG="$TARGET/.renest/deps-install.log"
 # Reruns must be idempotent: a stale failure file from the last attempt would
 # veto a fully successful rerun at the post-parallel check. Real-machine proof
 # 2026-07-26: a model downloaded to 100% and the run was still blocked by the
@@ -150,10 +160,20 @@ warn() { printf '\033[1;33m[renest] Heads up:\033[0m %s\n' "$*" >&2; }
 die()  {
   local code="$1"; shift
   printf '\033[1;31m[renest] Failed [%s / %s]:\033[0m %s\n' "$STAGE" "$code" "$*" >&2
+  local _EX=""
+  # jq does the escaping here: the message field's sed cannot handle tabs or the
+  # control bytes an installer's output is full of, and a broken record is worse
+  # than none — support would be reading a file that will not parse.
+  if [ -s "${DEPSLOG:-}" ] && command -v jq >/dev/null 2>&1; then
+    _EX=",\"install_log\":\"$DEPSLOG\",\"install_log_tail\":$(tail -n 40 "$DEPSLOG" | jq -Rs .)"
+  fi
   if mkdir -p "$(dirname "$FAILFILE")" 2>/dev/null; then
-    printf '{"stage":"%s","code":"%s","message":%s}\n' "$STAGE" "$code" \
-      "$(printf '%s' "$*" | tr '\n' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g; s/^/"/; s/$/"/')" > "$FAILFILE"
+    printf '{"stage":"%s","code":"%s","message":%s%s}\n' "$STAGE" "$code" \
+      "$(printf '%s' "$*" | tr '\n' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g; s/^/"/; s/$/"/')" "$_EX" > "$FAILFILE"
     printf '\033[1;31m[renest]\033[0m Details written to %s\n' "$FAILFILE" >&2
+  fi
+  if [ -n "$_EX" ]; then
+    printf '\033[1;31m[renest]\033[0m The installer output is kept at %s — that file is the diagnosis, and it is the one to send if you ask us for help.\n' "$DEPSLOG" >&2
   fi
   exit 1
 }
@@ -280,7 +300,14 @@ case "$FV" in
   2.0|2.1|2.2|2.3|2.4|2.5|2.6|2.7|2.8) ;;
   2.*)
     warn "This nest says format $FV; this script knows up to 2.8. Same major version, so it only adds optional fields this script does not use — carrying on. A newer Renest will make full use of them." ;;
-  *) die FORMAT-VERSION "Unrecognised nest format version: $FV — this script reads format 2.x (knows 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7 and 2.8). Nests in the older 1.x format cannot be read here. Pack the environment again with a current Renest." ;;
+  *)
+    # Same three facts the agent side gives, in the same order: how old this nest is,
+    # that there is no upgrade path and why, and that the files themselves are fine.
+    # Refusing is right; leaving someone wondering whether they just lost their models
+    # is not (the manifest still lists every one of them, with fingerprints).
+    _WHEN=$(jq -r '.created_at // empty' "$MANIFEST" 2>/dev/null | cut -c1-10)
+    _NFILES=$(jq -r '(.files // []) | length' "$MANIFEST" 2>/dev/null)
+    die FORMAT-VERSION "Unrecognised nest format version: $FV — this script reads format 2.x (knows 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7 and 2.8).${_WHEN:+ This nest was packed on ${_WHEN}.} Nests in the older 1.x format cannot be read here, and **there is no upgrade path**: format 2.0 made it compulsory to say which parts of a nest are the application and which are your own code, and nobody can work that out after the fact.${_NFILES:+ **Your files are not lost** — this nest still lists all ${_NFILES} of them with their fingerprints, so they can be fetched one by one even though the environment cannot be rebuilt automatically.} If you still have the environment, pack it again with a current Renest." ;;
 esac
 
 # ---- Where the files may land ------------------------------------------------
@@ -496,6 +523,12 @@ blob_url() {
   fi
 }
 
+# Where we note which sha256 already landed where, so a second path pointing at the
+# same bytes copies instead of downloading again. Under the target so a resumed run
+# still has it; failing to create it only costs the saving, never correctness.
+SEEN_BLOBS="$TARGET/.renest/landed-blobs"
+mkdir -p "$SEEN_BLOBS" 2>/dev/null || SEEN_BLOBS=""
+
 # ---- 2. Download one file and check it --------------------------------------
 # fetch_blob <sha256> <destination> [progress prefix]
 fetch_blob() {
@@ -506,6 +539,21 @@ fetch_blob() {
   mkdir -p "$(dirname "$dest")"
   if [ -f "$dest" ] && [ "$(sha256_of "$dest")" = "$h" ]; then
     log "  ${prefix}already here and byte-checked, skipping $(basename "$dest")"; return 0
+  fi
+  # **One sha256, one download.** A manifest may point several paths at the same bytes
+  # (one big model referenced from several places is normal); fetching each path
+  # separately spends the user's bandwidth once per reference. If these bytes already
+  # landed somewhere, copy from there and check the copy the same way -- a bad copy has
+  # to fail here, not three stages later reading as "the download was damaged".
+  if [ -n "${SEEN_BLOBS:-}" ] && [ -f "$SEEN_BLOBS/$h" ]; then
+    local twin; twin=$(cat "$SEEN_BLOBS/$h")
+    if [ -f "$twin" ] && [ "$twin" != "$dest" ]; then
+      cp "$twin" "$dest" || die FETCH-BLOB "Could not copy $twin to $dest"
+      got=$(sha256_of "$dest")
+      [ "$got" = "$h" ] || die HASH-MISMATCH "Copying $twin to $dest did not produce the same bytes (expected $h, got $got)."
+      log "  ${prefix}same bytes as $(basename "$twin") — copied instead of downloading again"
+      return 0
+    fi
   fi
   # --speed-limit/--speed-time: stall suicide. A dead TCP connection never
   # triggers --retry on its own; below 10 KiB/s for 30s curl exits 28 (retryable),
@@ -544,6 +592,10 @@ fetch_blob() {
   got=$(sha256_of "$tmp")
   [ "$got" = "$h" ] || die HASH-MISMATCH "$dest does not match what the nest says it should be (expected $h, got $got). The download was damaged, or the source was tampered with."
   mv "$tmp" "$dest"
+  # Remember where these bytes landed, so a second path referring to the same sha256
+  # copies from here instead of paying for the download twice.
+  [ -n "${SEEN_BLOBS:-}" ] && printf '%s' "$dest" > "$SEEN_BLOBS/$h"
+  return 0
 }
 
 # ---- 3. Which image this nest was built on (told, not enforced) -------------
@@ -573,6 +625,35 @@ fi
 # Deliberately not `ldd`: measured, it reported libraries the nest carries itself
 # as missing, and got the direction wrong on others. A plain look in the standard
 # library folders, under the exact name the program asks for, does not.
+# The C library the nest was built against. Same question the agent-side check asks
+# (check_system_layer), same verdict, so the two legs do not contradict each other on
+# the same machine: warn only when **this** machine is older than the nest's, because
+# pre-built packages are chosen against that number and may refuse to install.
+# `ldd --version` is used only to read a version string here -- not to resolve which
+# libraries a program needs, which is what the note below rejects it for.
+# Both readers are optional: no reading, no sentence. Never a refusal (this leg informs).
+# BEGIN libc-check -- the parity test runs exactly these lines, so they cannot drift
+WANT_LIBC=$(jq -r '.runtime.libc_version // empty' "$MANIFEST")
+if [ -n "$WANT_LIBC" ]; then
+  HAVE_LIBC=""
+  if command -v getconf >/dev/null 2>&1; then
+    HAVE_LIBC=$(getconf GNU_LIBC_VERSION 2>/dev/null | tr -dc '0-9.' )
+  fi
+  if [ -z "$HAVE_LIBC" ] && command -v ldd >/dev/null 2>&1; then
+    HAVE_LIBC=$(ldd --version 2>/dev/null | head -1 | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+' | head -1)
+  fi
+  if [ -n "$HAVE_LIBC" ]; then
+    _w_maj=${WANT_LIBC%%.*}; _w_rest=${WANT_LIBC#*.}; _w_min=${_w_rest%%.*}
+    _h_maj=${HAVE_LIBC%%.*}; _h_rest=${HAVE_LIBC#*.}; _h_min=${_h_rest%%.*}
+    case "$_w_maj$_w_min$_h_maj$_h_min" in *[!0-9]*) _w_maj="" ;; esac
+    if [ -n "$_w_maj" ] && { [ "$_h_maj" -lt "$_w_maj" ] || { [ "$_h_maj" -eq "$_w_maj" ] && [ "$_h_min" -lt "$_w_min" ]; }; }; then
+      warn "This machine's C library is $HAVE_LIBC and this nest was packed against $WANT_LIBC. Pre-built packages are chosen against that number, so some of them may refuse to install here."
+      warn "  Your nest is fine -- this belongs to the machine's operating system. Surest fix: start again from a machine whose C library is $WANT_LIBC or newer."
+    fi
+  fi
+fi
+# END libc-check
+
 NL_METHOD=$(jq -r '.runtime.native_libs.method // empty' "$MANIFEST")
 if [ -n "$NL_METHOD" ]; then
   NL_MISSING=""
@@ -789,7 +870,7 @@ if [ -n "${PACKAGE_SOURCE:-}" ]; then
   log "Installing dependencies from $PACKAGE_SOURCE instead of the default. Every package is still checked against the fingerprint recorded in this nest."
   export UV_DEFAULT_INDEX="$PACKAGE_SOURCE"
 fi
-VIRTUAL_ENV="$TARGET/.venv" uv pip sync "$TARGET/.renest/requirements.lock" || die DEPS-SYNC "Installing dependencies failed. uv's own output above is the real diagnosis — read it. The three usual causes:
+VIRTUAL_ENV="$TARGET/.venv" uv pip sync "$TARGET/.renest/requirements.lock" 2>&1 | tee "$DEPSLOG" || die DEPS-SYNC "Installing dependencies failed. uv's own output above is the real diagnosis — read it, and it is also saved to $DEPSLOG. The three usual causes:
        (1) torch/CUDA will not install on this machine (wrong base image)
        (2) a package needs compiling here and there is no compiler
        (3) a pinned wheel link returns 404 because that build was removed upstream.
@@ -825,7 +906,7 @@ while [ "$_i" -lt "$_N_CM" ]; do
     warn "The copy of $_MOD installed here is not the one your working setup used, and $_WIN is not pinned in this nest's dependency list, so it could not be reinstalled. Carrying on: anything that imports $_MOD may behave differently from the run that worked."
     continue
   fi
-  if ! VIRTUAL_ENV="$TARGET/.venv" uv pip install --reinstall --no-deps "$_REQ"; then
+  if ! VIRTUAL_ENV="$TARGET/.venv" uv pip install --reinstall --no-deps "$_REQ" 2>&1 | tee -a "$DEPSLOG"; then
     warn "The copy of $_MOD installed here is not the one your working setup used, and reinstalling $_WIN failed (uv's output above says why). Carrying on: anything that imports $_MOD may behave differently from the run that worked."
     continue
   fi
@@ -912,6 +993,20 @@ if [ -n "$WF_H" ]; then
     mkdir -p "$(dirname "$TARGET/$WF_PATH")"
     cp "$WF_STAGED" "$TARGET/$WF_PATH"
     log "Recipe is back where it lived: $TARGET/$WF_PATH"
+  fi
+
+  # A workflow built elsewhere often names its files the long way
+  # (/workspace/ComfyUI/models/x.safetensors). On a machine whose root is somewhere
+  # else every one of those goes nowhere, and the app's own error says nothing about
+  # why. Two components minimum: a one-word value like /upscale is a label, not a path.
+  # **Nothing new is stored to make this possible** — the paths are in the recipe
+  # itself. We name them; we do not create the link, which would mean writing outside
+  # the folder you gave us.
+  _STRAY=$(jq -r '[.. | strings | select(test("^(/[^/]+/[^/]|[A-Za-z]:[\\\\/])"))] | unique | .[]' \
+             "$WF_STAGED" 2>/dev/null | while IFS= read -r _p; do
+             [ -e "$_p" ] || printf '%s, ' "$_p"; done | sed 's/, $//')
+  if [ -n "$_STRAY" ]; then
+    warn "This recipe still names full paths from the machine it was built on, and they do not exist here: $_STRAY. Nothing is broken in the rebuild — the files it needs are in place under this folder — but those nodes will not find them until you point each one at its file by name, or make the old path lead here yourself."
   fi
 fi
 

@@ -32,11 +32,14 @@ FRAMEWORKS = ("kohya", "llamafactory")
 # The allow-list is backstopped by the schema's pattern as well.
 _SNAPSHOT_RE = re.compile(r"^snapshots/[0-9a-f]{40}/")
 
-# Training outputs: never packed.
-_OUTPUT_NAMES = (
-    "adapter_model.safetensors", "trainer_log.jsonl", "trainer_state.json",
-    "all_results.json", "train_results.json", "adapter_config.json",
-)
+# Training outputs never get packed, and **there is no name list doing that**. There used
+# to be one here, unreferenced by anything -- it read like an enforced rule while enforcing
+# nothing, and it was already shorter than what a real run leaves behind (no optimizer.pt,
+# no rng_state.pth, no checkpoint-N/). Two things really do the work: files[] carries only
+# what the recipe names, so an output nobody points at is never collected; and the output
+# directory is excluded from the code archive by the path the run itself declared, so it
+# cannot ride along inside a tar either. A list of names would be a third answer that goes
+# stale the first time a framework renames a file.
 
 
 def load_run_record(path: str | Path) -> dict:

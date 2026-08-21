@@ -93,6 +93,116 @@ def png_text_chunks(path: Path) -> dict[str, str]:
     return out
 
 
+
+#: Video containers ComfyUI's own save node writes. Kept small on purpose: each one
+#: here has been read off a real file, not guessed at.
+VIDEO_SUFFIXES = (".mp4", ".m4v", ".mov")
+
+
+def _mp4_boxes(fh, start: int, end: int):
+    """Walk the boxes between two offsets, yielding (type, body_start, body_end).
+
+    Seeks rather than reads: a render can be several GB and we want a few hundred
+    bytes of text out of it.
+    """
+    off = start
+    while off + 8 <= end:
+        fh.seek(off)
+        head = fh.read(8)
+        if len(head) < 8:
+            return
+        size, typ = struct.unpack(">I4s", head)
+        header = 8
+        if size == 1:                      # 64-bit size follows the type
+            size = struct.unpack(">Q", fh.read(8))[0]
+            header = 16
+        elif size == 0:                    # runs to the end of its parent
+            size = end - off
+        if size < header:
+            return
+        yield typ.decode("latin1", "replace"), off + header, off + size
+        off += size
+
+
+def _mp4_path(fh, start: int, end: int, *names: str):
+    """Descend a chain of box types, e.g. moov -> udta -> meta."""
+    for want in names:
+        found = None
+        for typ, body_start, body_end in _mp4_boxes(fh, start, end):
+            if typ == want:
+                found = (body_start, body_end)
+                break
+        if found is None:
+            return None
+        start, end = found
+        if want == "meta":
+            # `meta` is a full box: four bytes of version/flags before its children.
+            # Skipping them is not optional -- without it every child parses wrong.
+            start += 4
+    return start, end
+
+
+def mp4_text_chunks(path: Path) -> dict[str, str]:
+    """Every ComfyUI metadata entry of an mp4, keyed by name. Same shape as
+    :func:`png_text_chunks`, so the caller does not care which it got.
+
+    The save node writes the recipe into ``moov/udta/meta`` using Apple's ``mdta``
+    layout: a ``keys`` box lists the names in order, an ``ilst`` box holds the values
+    in that same order -- the values carry no names of their own, so the two are
+    matched by position.
+
+    **Never shells out to ffprobe.** The nest that needs this most is the one packed
+    on a machine with no system ffmpeg (or one built for another architecture), which
+    is exactly the case one of our test environments was built to reproduce. Reading
+    the container ourselves works everywhere; asking an external tool does not.
+
+    A file that is not a well-formed mp4 returns an empty dict rather than raising --
+    "no evidence", not a crash, same rule as the PNG side.
+    """
+    out: dict[str, str] = {}
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            meta = _mp4_path(fh, 0, size, "moov", "udta", "meta")
+            if meta is None:
+                return {}
+            keys = _mp4_path(fh, meta[0], meta[1], "keys")
+            ilst = _mp4_path(fh, meta[0], meta[1], "ilst")
+            if not (keys and ilst):
+                return {}
+            fh.seek(keys[0])
+            fh.read(4)                                   # version/flags
+            count = struct.unpack(">I", fh.read(4))[0]
+            if count > _MAX_METADATA_KEYS:
+                return {}
+            names: list[str] = []
+            for _ in range(count):
+                key_size = struct.unpack(">I", fh.read(4))[0]
+                fh.read(4)                               # namespace, always "mdta"
+                if not 8 <= key_size <= _MAX_TEXT_CHUNK:
+                    return {}
+                names.append(fh.read(key_size - 8).decode("utf-8", "replace"))
+            for i, (_typ, body_start, body_end) in enumerate(_mp4_boxes(fh, ilst[0], ilst[1])):
+                data = _mp4_path(fh, body_start, body_end, "data")
+                if data is None:
+                    continue
+                length = data[1] - data[0] - 8
+                if not 0 < length <= _MAX_TEXT_CHUNK:
+                    continue
+                fh.seek(data[0] + 8)                     # type + locale
+                value = fh.read(length).decode("utf-8", "replace")
+                out[names[i] if i < len(names) else f"?{i}"] = value
+    except (OSError, struct.error, UnicodeDecodeError):
+        return {}
+    return out
+
+
+#: A sane ceiling on how many metadata entries to believe. A damaged file can claim
+#: four billion of them.
+_MAX_METADATA_KEYS = 4096
+
+
 @dataclass
 class RecipeEvidence:
     """One recipe found on disk, plus where it came from."""
@@ -120,29 +230,40 @@ class ComfyUIEvidence:
         return self.recipes[0] if self.recipes else None
 
 
+
+def _outputs_worth_reading(output_dir: Path):
+    """Every file under the output folder that could carry a recipe."""
+    for p in output_dir.rglob("*"):
+        if p.is_file() and (p.suffix.lower() == ".png" or p.suffix.lower() in VIDEO_SUFFIXES):
+            yield p
+
+
 def scan_comfyui_output(output_dir: Path) -> ComfyUIEvidence:
-    """Read every PNG under ``output_dir`` for its recipe chunk.
+    """Read every picture and video under ``output_dir`` for its recipe.
 
-    **Subfolders count.** This used to look only in the top folder, on the idea that
-    a subfolder is a user sorting their own pictures. That idea is wrong: ComfyUI
-    itself writes into ``output/<sub>/`` whenever the save node's filename prefix
-    contains a slash, which is an ordinary thing to set. The cost of being wrong is
-    heavy and silent -- an environment that really has produced pictures packs as
-    "nothing here is confirmed to have worked yet", and every restore of it then
-    skips the one check worth most (does the recipe still run?), forever.
-    Measured 2026-08-20: a picture one folder down was invisible, and did not even
-    show up as unreadable, so nothing on screen hinted anything had been skipped.
+    **Subfolders and videos both count**, and neither did before 2026-08-20. Either
+    gap is total and silent: an environment that really has been producing work packs
+    as "nothing here is confirmed to have worked yet", and every restore of it then
+    skips the check worth most -- does the recipe still run? -- forever. ComfyUI
+    itself writes into ``output/<sub>/`` whenever a save node's filename prefix holds
+    a slash, and video nodes never wrote a PNG at all.
 
-    Sorting a user's own pictures in is not a danger: evidence is "this PNG carries
-    a ComfyUI ``prompt`` block", which holiday photos do not have. A PNG with no
-    ``prompt`` chunk, or one that fails to parse as JSON, is reported as unreadable
-    and skipped -- never guessed at.
+    Taking a user's own files for evidence is not a risk: what counts is a ComfyUI
+    ``prompt`` block, which holiday photos do not carry. A file without one is
+    reported as unreadable and skipped -- never guessed at.
     """
     recipes: list[RecipeEvidence] = []
     unreadable: list[Path] = []
     if output_dir.is_dir():
-        for p in sorted(output_dir.rglob("*.png")):
-            raw = png_text_chunks(p).get("prompt")
+        for p in sorted(_outputs_worth_reading(output_dir)):
+            reader = mp4_text_chunks if p.suffix.lower() in VIDEO_SUFFIXES else png_text_chunks
+            # **Read ``prompt``, never ``workflow``.** Both names appear, but ``workflow``
+            # is the web canvas and is written only when a person pressed Run in the
+            # browser; anything submitted over the API -- every script, every automated
+            # run -- writes ``prompt`` alone. Judging on ``workflow`` would file every
+            # automated run as "this never produced anything". Measured 2026-08-20 on
+            # three real files: the API-submitted one had no ``workflow`` at all.
+            raw = reader(p).get("prompt")
             if not raw:
                 unreadable.append(p)
                 continue

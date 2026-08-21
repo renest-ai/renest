@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "renest"
-version = "0.1.6"
+version = "0.1.7"
 readme = "README.md"
 description = "Renest agent CLI: pack a working GPU setup — an image workflow or a fine-tuning run — into an open-format nest and restore it byte-identical anywhere."
 requires-python = ">=3.11"

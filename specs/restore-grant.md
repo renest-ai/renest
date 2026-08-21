@@ -117,6 +117,16 @@ well revive their setup from a pod with a recovery code every day and never open
 the website, while renewal only counts website logins -- without a word at the
 point of restore, they would be swept away while visibly still using the
 product. Consumers **must** show the countdown when the value is `≤ 30`.
+
+`retention_renews_on_sign_in` — **whether that countdown restarts if the account
+signs in**; `null` or absent means the issuer did not say. `true` is the ordinary
+free account described above. `false` is an account that cancelled: its clock runs
+from the day it cancelled to a fixed date, and signing in changes nothing. This
+field exists because the countdown alone is not enough to write the sentence:
+consumers used to say "sign in once and the 90 days start over" to everybody, and
+for a cancelled account that sends the person to do something that will not save
+their files -- while leaving them believing it did. **When the field is absent,
+say nothing about renewal**; do not assume either answer.
 **Informs, never blocks**: this field never changes restore behaviour. A locally
 self-signed payload omits it, so nothing is shown and behaviour is unchanged.
 
