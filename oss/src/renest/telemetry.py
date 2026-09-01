@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .config import Config, ConfigError, is_pod_environment, user_config_path
+from .uplink import USER_AGENT
 
 __all__ = [
     "EVENT_SCHEMA",
@@ -324,7 +325,7 @@ def send_event(config: Config, payload: Mapping[str, Any]) -> bool:
             endpoint,
             data=json.dumps(payload).encode(),
             method="POST",
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
         )
         with urllib.request.urlopen(req, timeout=_TIMEOUT_S):
             return True

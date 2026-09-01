@@ -44,6 +44,7 @@ __all__ = [
     "pytorch_index",
     "artifact_hash",
     "add_hashes",
+    "unfingerprinted_packages",
 ]
 
 #: Built-in fallback allow-list. **The normal path never reads it** -- the real list lives
@@ -429,11 +430,20 @@ def pin_lock_text(
 
     Only lines carrying a local version (``+xxx``) are touched; the rest are kept as they
     are -- they exist on PyPI and uv can find them itself.
+
+    **The operating system's own rebuilds are left alone.** ``python-apt==2.4.0+ubuntu3``
+    carries a local version too, and asking a vendor index for it can only 404 -- which
+    used to abort the whole run and throw away the vendor wheels already found. Nothing is
+    hidden by skipping them: packing warns about that group separately, with the only fix
+    that works for it (build the environment in a virtual environment).
     """
+    from .envlock import distro_owned_packages
+
     own = client is None
     c = client if client is not None else httpx.Client(follow_redirects=True, timeout=FETCH_TIMEOUT)
     out: list[str] = []
     pinned: list[tuple[str, str]] = []
+    owned_by_the_os = set(distro_owned_packages(lock_text))
     try:
         for line in lock_text.splitlines():
             m = _REQ.match(line)
@@ -441,7 +451,7 @@ def pin_lock_text(
                 out.append(line)
                 continue
             name, version = m.group(1), m.group(2)
-            if "+" not in version:
+            if "+" not in version or line.split("#", 1)[0].strip() in owned_by_the_os:
                 out.append(line)
                 continue
             base, local_label = version.split("+", 1)
@@ -609,7 +619,7 @@ def add_hashes(
     python_tag: str,
     platform_tags: tuple[str, ...],
     *,
-    client: httpx.Client,
+    client: httpx.Client | None = None,
 ) -> tuple[str, int, list[str]]:
     """Add a content fingerprint to every line of the lock text.
 
@@ -623,30 +633,66 @@ def add_hashes(
 
     **Lines already pinned to a download address are left alone** -- those addresses carry
     a fingerprint on the end already.
+
+    ``client`` is optional and one is opened here when it is missing, exactly as
+    ``pin_lock_text`` does. Requiring it looked harmless and was not: the CLI passes
+    none, ``artifact_hash`` swallows the resulting error as "not found", and every real
+    pack recorded zero fingerprints while blaming the packages for it.
     """
+    own = client is None
+    c = client if client is not None else httpx.Client(follow_redirects=True, timeout=FETCH_TIMEOUT)
     lines = lock_text.splitlines()
     out: list[str] = []
     missing: list[str] = []
     added = 0
-    for line in lines:
-        m = _REQ.match(line)
-        if not m:
-            out.append(line)
-            continue
-        name, version = m.group(1), m.group(2)
-        if "+" in version:
-            # packages with a local version live only on the vendor index; they take the
-            # pinned-URL route, and that address carries its own fingerprint
-            out.append(line)
-            continue
-        digest = artifact_hash(name, version, python_tag, platform_tags, client=client)
-        if digest is None:
-            missing.append(f"{name}=={version}")
-            out.append(line)
-            continue
-        out.append(f"{line} --hash=sha256:{digest}")
-        added += 1
+    try:
+        for line in lines:
+            m = _REQ.match(line)
+            if not m:
+                out.append(line)
+                continue
+            name, version = m.group(1), m.group(2)
+            if "+" in version:
+                # packages with a local version live only on the vendor index; they take
+                # the pinned-URL route, and that address carries its own fingerprint
+                out.append(line)
+                continue
+            digest = artifact_hash(name, version, python_tag, platform_tags, client=c)
+            if digest is None:
+                missing.append(f"{name}=={version}")
+                out.append(line)
+                continue
+            out.append(f"{line} --hash=sha256:{digest}")
+            added += 1
+    finally:
+        if own:
+            c.close()
     if missing:
         # all or nothing: hand back the original, not one character changed
         return lock_text, 0, missing
     return "\n".join(out) + "\n", added, []
+
+
+#: A requirement line, however it pins: ``name==version`` or ``name @ url``.
+_ANY_REQ = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:==|@)\s*\S")
+
+
+def unfingerprinted_packages(lock_text: str) -> list[str]:
+    """Names of the packages in this lock whose bytes nothing can check.
+
+    Two ways a line is covered: ``--hash=sha256:`` added at pack time, or a direct
+    download address carrying its own ``#sha256=``. Anything else is fetched by name
+    and version from whatever index is in use, and arrives unexamined -- which is the
+    fact a restore has to state before someone points it at another mirror.
+    """
+    out: list[str] = []
+    for line in lock_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", "-")):
+            continue
+        if "--hash=sha256:" in line or "#sha256=" in line:
+            continue
+        m = _ANY_REQ.match(line)
+        if m:
+            out.append(m.group(1))
+    return out

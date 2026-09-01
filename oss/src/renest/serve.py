@@ -56,6 +56,7 @@ __all__ = [
     "default_out_dir",
     "ensure_token",
     "read_token_file",
+    "is_loopback_host",
     "make_server",
     "make_handler",
     "add_arguments",
@@ -90,7 +91,7 @@ def _env_hints(body: dict) -> dict:
     arbitrary keyword arguments into the pack engine.
     """
     hints = {}
-    for key in ("comfyui_dir", "env_python"):
+    for key in ("comfyui_dir", "program_dir", "env_python"):
         value = body.get(key)
         if isinstance(value, str) and value:
             hints[key] = value
@@ -274,8 +275,32 @@ class ServeApp:
         self._pack_fn = pack_fn or _default_pack_fn
         self._restore_fn = restore_fn or _default_restore_fn
         self._creds_fn = creds_fn or resolve_credentials
+        #: What the last preview already read, kept for the pack behind the
+        #: button. One slot, keyed by target -- see :meth:`_read_record_for`.
+        self._read_record: tuple[str, Any] | None = None
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self._recover_jobs()
+
+    def _read_record_for(self, target: Any) -> Any:
+        """The record of "already hashed this file" shared by the confirm page's
+        preview and the pack that follows it.
+
+        The preview is a dry run and a dry run writes nothing to the user's
+        folder, so nothing on disk can carry those hashes over -- without this
+        the pack behind the button reads every weight a second time (measured
+        2026-08-30: 2.00x). Kept in memory only, and only for the target it was
+        built from: the record pins itself to one folder's file the first time it
+        is used, so handing it to a different target would save it in the wrong
+        place. An entry is still believed only while size, time and inode all
+        match, so a stale record costs a re-read, never a wrong fingerprint.
+        """
+        from .pack import HashCache
+
+        key = str(Path(str(target)).resolve())
+        with self._lock:
+            if self._read_record is None or self._read_record[0] != key:
+                self._read_record = (key, HashCache(None))
+            return self._read_record[1]
 
     # -- lifecycle ----------------------------------------------------------
     def ensure_token(self) -> str:
@@ -453,6 +478,7 @@ class ServeApp:
         with tempfile.TemporaryDirectory() as tmp:
             report = self._pack_fn(
                 target, spec, tmp, dry_run=True, no_fingerprint=True, workflow=workflow,
+                hash_cache=self._read_record_for(target),
                 **_env_hints(body),
             )
         if not getattr(report, "ok", False):
@@ -595,10 +621,14 @@ class ServeApp:
             no_fingerprint=bool(body.get("no_fingerprint", False)),
             workflow=workflow,
             emitter=emitter,
+            # Whatever the confirm page's preview already read, so this pack does
+            # not read the same weights all over again.
+            hash_cache=self._read_record_for(body["target"]),
             # The plugin runs inside the application process and reports the real
             # shape of the environment; the engine never guesses. comfyui_dir = the
-            # source tree (not the data dir on the desktop build); env_python = the
-            # running interpreter, read live when there is no lock file.
+            # folder holding the nodes and models; program_dir = ComfyUI's own program
+            # tree when the desktop build keeps it apart; env_python = the running
+            # interpreter, read live when there is no lock file.
             **_env_hints(body),
         )
 
@@ -794,6 +824,24 @@ def make_server(app: ServeApp, host: str = DEFAULT_HOST, port: int = DEFAULT_POR
     return ThreadingHTTPServer((host, port), make_handler(app))
 
 
+def is_loopback_host(host: str) -> bool:
+    """Whether binding to ``host`` keeps this service off the network.
+
+    [SECURITY-REVIEW] the only thing standing between these endpoints and the
+    internet is that they are not reachable from it. On a rented GPU pod a
+    routable bind hands strangers the pack/restore job API.
+    """
+    import ipaddress
+
+    # "" is not loopback: an empty bind address means every interface.
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 # --------------------------------------------------------------------------
 # CLI adapter
 # --------------------------------------------------------------------------
@@ -806,6 +854,15 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
+    host = getattr(args, "host", DEFAULT_HOST)
+    if not is_loopback_host(host):
+        print(
+            f"✗ renest serve will not listen on {host}. It answers pack and restore "
+            f"requests, so it stays on this machine only ({DEFAULT_HOST}). Drop the "
+            f"--host option and run: renest serve",
+            file=sys.stderr,
+        )
+        return int(ExitCode.USAGE)
     port = args.port
     if port is None:
         from .config import load_config
@@ -819,12 +876,19 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
     app.ensure_token()
     app.start()
     try:
-        server = make_server(app, args.host, port)
+        server = make_server(app, host, port)
     except OSError as e:
         print(f"✗ Cannot listen on port {port}: {e}. Pick another one with --port.", file=sys.stderr)
         app.stop()
         return int(ExitCode.USAGE)
-    print(f"renest serve is listening on http://{args.host}:{port}{API_PREFIX} (loopback only)", file=sys.stderr)
+    # Report the address actually bound, not the one asked for: with --port 0 the
+    # requested port is 0 and the real one is only known after the bind.
+    bound_host, bound_port = server.server_address[0], server.server_address[1]
+    print(
+        f"renest serve is listening on http://{bound_host}:{bound_port}{API_PREFIX} "
+        f"(loopback only)",
+        file=sys.stderr,
+    )
     print(
         f"Token file: {token_path} (0600). The plugin reads the same file, "
         f"or point it there with {ENV_TOKEN_FILE}.",

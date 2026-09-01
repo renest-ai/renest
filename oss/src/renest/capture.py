@@ -16,20 +16,25 @@ via subprocess ``git`` -- never imported, never vendored.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import hashlib
+import os
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from . import __version__
 from .integrity import dirty_gap, git_identity, probe_model_bytes, registry_identity
+from .syslibs import read_run_record, record_search_roots
 from .verified import scan_comfyui_output
 
 __all__ = [
     "api_forwarding_nodes",
+    "recorded_node_owners",
     "resolve_image_digest",
     "CAPTURE_VERSION",
     "CATEGORIES",
@@ -110,6 +115,7 @@ _FACTORY_CATEGORIES: dict[str, tuple[tuple[str, ...], str]] = {
     "controlnet":      (("models/controlnet",), "controlnet"),
     "upscale_model":   (("models/upscale_models",), "upscaler"),
     "style_model":     (("models/style_models",), "other"),
+    "embedding":       (("models/embeddings",), "embedding"),
     "input_asset":     (("input",), "input_asset"),
     # Read off the extension's own source, 2026-08-20: it registers this folder itself
     # (`os.path.join(folder_paths.models_dir, "ipadapter")`), so the weights live outside
@@ -162,6 +168,13 @@ _FACTORY_MODEL_REF_MAP: dict[str, list[tuple[str, str]]] = {
     "ImageOnlyCheckpointLoader": [("ckpt_name", "checkpoint")],
     "LoadImage":              [("image", "input_asset")],
     "LoadImageMask":          [("image", "input_asset")],
+    # Video and audio, added 2026-08-22. Field names read off a running ComfyUI's
+    # /object_info, not guessed. The VHS_*Path variants are deliberately absent:
+    # they carry an absolute path, not a name under input/, and that has its own
+    # path already. Across 14 real user workflows the video loaders appear 12 times.
+    "LoadVideo":              [("file", "input_asset")],
+    "LoadAudio":              [("audio", "input_asset")],
+    "VHS_LoadVideo":          [("video", "input_asset")],
     # Added after measuring again, 2026-08-14: upstream had grown to 35 loader
     # classes against our 17. These ten fit categories already in the table above.
     "CreateHookLora":         [("lora_name", "lora")],
@@ -217,8 +230,20 @@ MODEL_REF_MAP = _merge_vocab(_FACTORY_MODEL_REF_MAP, _vocab[1] if _vocab else No
 # candidate custom node, and if nothing under custom_nodes/ defines it either we say so
 # plainly instead of swallowing it. Erring short is deliberate: a missing built-in costs
 # one report line for a human to check, a wrong entry could hide a real dependency.
+
+#: Loaders in MODEL_REF_MAP that upstream does not ship. Recognising their model is
+#: right; calling them built-in is not -- that stops us looking for the pack that
+#: defines them, and the nest then misses a code dependency without saying a word.
+THIRD_PARTY_LOADERS: frozenset[str] = frozenset({
+    "IPAdapterModelLoader",
+    # Ships in ComfyUI-VideoHelperSuite, not upstream. Added to the loader table
+    # 2026-08-22 without landing here, so a workflow whose only VHS node was this
+    # one recorded no dependency on that pack and said nothing about it.
+    "VHS_LoadVideo",
+})
+
 BUILTIN_CLASSES: frozenset[str] = frozenset({
-    *MODEL_REF_MAP,
+    *(set(MODEL_REF_MAP) - THIRD_PARTY_LOADERS),
     # sampling / guidance
     "KSampler", "KSamplerAdvanced", "SamplerCustom", "BasicScheduler",
     # text / conditioning
@@ -237,13 +262,83 @@ BUILTIN_CLASSES: frozenset[str] = frozenset({
 
 COMFYUI_CORE_EXCLUDE = ["models", "output", "temp", "input", "user"]
 
+#: Folder names packing never puts in an archive. A copy of ``pack.ARCHIVE_JUNK``
+#: (importing it here would be a cycle -- pack imports this module); the two are
+#: pinned together by ``test_two_trees.test_never_archived_mirrors_pack``. Read
+#: here so the second-tree check below does not count a folder that would leave
+#: the archive empty anyway.
+_NEVER_ARCHIVED = frozenset({".git", "__pycache__", ".venv", "venv", "node_modules", ".renest"})
 
-def _sha256_file(path: Path) -> tuple[str, int]:
+
+def _data_tree_leftovers(comfyui_dir: Path, exclude: Iterable[str]) -> list[str]:
+    """Two-tree layout: what in the data tree nothing else in the spec carries.
+
+    Once ``host`` reads from the program tree, the data tree is covered by the
+    node folders (an entry each) and the models (``files[]`` each) -- and by
+    nothing else. Whatever is left over (``extra_model_paths.yaml``, node folders
+    this workflow never named) needs an entry of its own or it silently stops
+    travelling. Returns the top-level names that are left, so the caller can skip
+    emitting an entry whose archive would come out empty: an empty archive makes
+    a rebuild stop and blame a symlink that does not exist.
+    """
+    ex = {str(e).strip("/") for e in exclude}
+
+    def carried(rel: str) -> bool:
+        return any(rel == e or rel.startswith(e + "/") for e in ex)
+
+    left: list[str] = []
+    try:
+        top = sorted(comfyui_dir.iterdir())
+    except OSError:
+        return []
+    for p in top:
+        if p.name in _NEVER_ARCHIVED or p.name.endswith(".pyc") or carried(p.name):
+            continue
+        # `custom_nodes/` is the partly-carried case: some packs inside it have an
+        # entry of their own, the rest do not. Name the ones that do not, so the
+        # report says what actually travels here rather than "custom_nodes".
+        if p.is_dir() and any(e.startswith(p.name + "/") for e in ex):
+            try:
+                kids = sorted(p.iterdir())
+            except OSError:
+                continue
+            left += [f"{p.name}/{k.name}" for k in kids
+                     if k.name not in _NEVER_ARCHIVED and not carried(f"{p.name}/{k.name}")]
+            continue
+        left.append(p.name)
+    return left
+
+
+def _sha256_file(path: Path, cache: Any = None) -> tuple[str, int]:
+    # Same read window as pack: a file written while we hash it (ComfyUI still
+    # running, a download unfinished) yields a fingerprint that is void the moment
+    # we write it down, and the bill lands days later on the restore side as a byte
+    # check that reads like a broken transfer. Fail loudly here instead.
+    before = path.stat()
+    if cache is not None:
+        # The record pack keeps of what it has already hashed, handed in so one
+        # weight is read once per pack and not once here and again there. An
+        # unchanged size, time and inode also means nothing is writing to it, so
+        # the guard below loses nothing.
+        known = cache.lookup(path, before)
+        if known is not None:
+            return known, before.st_size
     h = hashlib.sha256()
     with path.open("rb") as f:
         while chunk := f.read(1 << 22):
             h.update(chunk)
-    return h.hexdigest(), path.stat().st_size
+    after = path.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise ValueError(
+            f"This file changed while we were reading it: {path} "
+            f"(size {before.st_size} → {after.st_size} bytes). Something is still "
+            "writing to it — most likely ComfyUI itself, or a download that hasn't "
+            "finished. Stop the application and pack again."
+        )
+    digest = h.hexdigest()
+    if cache is not None:
+        cache.remember(path, after, digest)
+    return digest, after.st_size
 
 
 # ----------------------------------------------------------------- parsing --
@@ -288,6 +383,17 @@ def _clean_asset_name(value: str) -> str:
     return value
 
 
+def _expand_path_vars(value: str) -> str:
+    """``~/shared`` and ``$MODELS/loras`` the way ComfyUI expands them when it reads
+    the same file.
+
+    Without this a ``~`` is treated as a folder name, so the path becomes
+    ``ComfyUI/~/shared``, which cannot exist -- the models kept out there are then
+    reported missing and never travel.
+    """
+    return os.path.expandvars(os.path.expanduser(value)) if value else value
+
+
 def _parse_extra_model_paths(comfyui_dir: Path) -> dict[str, list[Path]]:
     """Parse ComfyUI/extra_model_paths.yaml -> {category key: [existing
     absolute directories]}.
@@ -314,13 +420,13 @@ def _parse_extra_model_paths(comfyui_dir: Path) -> dict[str, list[Path]]:
     for cfg in (data.values() if isinstance(data, dict) else []):
         if not isinstance(cfg, dict):
             continue
-        base = str(cfg.get("base_path", "") or "")
+        base = _expand_path_vars(str(cfg.get("base_path", "") or ""))
         base_p = Path(base) if Path(base).is_absolute() else (comfyui_dir / base).resolve() if base else None
         for key, val in cfg.items():
             if key in ("base_path", "is_default") or not isinstance(val, str):
                 continue
             for line in val.splitlines():        # one line, or a | block list
-                sub = line.strip()
+                sub = _expand_path_vars(line.strip())
                 if not sub:
                     continue
                 d = Path(sub) if Path(sub).is_absolute() else (base_p / sub if base_p else comfyui_dir / sub)
@@ -366,6 +472,22 @@ def _locate(comfyui_dir: Path, relname: str, search_dirs: tuple[str, ...],
     return None, ""
 
 
+#: A textual inversion is named inside the prompt text, not by any loader input:
+#: ``embedding:badhands``, normally with the file suffix left off. No node class
+#: mentions it, so the loader table above can never see one.
+_EMBEDDING_REF = re.compile(r"(?<!\w)embedding:([\w\-./\\]+)")
+
+
+def _locate_embedding(comfyui_dir: Path, name: str) -> Path | None:
+    """The file behind ``embedding:<name>``, trying each weights suffix in turn."""
+    rel = Path(name.replace("\\", "/").rstrip("."))
+    if ".." in rel.parts or rel.is_absolute() or not rel.name:
+        return None
+    base = comfyui_dir / "models" / "embeddings"
+    cands = [base / rel, *(base / f"{rel.as_posix()}{s}" for s in _WEIGHT_SUFFIXES)]
+    return next((c for c in cands if c.is_file()), None)
+
+
 def _looks_like_comfyui_source(d: Path) -> bool:
     """Does this directory actually hold the ComfyUI **program itself**?
 
@@ -383,6 +505,20 @@ def _scan_custom_node_dirs(comfyui_dir: Path) -> list[Path]:
         return []
     return sorted(d for d in cn.iterdir()
                   if d.is_dir() and not d.name.startswith((".", "__")))
+
+
+def _scan_custom_node_files(comfyui_dir: Path) -> list[Path]:
+    """Loose ``.py`` files sitting directly in custom_nodes/.
+
+    ComfyUI loads those as nodes just like a folder, so a class defined in one is
+    installed here -- reporting it as "no folder defines it, add that folder by
+    hand" sends the reader looking for a folder that does not exist.
+    """
+    cn = comfyui_dir / "custom_nodes"
+    if not cn.is_dir():
+        return []
+    return sorted(p for p in cn.iterdir()
+                  if p.is_file() and p.suffix == ".py" and not p.name.startswith((".", "__")))
 
 
 def _file_defines_class(py: Path, cls: str) -> bool:
@@ -407,36 +543,225 @@ def _dir_defines_class(node_dir: Path, cls: str) -> bool:
     return any(_file_defines_class(py, cls) for py in node_dir.rglob("*.py"))
 
 
+#: A node name put together when the pack starts: the source says
+#: ``NAME = get_name('Image Inset Crop')`` and the suffix is appended at registration,
+#: so ``Image Inset Crop (rgthree)`` is in no file and matching the full name never
+#: hits -- the nest then records no dependency on that folder at all.
+_NAME_WITH_SUFFIX = re.compile(r"^(?P<base>.+?)\s*\((?P<tag>[^()]+)\)$")
+
+
+def _dirs_defining_a_suffixed_class(node_dirs: list[Path], cls: str) -> list[Path]:
+    """Locate ``Base (tag)`` by its base name, in folders whose own name carries the tag.
+
+    Both halves are read off the disk, so this stays a static parse and stays a
+    sighting rather than a guess.
+
+    **The folder condition is the whole defence, not a belt-and-braces.** Measured
+    across twelve node packs installed side by side, 5 of 24 suffixed names collide on
+    their base name alone: ``Context`` and ``Seed`` each appear in six different packs,
+    ``Image Resize`` in three. On the base name alone those five pick the wrong pack;
+    with the folder condition all five come out unique and right. Naming the wrong pack
+    is worse than naming none -- an unmatched node prints a line the user can act on, a
+    wrong one says nothing. A fixture with two or three packs will not show you this.
+    """
+    m = _NAME_WITH_SUFFIX.match(cls)
+    if not m:
+        return []
+    base, tag = m.group("base").strip(), m.group("tag").strip().lower()
+    if not base or not tag:
+        return []
+    return [d for d in node_dirs if tag in d.name.lower() and _dir_defines_class(d, base)]
+
+
+#: "The record has nothing to say about this node type" -- told apart from "the record
+#: says it is one of ComfyUI's own", which is ``None`` and is an answer.
+NOT_RECORDED = object()
+
+
+def recorded_node_owners(comfyui_dir: Path, node_dirs: list[Path],
+                         program_dir: Path | None = None) -> dict[str, Any]:
+    """Which pack each node type came from, as the run that worked reported it.
+
+    The panel writes this from inside the running app, so it names the folder ComfyUI
+    really loaded the class from. Searching folders for the class name as text cannot
+    do that: a pack that assembles its node names at start-up spells the name in no
+    file, and two packs using the same name are indistinguishable from outside.
+
+    It writes beside ComfyUI's own source, so on a two-tree install the record is in
+    ``program_dir`` and not under the data folder at all -- looking only there reads
+    exactly like "the run said nothing about this node".
+
+    **Only what this machine can still show is kept.** A record that travelled here
+    from another machine names folders that are not on this disk, so a name that
+    cannot be pointed at a folder here is dropped rather than believed. ``None`` as
+    the value means the record says it is one of ComfyUI's own nodes.
+    """
+    owners = None
+    for root in record_search_roots(program_dir or comfyui_dir, [comfyui_dir]):
+        cand = (read_run_record(root) or {}).get("node_owners")
+        if isinstance(cand, dict):
+            owners = cand
+            break
+    if not isinstance(owners, dict):
+        return {}
+    here = {d.name for d in node_dirs}
+    out: dict[str, Any] = {}
+    for cls, info in owners.items():
+        if not isinstance(cls, str) or not isinstance(info, dict):
+            continue
+        name = info.get("dir")
+        if isinstance(name, str) and name in here:
+            out[cls] = name
+        elif not name and info.get("builtin") is True:
+            out[cls] = None
+    return out
+
+
+def _record_dir_identity(hits: list[Path], cls: str, matched_dirs: dict[str, dict],
+                         dirs_without_git: list[str], gaps: list[str]) -> None:
+    """Establish where each matched folder came from, and say so when we cannot.
+
+    One copy on purpose: both routes into it -- the run record and the text search --
+    have to answer this the same way, and two copies drift.
+    """
+    for d in hits:
+        if d.name in matched_dirs or d.name in dirs_without_git:
+            continue
+        # Two ways to establish identity, git first: a commit pins the version too.
+        # Without git, fall back to the node's own pyproject.toml -- that is how
+        # registry-installed nodes look, and in real environments it is the common
+        # case, not the exception.
+        ident = git_identity(d)
+        if ident is None:
+            ident = registry_identity(d)
+            if ident is not None:
+                gaps.append(
+                    f"custom_nodes/{d.name} has no .git (nodes installed from the ComfyUI "
+                    f"Registry usually don't). We took its origin from its own "
+                    f"pyproject.toml instead: {ident['repo_url']} — no commit to pin, so "
+                    f"the nest carries its files byte-for-byte rather than a revision to "
+                    f"fetch again"
+                )
+        if ident is None:
+            dirs_without_git.append(d.name)
+            # The files of such a node still travel inside the ComfyUI archive and
+            # come back on restore; what is lost is its **identity**, so it cannot
+            # be listed, updated on its own, or swapped out later. Word it that way:
+            # the older "stays out of code_deps" wording read as "not in the nest at
+            # all" and pushed users into reinstalling by hand for nothing.
+            gaps.append(f"custom_nodes/{d.name} defines node type {cls}, but it has neither "
+                        f"a readable git remote/HEAD nor a pyproject.toml saying where it "
+                        f"came from. Its files still travel inside the ComfyUI archive and "
+                        f"come back byte-for-byte — what's missing is its identity: we "
+                        f"can't say which version it is or where it came from, so it can't "
+                        f"be listed or updated on its own")
+        else:
+            matched_dirs[d.name] = ident
+            # Hand-edited node code is not in the commit, so a rebuild that
+            # clones a clean copy would make those edits vanish silently.
+            dg = dirty_gap(f"custom_nodes/{d.name}", d)
+            if dg:
+                gaps.append(dg)
+
+
 #: Where the host app keeps the nodes that hand work to an outside service.
 _API_NODE_PKG = "comfy_api_nodes"
+
+#: Same three shapes as the parse below, for a file too new for this Python to parse.
+#: Anchored the same way, so prose still cannot match: a ``class`` in column zero,
+#: a ``node_id=`` argument, a quoted key inside the mapping block.
+_FALLBACK_CLASS = re.compile(r"^class[ \t]+([A-Za-z_]\w*)", re.M)
+_FALLBACK_NODE_ID = re.compile(r"""node_id[ \t]*=[ \t]*["']([^"'\n]+)["']""")
+_FALLBACK_MAP_KEY = re.compile(r"""["']([^"'\n]+)["'][ \t]*:""")
+_MAPPING_NAME = "NODE_CLASS_MAPPINGS"
+
+
+def _fallback_node_names(text: str, *, package_root: bool) -> set[str]:
+    """Structural shapes read off unparseable source, by anchored pattern."""
+    names = set(_FALLBACK_NODE_ID.findall(text))
+    if package_root:
+        names.update(_FALLBACK_CLASS.findall(text))
+    start = text.find(_MAPPING_NAME)
+    if start != -1:
+        opened = text.find("{", start)
+        closed = text.find("}", opened) if opened != -1 else -1
+        if opened != -1 and closed != -1:
+            names.update(_FALLBACK_MAP_KEY.findall(text[opened:closed]))
+    return names
+
+
+def _api_node_names(py: Path, *, package_root: bool) -> set[str]:
+    """The node names this file puts on offer, read from its structure, not its text.
+
+    Three shapes, every one of them a place a name can only be *declared*: the keys of
+    ``NODE_CLASS_MAPPINGS``, a ``node_id=`` argument (the schema API's registered id),
+    and -- only for the package's own node modules -- a ``class`` at the top level.
+
+    The last one is a net for a registration form we have not met, and it stops at the
+    package's own files on purpose. Measured against ComfyUI v0.34.2: its generated
+    request/response models under ``apis/`` add 1042 further class names, two of which
+    (``Image``, ``Video``) are ordinary node names that no cloud service is behind.
+    """
+    try:
+        if py.stat().st_size > (2 << 20):
+            return set()
+        text = py.read_text(errors="ignore")
+    except OSError:
+        return set()
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return _fallback_node_names(text, package_root=package_root)
+    names: set[str] = set()
+    if package_root:
+        names.update(n.name for n in tree.body if isinstance(n, ast.ClassDef))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict) and any(
+                isinstance(t, ast.Name) and t.id == _MAPPING_NAME for t in node.targets):
+            names.update(k.value for k in node.value.keys
+                         if isinstance(k, ast.Constant) and isinstance(k.value, str))
+        elif isinstance(node, ast.Call):
+            names.update(kw.value.value for kw in node.keywords
+                         if kw.arg == "node_id" and isinstance(kw.value, ast.Constant)
+                         and isinstance(kw.value.value, str))
+    return names
 
 
 def api_forwarding_nodes(comfyui_dir: Path, classes: Iterable[str]) -> list[dict]:
     """Which of these nodes hand the work to somebody else's servers.
 
     **Recognised from the code on this machine, never from a list of names we keep.**
-    The host app keeps its service-calling nodes in one package, so a class defined
-    there is one of them, and the file that defines it names the service. When that
+    The host app keeps its service-calling nodes in one package, so a node *declared*
+    there is one of them, and the file declaring it names the service. When that
     package is not present, the answer is silence — a guessed entry here would be worse
     than none, because this list is the format's honest boundary: the byte-for-byte
     promise does not cover anything that runs on someone else's servers.
+
+    **Declared, not mentioned.** Asking whether the name occurs in the text put every
+    nest through 2026-08 on record as calling out to a cloud service for ``LoadImage``,
+    which reads a file off the local disk: three lines of prose in ``nodes_bytedance.py``
+    say "1 = transparent, LoadImage convention", and a word match cannot tell a
+    tooltip from a declaration.
 
     **Known limit, stated rather than hidden**: a third-party node that forwards to a
     service is not caught by this — it lives in its own folder like any other."""
     pkg = Path(comfyui_dir) / _API_NODE_PKG
     if not pkg.is_dir():
         return []
-    sources = sorted(pkg.rglob("*.py"))
+    declared: dict[str, Path] = {}
+    for py in sorted(pkg.rglob("*.py")):
+        for name in _api_node_names(py, package_root=py.parent == pkg):
+            declared.setdefault(name, py)
     out: list[dict] = []
     for cls in sorted(set(classes)):
-        hit = next((py for py in sources if _file_defines_class(py, cls)), None)
+        hit = declared.get(cls)
         if hit is None:
             continue
         stem = hit.stem.removeprefix("nodes_")
         out.append({
             "node_name": cls,
             "service": stem if stem and stem != "nodes" else hit.parent.name,
-            "note": "Recognised because the app defines this node in its own "
+            "note": "Recognised because the app declares this node in its own "
                     "service-calling package; what it sends is not archived.",
         })
     return out
@@ -559,7 +884,9 @@ def _iso_utc_mtime(mtime: float) -> str:
 
 def capture(workflow: dict, comfyui_dir: Path,
             workflow_relpath: str | None = None,
-            large_file_bytes: int | None = None) -> CaptureResult:
+            large_file_bytes: int | None = None,
+            hash_cache: Any = None,
+            program_dir: Path | None = None) -> CaptureResult:
     """Static capture: a workflow (API-format dict) plus a ComfyUI directory ->
     a pack-spec draft and a report.
 
@@ -567,10 +894,24 @@ def capture(workflow: dict, comfyui_dir: Path,
     of ``comfyui_dir``), matching ``pack --root``. When ``large_file_bytes`` is
     omitted the module-level ``LARGE_FILE_BYTES`` is read at call time, which
     keeps it overridable from tests.
+
+    ``hash_cache`` is pack's record of what it has already hashed. Handing it in
+    is what stops a first pack reading every weight twice -- once to work out
+    what to pack, once to pack it.
+
+    ``program_dir`` is for an installation that keeps ComfyUI's program in a
+    different tree from its nodes and models (the ComfyUI desktop build). It
+    supplies ComfyUI's identity and files, ``comfyui_dir`` still supplies the
+    nodes and models, and the nest is an ordinary single-tree install. Left
+    out, everything below behaves exactly as before.
     """
     if large_file_bytes is None:
         large_file_bytes = LARGE_FILE_BYTES
     comfyui_dir = comfyui_dir.resolve()
+    if program_dir is not None:
+        program_dir = Path(program_dir).resolve()
+        if program_dir == comfyui_dir:
+            program_dir = None  # one tree after all; say nothing, change nothing
     prefix = comfyui_dir.name           # usually "ComfyUI"
     nodes = _normalize_workflow(workflow)
     gaps: list[str] = []
@@ -596,6 +937,16 @@ def capture(workflow: dict, comfyui_dir: Path,
             unknown_classes.setdefault(cls, []).append(node_id)
             for input_name, value in inputs.items():
                 if isinstance(value, str):
+                    # A table of node classes can never keep up with upstream, so this
+                    # second route needs no table: if the string names a file that is
+                    # really sitting in input/, list it as the user's own material.
+                    # That is not a guess about an unknown node -- we looked, and it
+                    # is there. Anything else stays reported-verbatim as before.
+                    if (comfyui_dir / "input" / _clean_asset_name(value)).is_file():
+                        refs.append({"node_id": node_id, "class_type": cls,
+                                     "input": input_name, "value": value,
+                                     "category": "input_asset"})
+                        continue
                     unrecognized_inputs.append(
                         {"node_id": node_id, "class_type": cls,
                          "input": input_name, "value": value})
@@ -630,7 +981,7 @@ def capture(workflow: dict, comfyui_dir: Path,
         if rel_to_root in seen_paths:
             continue                    # several nodes, one file: register once
         seen_paths.add(rel_to_root)
-        sha, size = _sha256_file(found)
+        sha, size = _sha256_file(found, hash_cache)
         entry = {**ref, "path": rel_to_root, "size_bytes": size,
                  "sha256": sha, "kind": kind}
         if note:
@@ -658,10 +1009,24 @@ def capture(workflow: dict, comfyui_dir: Path,
             continue
         found, note = _locate(comfyui_dir, u["value"], ("models",))
         if found is None:
-            gaps.append(
-                f"{u['class_type']}.{u['input']} = {u['value']} names a model file, but that "
-                f"node type isn't one we know and no such file is under {prefix}/models. "
-                f"Add it to the pack list by hand — without it the nest can't run this recipe")
+            # A full path from another machine is refused, and then saying "no such
+            # file is under models/" is false: it is usually sitting right there.
+            here = None
+            if "points outside the folder" in note:
+                here, _ = _locate(comfyui_dir, Path(u["value"].replace("\\", "/")).name,
+                                  ("models",))
+            if here is not None:
+                gaps.append(
+                    f"{u['class_type']}.{u['input']} names a full path from another machine: "
+                    f"{u['value']}. We do not follow paths out of the folder being packed, so "
+                    f"this model is **not in the nest** — but the file itself is right here, at "
+                    f"{prefix}/{here.relative_to(comfyui_dir).as_posix()}. Point that node at "
+                    f"the file by name and pack again")
+            else:
+                gaps.append(
+                    f"{u['class_type']}.{u['input']} = {u['value']} names a model file, but that "
+                    f"node type isn't one we know and no such file is under {prefix}/models. "
+                    f"Add it to the pack list by hand — without it the nest can't run this recipe")
             continue
         rel_to_root = f"{prefix}/{found.relative_to(comfyui_dir).as_posix()}"
         if rel_to_root in seen_paths:
@@ -669,7 +1034,7 @@ def capture(workflow: dict, comfyui_dir: Path,
         seen_paths.add(rel_to_root)
         parent = found.parent.relative_to(comfyui_dir).as_posix()
         kind = dir_kind.get(parent) or (found.parent.name if parent != "models" else "other")
-        sha, size = _sha256_file(found)
+        sha, size = _sha256_file(found, hash_cache)
         entry = {**u, "category": "inferred", "path": rel_to_root, "size_bytes": size,
                  "sha256": sha, "kind": kind, "inferred": True}
         if note:
@@ -684,7 +1049,55 @@ def capture(workflow: dict, comfyui_dir: Path,
             f"that node type isn't one we know — we went by the file name alone. Check it is "
             f"the right file, and that this node needs nothing else")
 
+    # ---- 2c. textual inversions written into the prompt text ----
+    # Nothing above can reach these: no loader input names them, so before this
+    # they left the nest without one line of output -- the rebuilt recipe reads
+    # the word as plain text and draws something else.
+    for node_id, node in sorted(nodes.items()):
+        _inputs = node.get("inputs", {}) if isinstance(node.get("inputs"), dict) else {}
+        for input_name, value in _inputs.items():
+            if not isinstance(value, str) or "embedding:" not in value:
+                continue
+            for name in _EMBEDDING_REF.findall(value):
+                found = _locate_embedding(comfyui_dir, name)
+                if found is None:
+                    gaps.append(
+                        f"The text in node {node_id} uses embedding:{name}, but no such file is "
+                        f"under {prefix}/models/embeddings. Without it the rebuilt recipe reads "
+                        f"that word as ordinary text and draws something else — put the "
+                        f"embedding back before you pack")
+                    continue
+                rel_to_root = f"{prefix}/{found.relative_to(comfyui_dir).as_posix()}"
+                if rel_to_root in seen_paths:
+                    continue
+                seen_paths.add(rel_to_root)
+                sha, size = _sha256_file(found, hash_cache)
+                entry = {"node_id": node_id, "class_type": node["class_type"],
+                         "input": input_name, "value": name, "category": "embedding",
+                         "path": rel_to_root, "size_bytes": size, "sha256": sha,
+                         "kind": "embedding"}
+                bad = probe_model_bytes(found, size)
+                if bad:
+                    entry["integrity_warning"] = bad
+                    gaps.append(f"Doesn't look like a complete file: {bad}")
+                recognized.append(entry)
+
     for m in missing:
+        # ComfyUI's picker writes the folder it read from into the value itself
+        # ("photo.png [output]"). Finished pictures and scratch files are kept out
+        # of a nest deliberately, so "put the file back" is the wrong instruction:
+        # nothing is missing, it is simply somewhere we never pack from.
+        _raw = str(m["value"])
+        _ann = _raw.rsplit(" [", 1)[1][:-1] if _raw.endswith("]") and " [" in _raw else ""
+        _base = _clean_asset_name(_raw)
+        if _ann in ("output", "temp") and (comfyui_dir / _ann / _base).is_file():
+            gaps.append(
+                f"{m['class_type']}.{m['input']} = {_raw} reads a picture out of "
+                f"{prefix}/{_ann}/, not {prefix}/input/. Finished pictures and scratch files "
+                f"never travel with a nest, so this one won't either and the recipe won't run "
+                f"as it stands. Copy {_base} into {prefix}/input/, point the node at it there, "
+                f"and pack again")
+            continue
         # **"Missing" is the wrong word when the workflow named a full path.** The file
         # is usually sitting in the standard folder under that same name; what we refused
         # to follow is a path from the machine the workflow was built on. Telling someone
@@ -733,17 +1146,66 @@ def capture(workflow: dict, comfyui_dir: Path,
     # ---- 3. custom_nodes: match non-built-in classes statically, then read
     #         url + commit through a git subprocess ----
     node_dirs = _scan_custom_node_dirs(comfyui_dir)
+    node_files = _scan_custom_node_files(comfyui_dir)
     class_match: dict[str, dict] = {}   # class -> match result
     matched_dirs: dict[str, dict] = {}  # dir name -> git identity (into code_deps)
     dirs_without_git: list[str] = []
+    by_suffix: dict[str, list[str]] = {}  # dir name -> classes matched the second way
+    # What the run that worked said about where each node came from. It beats every
+    # route below it -- those read files from outside and infer, this one was written
+    # by the app that had the class loaded.
+    recorded = recorded_node_owners(comfyui_dir, node_dirs, program_dir)
     for cls, node_ids in sorted(unknown_classes.items()):
+        owner = recorded.get(cls, NOT_RECORDED)
+        if owner is None:
+            class_match[cls] = {"status": "matched", "node_ids": node_ids, "dirs": [],
+                                "source": "run_record_builtin"}
+            gaps.append(
+                f"Node type {cls} isn't in our list of ComfyUI's own nodes, but your "
+                f"working run reported it as one of them — so nothing extra has to be "
+                f"packed for it. Our list is behind ComfyUI, that is all")
+            continue
+        if isinstance(owner, str):
+            hits = [d for d in node_dirs if d.name == owner]
+            class_match[cls] = {"status": "matched", "node_ids": node_ids,
+                                "dirs": [owner], "source": "run_record"}
+            _record_dir_identity(hits, cls, matched_dirs, dirs_without_git, gaps)
+            continue
         hits = [d for d in node_dirs if _dir_defines_class(d, cls)]
+        # Only when the full name found nothing, so a folder that really does spell the
+        # name out always wins over one matched through its suffix.
         if not hits:
+            hits = _dirs_defining_a_suffixed_class(node_dirs, cls)
+            for d in hits:
+                by_suffix.setdefault(d.name, []).append(cls)
+        if not hits:
+            solo = [f for f in node_files if _file_defines_class(f, cls)]
+            if solo:
+                class_match[cls] = {"status": "matched", "node_ids": node_ids, "dirs": [],
+                                    "files": [f.name for f in solo]}
+                gaps.append(
+                    f"Node type {cls} comes from custom_nodes/{solo[0].name}, a single file "
+                    f"rather than a folder. Its bytes travel inside the {prefix} archive and "
+                    f"come back as they are; what we can't record is where it came from or "
+                    f"which version it is, because one loose file carries no git history")
+                continue
             class_match[cls] = {"status": "unmatched", "node_ids": node_ids}
-            gaps.append(f"Node type {cls} isn't one of the built-ins and no folder in "
-                        f"custom_nodes/ defines it — we can't tell where it comes from. Either "
-                        f"our built-in list doesn't cover it, or that node pack really is "
-                        f"missing here")
+            # Name the three things this can mean and how to tell them apart. Saying
+            # only "we cannot say where it comes from" leaves the reader with no next
+            # move, and leaning on "probably a built-in we have not listed" points at
+            # the harmless reading while the expensive one -- an installed pack we
+            # failed to recognise, whose absence shows up only on rebuild -- reads the
+            # same from here. Checking in a running ComfyUI is advice to the reader,
+            # not something this module does: the static-parse rule at the top governs
+            # what capture touches, not what its report may suggest you go and look at.
+            gaps.append(f"Node type {cls} is not in our list of ComfyUI built-ins, and no "
+                        f"folder under custom_nodes/ defines it either. Either it is a "
+                        f"built-in we have not listed, or it comes from a node pack — and "
+                        f"if that pack is installed here, this nest will not record it, "
+                        f"which is the reading that costs you a rebuild. To settle it: "
+                        f"install the Renest panel in ComfyUI, run this workflow once and "
+                        f"capture again — a finished run reports which pack every node came "
+                        f"from, and that answer beats anything we can read from outside")
             continue
         if len(hits) > 1:
             gaps.append(f"Node type {cls} shows up in more than one custom_nodes folder "
@@ -751,49 +1213,25 @@ def capture(workflow: dict, comfyui_dir: Path,
                         f"which one it really comes from")
         class_match[cls] = {"status": "matched", "node_ids": node_ids,
                             "dirs": [d.name for d in hits]}
-        for d in hits:
-            if d.name in matched_dirs or d.name in dirs_without_git:
-                continue
-            # Two ways to establish identity, git first: a commit pins the version too.
-            # Without git, fall back to the node's own pyproject.toml -- that is how
-            # registry-installed nodes look, and in real environments it is the common
-            # case, not the exception.
-            ident = git_identity(d)
-            if ident is None:
-                ident = registry_identity(d)
-                if ident is not None:
-                    gaps.append(
-                        f"custom_nodes/{d.name} has no .git (nodes installed from the ComfyUI "
-                        f"Registry usually don't). We took its origin from its own "
-                        f"pyproject.toml instead: {ident['repo_url']} — no commit to pin, so "
-                        f"the nest carries its files byte-for-byte rather than a revision to "
-                        f"fetch again"
-                    )
-            if ident is None:
-                dirs_without_git.append(d.name)
-                # The files of such a node still travel inside the ComfyUI archive and
-                # come back on restore; what is lost is its **identity**, so it cannot
-                # be listed, updated on its own, or swapped out later. Word it that way:
-                # the older "stays out of code_deps" wording read as "not in the nest at
-                # all" and pushed users into reinstalling by hand for nothing.
-                gaps.append(f"custom_nodes/{d.name} defines node type {cls}, but it has neither "
-                            f"a readable git remote/HEAD nor a pyproject.toml saying where it "
-                            f"came from. Its files still travel inside the ComfyUI archive and "
-                            f"come back byte-for-byte — what's missing is its identity: we "
-                            f"can't say which version it is or where it came from, so it can't "
-                            f"be listed or updated on its own")
-            else:
-                matched_dirs[d.name] = ident
-                # Hand-edited node code is not in the commit, so a rebuild that
-                # clones a clean copy would make those edits vanish silently.
-                dg = dirty_gap(f"custom_nodes/{d.name}", d)
-                if dg:
-                    gaps.append(dg)
+        _record_dir_identity(hits, cls, matched_dirs, dirs_without_git, gaps)
+    # One line per folder rather than per node type: a pack of this shape brings dozens
+    # of node types at once, and a line each would bury everything else in the report.
+    for _dirname, _classes in sorted(by_suffix.items()):
+        _shown = ", ".join(sorted(_classes)[:3]) + ("…" if len(_classes) > 3 else "")
+        gaps.append(f"Matched {len(_classes)} node type(s) to custom_nodes/{_dirname} through "
+                    f"the suffix in their names rather than the names themselves ({_shown}). "
+                    f"That pack puts its node names together when it starts, so the full name "
+                    f"is in none of its files. It is recorded as the source and its files "
+                    f"travel with the nest; worth a glance if it isn't the right pack")
     referenced = {n for m in class_match.values() for n in m.get("dirs", [])}
     dirs_not_referenced = [d.name for d in node_dirs if d.name not in referenced]
 
     # ---- 4. git identity of ComfyUI itself ----
-    core = git_identity(comfyui_dir)
+    # Whichever tree holds the program is the one that answers "which ComfyUI is
+    # this". On a one-tree install that is the same directory as the nodes and
+    # models; on the desktop build it is the separate program tree.
+    core_dir = program_dir or comfyui_dir
+    core = git_identity(core_dir)
     if core is None:
         core = {"repo_url": "<fill in the ComfyUI repo, e.g. https://github.com/comfyanonymous/ComfyUI>",
                 "commit": "<fill in the full 40 characters from git -C ComfyUI rev-parse HEAD>"}
@@ -801,30 +1239,76 @@ def capture(workflow: dict, comfyui_dir: Path,
         # directory at all (the desktop app hands us its data directory only), versus
         # it is here but has no git history. A hint pointing the wrong way costs more
         # than no hint -- the first case means the nest has no ComfyUI in it.
-        if not _looks_like_comfyui_source(comfyui_dir):
-            gaps.append(
-                f"There's no ComfyUI program in {comfyui_dir} — no main.py, no comfy/ folder. "
-                f"This is what the ComfyUI desktop app looks like: it hands us its **data** "
-                f"folder (custom nodes, models, workflows) while the program itself lives "
-                f"somewhere else. This nest will carry your nodes, models and workflow, but "
-                f"NOT ComfyUI itself — whoever rebuilds it has to install ComfyUI first. "
-                f"Packing both trees as one environment is not supported yet"
-            )
+        if not _looks_like_comfyui_source(core_dir):
+            if program_dir is None:
+                gaps.append(
+                    f"There's no ComfyUI program in {comfyui_dir} — no main.py, no comfy/ folder. "
+                    f"This is what the ComfyUI desktop app looks like: it hands us its **data** "
+                    f"folder (custom nodes, models, workflows) while the program itself lives "
+                    f"somewhere else. This nest will carry your nodes, models and workflow, but "
+                    f"NOT ComfyUI itself — whoever rebuilds it has to install ComfyUI first. "
+                    f"Packing both trees as one environment is not supported yet"
+                )
+            else:
+                # Told, not refused: the rest of the environment still packs, and the
+                # one thing this costs is exactly the thing the program tree was for.
+                gaps.append(
+                    f"There's no ComfyUI program in {program_dir} — no main.py, no comfy/ "
+                    f"folder — and that is the folder named as where the program lives. "
+                    f"This nest will carry your nodes, models and workflow, but NOT ComfyUI "
+                    f"itself. Check that path and pack again"
+                )
         else:
-            gaps.append(f"Can't read git remote/HEAD in {prefix}/ — fill in where ComfyUI itself "
+            where = str(program_dir) if program_dir is not None else f"{prefix}/"
+            gaps.append(f"Can't read git remote/HEAD in {where} — fill in where ComfyUI itself "
                         f"came from by hand")
     else:
-        core_dirty = dirty_gap(f"{prefix}/ (ComfyUI itself)", comfyui_dir)
+        core_dirty = dirty_gap(f"{prefix}/ (ComfyUI itself)", core_dir)
         if core_dirty:
             gaps.append(core_dirty)
+    if program_dir is not None and _looks_like_comfyui_source(comfyui_dir):
+        # Both folders hold a program, so the version this nest records comes from one
+        # of them and the bytes that land last come from the other -- a manifest whose
+        # recorded version and packed files disagree. Said, never guessed at.
+        gaps.append(
+            f"Two ComfyUI programs here: the version this nest records is the one in "
+            f"{program_dir}, but {comfyui_dir} has a main.py and a comfy/ folder too and "
+            f"its files are packed on top. The recorded version would then not match the "
+            f"files. Point --program-dir at the folder your nodes and models actually run "
+            f"against, or pack that folder on its own"
+        )
 
-    # ---- 5. assemble the pack-spec draft (shaped like pack's input; hash and
-    #         size are never filled in by hand) ----
+    # ---- 5. assemble the pack-spec draft (shaped like pack's input; the measured
+    #         hash travels only as a cross-check, never as the packer's source) ----
     # role (required from format v2.0 on): capture already knows which is which, so
     # emitting it here saves every consumer from inferring it back out of the path.
     core_exclude = COMFYUI_CORE_EXCLUDE + [f"custom_nodes/{n}" for n in sorted(matched_dirs)]
-    code_deps = [{"name": prefix, "role": "host", **core, "install_path": prefix,
-                  "exclude": core_exclude}]
+    host: dict = {"name": prefix, "role": "host", **core, "install_path": prefix}
+    if program_dir is not None:
+        # pack-spec 1.3: read the program's bytes over there, still land them at the
+        # standard-layout spot. install_path is untouched, so the nest is an ordinary
+        # single-tree install however scattered the machine it was packed from.
+        host["source_path"] = str(program_dir)
+    host["exclude"] = core_exclude
+    code_deps = [host]
+    if program_dir is not None:
+        # The data tree used to ride inside the host archive; now that host reads the
+        # program tree, everything in it that is not a node folder and not a model has
+        # nobody to carry it. Give it an entry of its own, landing at the same standard
+        # spot -- both archives unpack into it, and neither restore leg clears the
+        # directory first. Skipped when nothing is left, because an empty archive makes
+        # the rebuild stop and blame a symlink that does not exist.
+        leftovers = _data_tree_leftovers(comfyui_dir, core_exclude)
+        if leftovers:
+            code_deps.append({"name": f"{prefix}-data", "role": "user_code",
+                              "install_path": prefix, "source_path": str(comfyui_dir),
+                              "exclude": core_exclude})
+            shown = ", ".join(leftovers[:5]) + ("…" if len(leftovers) > 5 else "")
+            gaps.append(f"ComfyUI's program and your nodes and models live in two separate "
+                        f"folders here, and the nest merges them into one standard install. "
+                        f"{len(leftovers)} item(s) that sit beside your nodes and models "
+                        f"travel too ({shown}); everything under models/, output/, temp/, "
+                        f"input/ and user/ is left out as usual")
     for name in sorted(matched_dirs):
         code_deps.append({"name": name, "role": "extension", **matched_dirs[name],
                           "install_path": f"{prefix}/custom_nodes/{name}"})
@@ -839,10 +1323,21 @@ def capture(workflow: dict, comfyui_dir: Path,
             lic = {"shareable": False, "serving_scope": "gated", "tag": "unknown",
                    "note": "We couldn't confirm the license, so it defaults to gated "
                            "(restricted). Check the license and add origin_url before you pack."}
-            gaps.append(f"{r['path']}: license unknown (defaulting to gated) and no origin_url. "
-                        f"Gated files don't travel with the nest — whoever restores it fetches "
-                        f"them from origin_url, so add one before you pack.")
-        files.append({"path": r["path"], "license": lic, "kind": r["kind"]})
+            # The bytes ARE packed -- restricted only stops them being supplied to
+            # somebody you hand the nest to (pack.py says the same thing in the same
+            # words). Reading this as "not in the nest" sends people re-downloading
+            # models they already have.
+            gaps.append(f"{r['path']}: license unknown, so it's restricted by default and has "
+                        f"no origin_url. The bytes are in the nest and your own rebuilds work; "
+                        f"what they won't do is travel to anyone you hand this nest to, and "
+                        f"without an origin_url that person has nowhere to fetch it from. Add "
+                        f"the licence and origin_url before you pack.")
+        # Hand the hash we just measured to the packer as `expected_sha256`. It is a
+        # cross-check, not a source — packing hashes the file again and refuses to
+        # continue if it has changed since capture. The hash that reaches the nest is
+        # always the one packing measured, so no hash is ever "filled in by hand".
+        files.append({"path": r["path"], "license": lic, "kind": r["kind"],
+                      "expected_sha256": r["sha256"]})
 
     if workflow_relpath is None:
         workflow_relpath = "<fill in the path to the workflow JSON you ran, relative to the environment root>"
@@ -898,7 +1393,11 @@ def capture(workflow: dict, comfyui_dir: Path,
     # honest boundary: whatever runs over there is not in the nest and will keep
     # working only as long as that service does. Defined and never written until now,
     # which is the worst of both — it read as "we checked, there are none".
-    _api = api_forwarding_nodes(comfyui_dir, [n["class_type"] for n in nodes.values()])
+    # Read from the tree that holds the program: `comfy_api_nodes/` is ComfyUI's own
+    # package, so on a two-tree install it is not under the data folder at all, and
+    # looking there finds nothing -- which reads exactly like "we checked, there are
+    # none", the very failure the paragraph above was written for.
+    _api = api_forwarding_nodes(core_dir, [n["class_type"] for n in nodes.values()])
     if _api:
         pack_spec["api_deps"] = _api
         gaps.append(

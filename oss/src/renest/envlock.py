@@ -74,22 +74,46 @@ LOCK_FROM_ENV_HEADER = (
 
 #: The probe handed to that interpreter to execute. Stdlib only: installs
 #: nothing, touches no network.
-_FREEZE_SNIPPET = (
-    "import importlib.metadata as m;"
-    "seen=sorted({(d.metadata['Name'] or '').strip(): d.version "
-    "for d in m.distributions() if d.metadata['Name']}.items(), "
-    "key=lambda kv: kv[0].lower());"
-    "print('\\n'.join(f'{n}=={v}' for n, v in seen if v))"
-)
+#: Last-resort freeze, stdlib only. **Reads ``direct_url.json`` as well as the
+#: version**: a package installed from git carries no useful version (`SAM-2==1.0`
+#: is not on any index -- installing from that line fails), and the address plus
+#: commit that would reinstall it is sitting right there in the metadata. pip and uv
+#: both emit the address; this route used to drop it and say nothing.
+_FREEZE_SNIPPET = """
+import importlib.metadata as m, json
+lines = {}
+for d in m.distributions():
+    name = (d.metadata['Name'] or '').strip()
+    if not name or not d.version:
+        continue
+    pin = name + '==' + d.version
+    try:
+        info = json.loads(d.read_text('direct_url.json') or '')
+        vcs = info.get('vcs_info') or {}
+        if vcs.get('vcs') and vcs.get('commit_id') and info.get('url'):
+            pin = name + ' @ ' + vcs['vcs'] + '+' + info['url'] + '@' + vcs['commit_id']
+    except Exception:
+        pass
+    lines[name] = pin
+print(chr(10).join(v for _, v in sorted(lines.items(), key=lambda kv: kv[0].lower())))
+"""
 
 
 def distro_owned_packages(lock_text: str) -> list[str]:
     """Lines in a lock that only the operating system's own Python could have.
 
     Two tells, either is enough: a distro local version (``2.4.0+ubuntu4``), or a name
-    no index carries. Kept separate from vendor builds like ``torch==2.4.1+cu124``,
+    on the list above. Kept separate from vendor builds like ``torch==2.4.1+cu124``,
     which a wheel URL does fix — these cannot be fixed at all, only avoided by building
     the environment in a venv before packing.
+
+    **What it does not do**, stated because the wording here used to claim it did:
+    it never asks an index whether a name exists. A package installed straight from a
+    repository is not on the list and has no distro version, so it is **not** reported
+    here even though nothing could install it from a bare ``name==version`` line —
+    that case is handled where the lock is written, by keeping the address and the
+    commit (see ``_FREEZE_SNIPPET``), not by trying to spot it afterwards.
+    Asking an index would mean a network call from a step that must work offline.
     """
     hits: list[str] = []
     for raw in lock_text.splitlines():
@@ -187,17 +211,40 @@ def _uv_freeze(python_exe: str | Path) -> str | None:
     return out.stdout.strip()
 
 
+def _pip_freeze(python_exe: str | Path) -> str | None:
+    """``pip freeze`` from that interpreter, or None when pip is not there.
+
+    ``--disable-pip-version-check`` keeps pip's own upgrade notice out of the lock.
+    """
+    try:
+        out = subprocess.run(
+            [str(python_exe), "-m", "pip", "freeze", "--disable-pip-version-check"],
+            capture_output=True, text=True, timeout=180, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else None
+
+
 def freeze_environment(python_exe: str | Path) -> str | None:
     """Ask the interpreter which packages it has and at which versions. Returns
     ``None`` when it cannot be read — we report that honestly rather than invent a
     list.
 
-    Two routes, and **the order matters**: uv first, because it understands
-    editable installs; the stdlib-only route second, so machines without uv can
-    still be captured, at the cost of not being able to express an editable
-    install.
+    Three routes, and **the order matters**: uv first, because it understands
+    editable installs; **then pip**, which every ordinary environment has; the
+    stdlib-only route last, so a machine with neither can still be captured, at the
+    cost of not being able to express an editable install.
+
+    **pip earns its place in the middle**: without it a machine that has no uv fell
+    straight through to the last route, and a package installed from a repository
+    came out as a bare ``name==version`` that no index carries -- a lock that cannot
+    be installed, with nothing in the nest saying so.
     """
     body = _uv_freeze(python_exe)
+    if body:
+        return LOCK_FROM_ENV_HEADER + body + "\n"
+    body = _pip_freeze(python_exe)
     if body:
         return LOCK_FROM_ENV_HEADER + body + "\n"
     try:

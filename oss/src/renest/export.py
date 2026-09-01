@@ -27,8 +27,14 @@ import httpx
 
 from .byos import S3Uploader
 from .config import ConfigError, CredentialSource, resolve_credentials, resolve_token
-from .download import BlobSpec, SourcesExhausted, resolve, sources_from_urls
-from .errors import ExitCode, NestFailure
+from .download import (
+    BlobSpec,
+    SourcesExhausted,
+    classify_source_failures,
+    resolve,
+    sources_from_urls,
+)
+from .errors import ExitCode, NestFailure, exit_code_for
 from .events import EventEmitter
 from .hosted import DEFAULT_ORIGIN, _error_message, manifest_blobs
 from .pack import PackError
@@ -332,8 +338,13 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:  # no
             try:
                 resolve(spec, dest, client)
             except SourcesExhausted as e:
-                print(f"✗ Could not download {sha[:12]}…: {e}", file=sys.stderr)
-                return int(ExitCode.S1_NETWORK_INTERRUPTED)
+                # Say which kind of failure this is. Filing everything under the
+                # network class told the user to check a network that was fine, and
+                # marked a missing object retryable in the exit-code table.
+                class_name, why = classify_source_failures(e.attribution)
+                print(f"✗ Could not download {sha[:12]}…: {why}", file=sys.stderr)
+                print(f"  {e}", file=sys.stderr)
+                return int(exit_code_for("S1", class_name))
             fetched += 1
 
         manifest_path = _write_manifest(out, nest_id, manifest, grant.manifest_sha256 or "")

@@ -1,7 +1,7 @@
 {
   "schema": "ai.renest.rules.doctor",
   "schema_version": "1",
-  "updated": "2026-08-10",
+  "updated": "2026-08-22",
   "provenance": "Factory baseline. The driver lower bounds come from the vendor's official release notes (checked 2026-08-08); every other rule came out of a real run, with its source in the entry's own note.",
   "cuda_driver_floors": {
     "cu124": {
@@ -40,15 +40,24 @@
     "note": "Measured on a real run: the restore was byte-for-byte identical, yet importing a numerical library raised an illegal-instruction fault -- the host CPU was older and lacked the instruction set the wheel was built for."
   },
   "egress": {
-    "reject_below_mbps": 20.0,
+    "reject_below_mbps": 2.0,
     "warn_below_mbps": 100.0,
     "probe_url": "https://github.com/peak/s5cmd/releases/download/v2.2.2/s5cmd_2.2.2_Linux-64bit.tar.gz",
-    "note": "Measured on a real run: a machine being alive is not the same as a machine being usable -- egress to the code host was slow enough that cloning timed out. Threshold matched to the harness's fast-failure limit."
+    "note": "Floor lowered 20.0 -> 2.0 on 2026-09-01: a slow link costs time, not fidelity, so speed is reported with an estimate instead of refusing. Only links that cannot finish are still refused. Measured on a real run: a machine being alive is not the same as a machine being usable -- egress to the code host was slow enough that cloning timed out. Threshold matched to the harness's fast-failure limit."
   },
   "cuda_family_consistency": {
     "package_pattern": "^nvidia-",
     "level": "warn",
     "note": "Measured on a real run: PyTorch was pinned to a CUDA 12.4 build, while an editable install with extras resolved a companion audio package to a CUDA 13 build from the default index -- two CUDA lines in one environment, ending in a missing runtime library. Pinning PyTorch alone is not enough; every CUDA-bound package in the family has to stay on the same line."
+  },
+  "silent_torch_floors": {
+    "note": "Packages that need a minimum torch version and declare no requirement for it. Because nothing is declared, the resolver reports no conflict, the install finishes clean, and the failure only arrives at import -- in a message about a type annotation that never mentions torch. Measured 2026-08-16 on a rented machine: an environment installed from the CUDA 12.4 wheel index tops out at torch 2.6.0, ComfyUI's own requirements pull the newest of these packages, and starting it raised `infer_schema(func): Parameter kernel_size has unsupported type list[int]` out of `torch.library.custom_op`. Pinning the application's own commit does not help -- the floor sits in a dependency it resolves fresh every time. Kept as data because these floors move whenever upstream moves; what to do about a hit stays in code.",
+    "packages": {
+      "comfy-kitchen": {
+        "min_torch": "2.8",
+        "note": "Measured 2026-08-16: torch 2.4.1 and torch 2.6.0 both fail at import, torch 2.11.0 starts. Stated for the package rather than per release, because the runs that produced this all used the release current on that date."
+      }
+    }
   },
   "lock_cuda_vs_driver": {
     "level": "reject",

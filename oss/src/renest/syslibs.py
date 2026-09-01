@@ -19,27 +19,38 @@ from __future__ import annotations
 import base64
 import csv
 import hashlib
+import json
 import os
 import re
 import struct
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 from .envlock import canonical_name, installed_dist_infos
 
 __all__ = [
     "CONTESTED_MODULES",
+    "LAYER_INTERPRETER",
+    "LAYER_MACHINE",
+    "LAYER_NEST",
     "collect_native_libs",
+    "collect_native_libs_with_layers",
+    "record_search_roots",
     "contested_module_missing_libs",
     "contested_winners",
     "elf_needed",
     "elf_runpaths",
     "elf_soname",
     "interpreter_site_packages",
+    "library_layer",
     "lock_requirement_for",
     "lock_requirements",
     "looks_like_the_working_run",
+    "machine_libs_checkable",
     "missing_native_libs",
+    "split_by_layer",
+    "this_platform_tag",
 ]
 
 _DT_NULL, _DT_NEEDED, _DT_STRTAB, _DT_STRSZ, _DT_SONAME = 0, 1, 5, 10, 14
@@ -68,6 +79,60 @@ _EXT_MODULE = re.compile(r"\.(cpython|pypy)-\d+[^/]*\.so$")
 #: The dynamic loader itself. It is what *runs* the program, not something the program
 #: depends on, and it is present by definition wherever anything runs at all.
 _LOADER = re.compile(r"^ld(-linux[^/]*|64|)\.so(\.\d+)?$")
+
+
+#: Prefixes that belong to the machine's distribution rather than to one interpreter.
+#: A Python rooted at one of these **is** the distribution's, so its libraries are the
+#: machine's and stay on the list. `/usr/local` falls under `/usr` on purpose: the
+#: restore side looks for libraries in `/usr/local/lib` too, so a name found there is
+#: answerable and dropping it would lose a true warning.
+_DISTRO_PREFIXES = (Path("/usr"),)
+
+#: Where a library was loaded from, as three kinds that a rebuild treats differently.
+LAYER_NEST = "nest"                # travels inside the nest; never a machine requirement
+LAYER_INTERPRETER = "interpreter"  # the packing interpreter's own; see library_layer
+LAYER_MACHINE = "machine"          # the machine must provide it, or a rebuild is short
+
+
+def library_layer(path: str | os.PathLike[str], nest_roots: Sequence[Path],
+                  interpreter_prefix: Path | None) -> str:
+    """Which of the three kinds this loaded file is, **decided by where it sits**.
+
+    ``interpreter`` is the one that had no name before, and it is why this function
+    exists. Measured 2026-08-30 in a `continuumio/miniconda3` container running the
+    shipping collector against a live conda interpreter: of 13 libraries the run
+    loaded, **8 came out of `/opt/conda/lib`** -- the interpreter's own copies of
+    ssl, sqlite, lzma, ffi, bz2, uuid, z and crypto -- and 5 out of the
+    distribution. A rebuild never uses that interpreter: restore creates the
+    environment with ``uv venv --python <version>``, which brings its own. So a
+    machine without those 8 is short of nothing, and saying it is short is a false
+    alarm on a machine that would have worked.
+
+    It is also the difference the old rule could not express. The base interpreter
+    counted as the nest's only when it sat **inside the pack root**, so packing a
+    conda environment directly hid conda's libraries while packing a `venv` built on
+    top of that same conda reported every one of them -- same run, same files, two
+    different answers depending on whether a `venv` sat in between.
+    """
+    p = Path(path)
+    if _under(p, list(nest_roots)):
+        return LAYER_NEST
+    if interpreter_prefix is not None and _under(p, [interpreter_prefix]):
+        return LAYER_INTERPRETER
+    return LAYER_MACHINE
+
+
+def _own_interpreter_prefix(home: Path | None, nest_roots: Sequence[Path]) -> Path | None:
+    """The base interpreter's own prefix, when it is a place of its own.
+
+    None when there is no such place: the interpreter lives inside the nest (its
+    libraries already travel along), or it is the distribution's at ``/usr`` (its
+    libraries really are the machine's, and dropping them would hide real gaps)."""
+    if home is None or _under(home, list(nest_roots)):
+        return None
+    if any(home == d or _under(home, [d]) for d in _DISTRO_PREFIXES):
+        return None
+    return home
 
 
 def _is_lib(name: str) -> bool:
@@ -262,7 +327,96 @@ def _pids_running_in(by_exe: list[Path], by_cwd: list[Path]) -> list[int]:
     return exact or loose
 
 
-def _loaded_machine_libs(pids: list[int], nest_roots: list[Path]) -> list[str]:
+def os_release() -> str | None:
+    """Which distribution this machine runs, as it names itself: ``"ubuntu 22.04"``.
+
+    Recorded so a restore elsewhere can say *where* the package names below came from.
+    A package name only means something next to its distribution: ``libGL.so.1`` is
+    ``libgl1`` on Ubuntu, ``mesa-libGL`` on Fedora, ``libglvnd`` on Arch -- and on
+    Ubuntu itself it was ``libgl1-mesa-glx`` before 22.04.
+    """
+    try:
+        text = Path("/etc/os-release").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    got: dict[str, str] = {}
+    for line in text.splitlines():
+        k, _, v = line.partition("=")
+        if v:
+            got[k.strip()] = v.strip().strip('"')
+    name = got.get("ID") or got.get("NAME")
+    ver = got.get("VERSION_ID") or ""
+    return f"{name} {ver}".strip() if name else None
+
+
+def _paths_dpkg_might_know(path: str) -> list[str]:
+    """The spellings of one file a package database might have recorded it under.
+
+    **Measured on a live Ubuntu 22.04 machine, 2026-08-30** (three runs, $0.012):
+    `dpkg -S /usr/lib/x86_64-linux-gnu/libc.so.6` answers "no path found matching
+    pattern" and exits 1, even though the file is real (not a symlink) and dpkg holds
+    237 package file lists. The reason is **merged-`/usr`**: `/lib` is a symlink to
+    `/usr/lib`, and libc6's file list records the file under `/lib/...`, while the
+    loader reports the path under `/usr/lib/...`. dpkg matches literal strings, so one
+    spelling hits and the other misses -- and `Path.resolve()` makes it worse, since it
+    canonicalises toward `/usr/lib`, away from what the database holds.
+
+    So: ask about the path as seen, its resolved form, and both `/usr`-prefixed and
+    `/usr`-stripped spellings. First answer wins; order is only about speed.
+    """
+    out = [path]
+    try:
+        real = str(Path(path).resolve())
+    except OSError:
+        real = path
+    for candidate in (real,
+                      path[4:] if path.startswith("/usr/") else "/usr" + path,
+                      real[4:] if real.startswith("/usr/") else "/usr" + real):
+        if candidate and candidate not in out:
+            out.append(candidate)
+    return out
+
+
+def _packages_for(paths: dict[str, str]) -> dict[str, str]:
+    """Which installed package owns each library file, **asked of this machine**.
+
+    Why measured instead of a table: a library name maps to a different package on every
+    distribution *and* on different releases of one -- ``libicudata.so.75`` is ``libicu75``
+    on Ubuntu 24.04 and ``libicu70`` on 22.04, because the soname carries the version, so
+    any table we wrote would go stale on the next ICU release without anyone noticing.
+    The machine that ran the app already knows the answer; ask it once, at pack time.
+
+    Unknown files are simply left out -- **a wrong package name is worse than none**
+    (the same rule the small built-in table has followed since 2026-08-12).
+    """
+    out: dict[str, str] = {}
+    for soname, path in paths.items():
+        # **Ask about the real file, not the symlink.** Measured on a live machine
+        # 2026-08-30: `dpkg -S /usr/lib/x86_64-linux-gnu/libc.so.6` answers "no path found
+        # matching pattern" and exits 1 -- that name is a symlink `ldconfig` creates, and
+        # no package ships it, so it is in no package's file list. The file it points at
+        # (`libc-2.35.so`) is. Four of five libraries were lost to this before the resolve.
+        tries = _paths_dpkg_might_know(path)
+        for argv, cut in [(["dpkg", "-S", t], ":") for t in tries] + \
+                         [(["rpm", "-qf", t], None) for t in tries]:
+            try:
+                r = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            line = (r.stdout or "").strip().splitlines()
+            if r.returncode != 0 or not line:
+                continue
+            first = line[0].strip()
+            pkg = first.split(cut, 1)[0].strip() if cut else first
+            # dpkg prints "pkg:arch: /path"; drop the architecture suffix.
+            pkg = pkg.split(":", 1)[0].strip()
+            if pkg and " " not in pkg:
+                out[soname] = pkg
+            break
+    return out
+
+
+def _loaded_machine_libs(pids: list[int], nest_roots: list[Path]) -> dict[str, str]:
     """Library names the run really loaded **from the machine**, as the program asked
     for them.
 
@@ -272,7 +426,10 @@ def _loaded_machine_libs(pids: list[int], nest_roots: list[Path]) -> list[str]:
     an installed package while the machine's copy is the one in use); and the name is the
     file's own recorded name, copied verbatim -- most files on disk carry a version the
     program never asks for."""
-    names: dict[str, None] = {}
+    # **soname -> the file it actually loaded from.** The path used to be thrown away
+    # here; it is what lets the packing machine be asked which package owns the file,
+    # so a restore elsewhere gets a real package name instead of "look it up yourself".
+    names: dict[str, str] = {}
     for pid in pids:
         try:
             maps = Path(f"/proc/{pid}/maps").read_text(encoding="utf-8", errors="replace")
@@ -288,8 +445,8 @@ def _loaded_machine_libs(pids: list[int], nest_roots: list[Path]) -> list[str]:
             p = Path(path)
             if _under(p, nest_roots) or not p.is_file():
                 continue
-            names.setdefault(elf_soname(p) or p.name, None)
-    return sorted(names)
+            names.setdefault(elf_soname(p) or p.name, str(p))
+    return names
 
 
 #: Names that only the GPU driver supplies. Every successful run this product exists for
@@ -370,14 +527,113 @@ def interpreter_site_packages(python: str | os.PathLike[str]) -> Path | None:
     return hits[0] if hits else None
 
 
-def collect_native_libs(
-    env_root: str | os.PathLike[str], python: str | os.PathLike[str] | None = None
-) -> dict | None:
-    """``{"method": "loaded"|"declared", "names": [...]}``, or None when nothing could
-    be established -- in which case write nothing, rather than an empty list that reads
-    like "this run needed none"."""
-    if not Path("/proc").is_dir():
+#: Where the ComfyUI extension leaves the record of what a working run had loaded.
+#: Reading a live process only works while the app is running; packing usually happens
+#: hours later. Measured 2026-08-20 on one real environment: 97 libraries while running,
+#: 29 from the fallback that reads what installed packages declare -- 76% lost.
+RUN_RECORD_REL = ".renest/native-libs.json"
+
+
+def record_search_roots(
+    env_root: str | os.PathLike[str], record_roots: Sequence[str | os.PathLike[str]] = ()
+) -> list[Path]:
+    """Where to look for the run record, in order: our own root, then the callers'.
+
+    **A named function on purpose.** Inline, the only way to test the order was to
+    write the same list out again in the test -- and a test that rebuilds the logic
+    it is checking passes no matter what the product does. That is exactly how the
+    seam this exists for went unnoticed.
+    """
+    seen: dict[Path, None] = {}
+    for r in [env_root, *record_roots]:
+        seen.setdefault(Path(r).resolve(), None)
+    return list(seen)
+
+
+def read_run_record(root: str | os.PathLike[str]) -> dict | None:
+    """The whole record the extension wrote when a run finished, or None when there is
+    none to read there. It carries more than libraries -- video-memory readings ride
+    along in it -- so the loading lives in one place and each reader takes its part.
+    """
+    try:
+        raw = json.loads((Path(root) / RUN_RECORD_REL).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _libs_from_run_record(root: Path, nest_roots: list[Path]) -> dict[str, str]:
+    """``{soname: the file it actually loaded from}`` for the libraries named by the
+    record the extension wrote when a run finished.
+
+    The record holds raw paths and nothing else. **Which of them count and what each
+    is called is decided here**, by the same rules a live process goes through -- one
+    set of rules, in one place, so the two cannot drift apart.
+
+    **The path is kept, not just the name.** It used to be dropped here and then
+    guessed back by looking the name up in the distribution's library folders, which
+    is a different file whenever the run loaded a different copy. Measured 2026-08-30
+    in a `continuumio/miniconda3` container: of 13 libraries a live conda interpreter
+    had loaded, the name lookup pointed at the wrong file for **8 of them** -- it
+    answered `/usr/lib/x86_64-linux-gnu/libssl.so.3` for a run that loaded
+    `/opt/conda/lib/libssl.so.3` -- so the package name recorded beside it described
+    a file the run never touched.
+    """
+    raw = read_run_record(root)
+    if raw is None:
+        return {}
+    paths = raw.get("mapped_library_paths")
+    if not isinstance(paths, list):
+        return {}
+    found: dict[str, str] = {}
+    for item in paths:
+        if not isinstance(item, str) or not item.startswith("/"):
+            continue
+        p = Path(item)
+        if not _is_lib(p.name) or _under(p, nest_roots) or not p.is_file():
+            continue
+        found.setdefault(elf_soname(p) or p.name, str(p))
+    return dict(sorted(found.items()))
+
+
+def collect_native_libs(
+    env_root: str | os.PathLike[str],
+    python: str | os.PathLike[str] | None = None,
+    record_roots: Sequence[str | os.PathLike[str]] = (),
+) -> dict | None:
+    """The nest's machine-library list, or None when nothing could be established.
+
+    Thin wrapper: :func:`collect_native_libs_with_layers` does the work and also hands
+    back what it left off, for callers that want to say so.
+    """
+    return collect_native_libs_with_layers(env_root, python, record_roots)[0]
+
+
+def collect_native_libs_with_layers(
+    env_root: str | os.PathLike[str],
+    python: str | os.PathLike[str] | None = None,
+    record_roots: Sequence[str | os.PathLike[str]] = (),
+) -> tuple[dict | None, dict[str, str]]:
+    """``({"method": ..., "names": [...]} or None, {soname: file} left off)``.
+
+    The first half is the nest's list -- None when nothing could be established, in
+    which case write nothing rather than an empty list that reads like "this run
+    needed none". The second half is what was **deliberately left off**: libraries the
+    run loaded out of the packing interpreter's own installation. It is returned rather
+    than discarded so the packing side can tell the user, which is the whole complaint
+    this function was changed for -- the fact was being established and then thrown
+    away in the same breath. Empty on an environment whose Python is uv-managed or the
+    distribution's, because neither has a place of its own.
+
+    ``record_roots``: extra places to look for the run record, tried in order after
+    ``env_root``. The extension writes it beside the host application's own source,
+    which is not always under the directory a pack is rooted at -- an install that
+    keeps program and data in separate trees puts it in neither the pack root nor
+    below it. Which directories those are is a fact about the host application, so
+    the caller supplies them and this layer never names one.
+    """
+    if not Path("/proc").is_dir():
+        return None, {}
     root = Path(env_root).resolve()
     nest_roots = [root]
     site_dirs: list[Path] = []
@@ -393,6 +649,9 @@ def collect_native_libs(
             nest_roots.append(home)
         else:
             site_dirs.append(home / "lib")
+    # The packing interpreter's own place, when it has one. Everything loaded out of it
+    # is that interpreter's business, not the machine's -- see library_layer.
+    interp = _own_interpreter_prefix(home, nest_roots)
     # "This environment's own program" first, "anything running under this folder"
     # only as a fallback — see _pids_running_in. **The base interpreter goes in only when
     # it lives inside this environment** (a uv-managed private Python does): a system one
@@ -401,27 +660,140 @@ def collect_native_libs(
     by_exe = [p for p in nest_roots[1:] if p is not None]
     if home is not None and _under(home, [root]):
         by_exe.append(home)
+    # The record the extension left at the moment a run finished comes first: it was
+    # taken while everything the workflow needs was loaded, which is exactly the moment
+    # this list is supposed to describe, and it survives the app being closed.
+    # Own root first, then wherever the caller says the extension may have written.
+    # **Why the parameter exists**: the extension writes beside the host application's
+    # own source, which on a two-tree install is not under the pack root at all, so a
+    # record from a real run was never found. Both halves had tests; the seam had none.
+    recorded: dict[str, str] = {}
+    for candidate in record_search_roots(root, record_roots):
+        recorded = _libs_from_run_record(candidate, nest_roots)
+        if recorded:
+            break
+    if recorded:
+        by_path, theirs = split_by_layer(recorded, nest_roots, interp)
+        if by_path and looks_like_the_working_run(list(by_path)):
+            # **Ask the package manager about the file that was really loaded**, which
+            # the record carried all along. This is the path a real pack takes: measured
+            # 2026-08-30, the first packed 2.9 nest carried zero package names because
+            # the resolution lived only on the live-process fallback below.
+            got = _with_packages({"method": "loaded", "names": sorted(by_path)}, by_path)
+            return got, theirs
     pids = _pids_running_in(by_exe, [root])
-    loaded = _loaded_machine_libs(pids, nest_roots) if pids else []
+    seen = _loaded_machine_libs(pids, nest_roots) if pids else {}
+    by_path, theirs = split_by_layer(seen, nest_roots, interp)
+    loaded = sorted(by_path)
     # **Better a truthful fallback than a false authority.** A process matched here may
     # simply have been passing through; if what it loaded does not look like the run that
     # worked, drop back to the declared list and say so, rather than dressing it up as
     # the authoritative one.
     if loaded and looks_like_the_working_run(loaded):
-        return {"method": "loaded", "names": loaded}
+        return _with_packages({"method": "loaded", "names": loaded}, by_path), theirs
+
     declared = _declared_machine_libs(site_dirs)
-    return {"method": "declared", "names": declared} if declared else None
+    # Nothing was reclassified on this branch: the declared list is read off installed
+    # files, not off what a run loaded, so there is no path to classify by.
+    return ({"method": "declared", "names": declared} if declared else None), {}
 
 
-def missing_native_libs(names: list[str] | tuple[str, ...]) -> list[str]:
+def _locate(names: list[str]) -> dict[str, str]:
+    """Where a library of this name sits in the distribution's folders, if one does.
+
+    **Not on the packing path any more, and not to be put back there.** It answers by
+    name, and a name is not an identity: measured 2026-08-30 in the packing image, 9 of
+    23 libraries existed under one file name in two places at once, and the copy the run
+    loaded was never the distribution's. The run record carries the file each library
+    actually loaded from, so pack asks about that file instead. Kept only for a
+    development diagnostic that puts the two answers side by side; nothing the tool
+    does calls it.
+    """
+    out: dict[str, str] = {}
+    for name in names:
+        for d in LIB_DIRS:
+            f = Path(d) / name
+            if f.is_file():
+                out[name] = str(f)
+                break
+    return out
+
+
+def split_by_layer(
+    by_path: dict[str, str], nest_roots: Sequence[Path], interpreter_prefix: Path | None
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Split ``{soname: file}`` into ``(the machine's, the packing interpreter's own)``.
+
+    Only the first half belongs on a nest's machine list. A rebuild builds its own
+    interpreter (``uv venv --python <version>``), so a machine without the second half
+    is short of nothing -- reporting it is a false alarm on a machine that works.
+    """
+    mine: dict[str, str] = {}
+    theirs: dict[str, str] = {}
+    for name, path in by_path.items():
+        layer = library_layer(path, nest_roots, interpreter_prefix)
+        if layer == LAYER_INTERPRETER:
+            theirs[name] = path
+        elif layer == LAYER_MACHINE:
+            mine[name] = path
+    return mine, theirs
+
+
+def _with_packages(out: dict, by_path: dict[str, str]) -> dict:
+    """Attach the measured package names, when this machine can answer.
+
+    Recorded rather than looked up in a table: a library name maps to a different package
+    on every distribution and between releases of one (the soname carries the version), so
+    a shipped table goes stale on the next release with nobody noticing.
+    """
+    if not by_path:
+        return out
+    pkgs = _packages_for(by_path)
+    if pkgs:
+        out["packages"] = dict(sorted(pkgs.items()))
+        got = os_release()
+        if got:
+            out["packages_from"] = got
+    return out
+
+
+def this_platform_tag() -> str:
+    """This machine's Python platform tag, or ``""`` when it cannot be read."""
+    try:
+        import sysconfig
+
+        return str(sysconfig.get_platform() or "")
+    except Exception:
+        return ""
+
+
+def machine_libs_checkable(platform_tag: str | None = None) -> bool:
+    """Whether "does this machine have that library" can be answered here at all.
+
+    A nest names Linux shared objects and they are looked up in Linux library
+    folders. Ask that on macOS and every single one reads as missing, so a machine
+    short of nothing is handed a full list of things it lacks -- and a warning that
+    is always wrong is how people learn to skip the real one. Only a tag that says
+    outright it is another system silences the check; an unreadable tag still gets
+    checked, because losing a true warning costs more than an unnecessary look.
+    No tag asks this machine; the escape hatch draws the same line from ``uname -s``.
+    """
+    tag = platform_tag or this_platform_tag()
+    return str(tag).split("-", 1)[0].lower() in ("", "linux")
+
+
+def missing_native_libs(names: list[str] | tuple[str, ...],
+                        platform_tag: str | None = None) -> list[str]:
     """Which of these library names this machine does not have.
 
     Looked up by the exact name asked for, in the standard library folders -- the
     same thing the escape hatch does in shell, deliberately kept identical. **Not
     ``ldd``**: measured, it reported libraries the nest carries itself as missing and
     got the direction wrong on others, and a false alarm here trains people to ignore
-    the real one."""
-    if not Path("/proc").is_dir():
+    the real one. Empty off Linux, where the question has no meaning -- callers that
+    report a count must ask :func:`machine_libs_checkable` first, or "nothing missing"
+    will be printed where nothing was looked at."""
+    if not machine_libs_checkable(platform_tag):
         return []
     return [n for n in names
             if isinstance(n, str) and n
@@ -498,7 +870,7 @@ def lock_requirements(lock_text: str) -> list[tuple[str, str]]:
         if not m:
             continue
         req = line.split(" #", 1)[0]
-        req = re.split(r"\s+--hash=", req, 1)[0]
+        req = re.split(r"\s+--hash=", req, maxsplit=1)[0]
         req = req.rstrip().rstrip("\\").strip()
         if req:
             out.append((canonical_name(m.group(1)), req))

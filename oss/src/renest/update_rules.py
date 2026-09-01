@@ -26,10 +26,17 @@ import httpx
 from . import rules as _rules
 from .errors import ExitCode
 from .events import EventEmitter
-from .rules import DOCTOR_RULES, FINGERPRINT_MATRIX, SOURCE_PLAYBOOK, TRUSTED_HOSTS, WORLD_RULES
+from .rules import (
+    DOCTOR_RULES,
+    FINGERPRINT_MATRIX,
+    KNOWN_COMPONENTS,
+    SOURCE_PLAYBOOK,
+    TRUSTED_HOSTS,
+    WORLD_RULES,
+)
 
-__all__ = ["RULE_NAMES", "trusted_keys", "verify_and_install", "update_all",
-           "staleness_warning", "warn_if_stale", "in_effect"]
+__all__ = ["RULE_NAMES", "OPTIONAL_IN_BUNDLE", "trusted_keys", "verify_and_install",
+           "update_all", "staleness_warning", "warn_if_stale", "in_effect"]
 
 #: Which rules files this channel refreshes.
 #:
@@ -39,10 +46,20 @@ __all__ = ["RULE_NAMES", "trusted_keys", "verify_and_install", "update_all",
 RULE_NAMES: tuple[str, ...] = (
     DOCTOR_RULES,
     FINGERPRINT_MATRIX,
+    KNOWN_COMPONENTS,
     SOURCE_PLAYBOOK,
     TRUSTED_HOSTS,
     WORLD_RULES,
 )
+
+#: Names a bundle is allowed **not** to carry.
+#:
+#: A rules file added after the last bundle was signed is simply not in that bundle yet,
+#: and refusing the whole bundle over it would break every refresh between the release
+#: and the next signing -- turning "we added a table" into "nobody can refresh anything".
+#: A file that is absent keeps whatever copy the machine already has, which for a new
+#: file is the baseline inside the install. Present but malformed is still refused.
+OPTIONAL_IN_BUNDLE: frozenset[str] = frozenset({KNOWN_COMPONENTS})
 # Default service address. **The API domain, not the web domain**: the console is static
 # hosting, where any /api/v1/* is swallowed by the catch-all page and comes back as a 200
 # with HTML, which the CLI then misreports as a network fault.
@@ -302,7 +319,7 @@ BUNDLE_NAME = "renest-rules.signed.json"
 
 
 def install_bundle(body: dict, *, keys: dict[str, bytes] | None = None) -> list[dict]:
-    """Install the bundled rules: **check the signature once, then land five files
+    """Install the bundled rules: **check the signature once, then land each file
     separately**.
 
     **Atomicity**: if any one of them fails the structure check, **none of them lands**.
@@ -328,6 +345,8 @@ def install_bundle(body: dict, *, keys: dict[str, bytes] | None = None) -> list[
     for name in RULE_NAMES:
         data = files.get(name)
         if data is None:
+            if name in OPTIONAL_IN_BUNDLE:
+                continue
             return [{"name": BUNDLE_NAME, "ok": False, "detail": f"the bundle is missing {name}"}]
         why = _rules._validate(name, data)
         if why is not None:
@@ -346,8 +365,15 @@ def install_bundle(body: dict, *, keys: dict[str, bytes] | None = None) -> list[
     dest.mkdir(parents=True, exist_ok=True)
     out = []
     for name in RULE_NAMES:
+        if name not in files:
+            continue      # only ever an OPTIONAL_IN_BUNDLE name; the loop above refused the rest
         one = dict(files[name])
-        one.setdefault("issued_at", payload.get("issued_at"))
+        # Stamp when the file carries no usable date of its own. **Not setdefault**:
+        # a file that spells the slot out as ``"issued_at": null`` has the key, so
+        # setdefault left it null and that file landed undated -- and an undated file
+        # can answer neither "how old are my rules" nor "is this a downgrade".
+        if not one.get("issued_at"):
+            one["issued_at"] = payload.get("issued_at")
         tmp = dest / f".{name}.tmp"
         tmp.write_text(json.dumps(one, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, dest / name)
@@ -388,7 +414,7 @@ def _fetch_bundle() -> dict | None:
 
 
 def update_all(fetch=None) -> list[dict]:
-    """Fetch the bundle -> check the signature -> land five files.
+    """Fetch the bundle -> check the signature -> land the files.
 
     Returns one result per file, [{name, ok, detail}].
 
@@ -420,14 +446,19 @@ def in_effect() -> dict:
 
     ``{"source": "downloaded"|"built-in"|"mixed", "issued": "YYYY-MM-DD", "version": …}``.
     A downloaded set is dated by the day it was issued; the built-in set has no such day,
-    so what identifies it is the version it shipped with. "mixed" means the five files
+    so what identifies it is the version it shipped with. "mixed" means the files
     disagree, which is worth showing rather than hiding behind whichever was read first.
     """
     from . import __version__
 
-    sources = {_rules.active_copy(name) for name in RULE_NAMES}
+    # A file the bundle is allowed to omit and has never sent counts for nothing here:
+    # otherwise adding a table would report every machine on the planet as "mixed" until
+    # the next signing, which reads as "your refresh half worked" when nothing is wrong.
+    names = [n for n in RULE_NAMES
+             if n not in OPTIONAL_IN_BUNDLE or (_install_dir() / n).is_file()]
+    sources = {_rules.active_copy(name) for name in names}
     source = sources.pop() if len(sources) == 1 else "mixed"
-    stamps = [s for s in (_local_issued_at(n) for n in RULE_NAMES) if s]
+    stamps = [s for s in (_local_issued_at(n) for n in names) if s]
     return {
         "source": source,
         "issued": min(stamps)[:10] if source == "downloaded" and stamps else "",

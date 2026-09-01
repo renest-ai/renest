@@ -46,7 +46,7 @@ class ExitCode(enum.IntEnum):
     USAGE = 2
     CONFIG_OR_CREDENTIAL = 3
 
-    # -- S0 pre-check (6x; replaces the retired 6/7 doctor codes) --------
+    # -- S0 pre-check (60-67; replaces the retired 6/7 doctor codes) -----
     S0_UNKNOWN = 60
     S0_WARNING_UNCONFIRMED = 61
     S0_PYTHON_BLOCK = 62
@@ -54,10 +54,20 @@ class ExitCode(enum.IntEnum):
     S0_ARCH_UNSUPPORTED = 64
     S0_DISK_INSUFFICIENT = 65
     S0_FINGERPRINT_MISSING = 66
+    #: A health-check warning that is *not* a missing system library -- most often
+    #: "some packages here are a different version than on the packing machine".
+    #: Split out of 61 on 2026-08-29: 61 had covered both since 08-23, and one number
+    #: for a serious finding (plugins load but silently do nothing) and a
+    #: near-universal one left nobody able to act on either.
+    S0_WARNING_OTHER = 67
 
     # -- S1 transfer (1x) -------------------------------------------------
     S1_UNKNOWN = 10
     S1_NETWORK_INTERRUPTED = 11
+    #: Not raised yet. Waiting on the ranged download being able to retry the *same*
+    #: source as a single stream: the mode is chosen once from the probe, and a failure
+    #: mid-transfer moves on to the next source instead. Until then a throttled source
+    #: (HTTP 429) is reported as 11 NETWORK_INTERRUPTED, which is retryable and true.
     S1_RANGE_THROTTLED = 12
     S1_CREDENTIAL_EXPIRED = 13
     S1_STORAGE_UNAVAILABLE = 14
@@ -70,6 +80,10 @@ class ExitCode(enum.IntEnum):
 
     # -- S2 layout & byte verification (2x) -------------------------------
     S2_UNKNOWN = 20
+    #: Not raised yet: it needs a ``--mode`` switch, and there is none. Today a collision
+    #: is not a failure at all — when something different already sits at the recipe's
+    #: landing path the user's copy wins untouched and ours stays in staging with a
+    #: warning. The switch has to exist before this can mean anything.
     S2_PATH_CONFLICT = 21
     S2_PERMISSION_DENIED = 22
     S2_HASH_MISMATCH = 23  # lint / verify byte-level failures reuse this
@@ -84,10 +98,22 @@ class ExitCode(enum.IntEnum):
     # -- S3 environment build (3x) ----------------------------------------
     S3_UNKNOWN = 30
     S3_TORCH_CUDA_CONFLICT = 31
+    #: Not raised yet: it only means something once extensions are installed one at a
+    #: time. The rebuild installs a single merged lock in one pass, so a build failure
+    #: in there is attributed to the package being compiled, not to an extension, and
+    #: lands on 35 SYSLIB_MISSING.
     S3_NODE_REQUIREMENTS_FAILED = 32
+    #: Not raised — and **do not wire it to uv's resolution failures**: 33 means two
+    #: extensions are mutually exclusive, but a merged lock cannot say which package came
+    #: from which extension (a fine-tuning nest has none), so it would name a wrong cause
+    #: and send people deleting extensions. Those land on 31 if torch is named, else 30.
     S3_NODE_VERSION_CONFLICT = 33
     S3_PYTHON_MISMATCH = 34
     S3_SYSLIB_MISSING = 35
+    #: Not raised, and unreachable as the product stands: the rebuild never runs
+    #: ComfyUI-Manager. Kept rather than deleted — retiring a code is a format change
+    #: with its own version process, and dropping it would leave that failure with
+    #: nothing but the stage's unclassified code to land on.
     S3_MANAGER_INCOMPATIBLE = 36
     S3_UNTRUSTED_SOURCE = 37  # lockfile installs from a host that is not on the
     # allow-list; --trust-unsafe-urls goes ahead anyway
@@ -99,6 +125,12 @@ class ExitCode(enum.IntEnum):
 
     # -- S4 application startup (4x) ---------------------------------------
     S4_UNKNOWN = 40
+    #: 41/42/43 are never raised, and that is a design consequence rather than an oversight:
+    #: ComfyUI logs an extension it could not import and starts anyway, so no S4 check ever
+    #: sees one. That failure surfaces a gate later instead — 55 when a system library is
+    #: named, otherwise the S5 catch-all — at the moment the recipe asks for that extension.
+    #: Raising these needs an S4 step reading the launch log against the recipe's node list,
+    #: i.e. ruling an extension unusable before anything has asked it to run.
     S4_NODE_IMPORT_FAILED = 41
     S4_NODE_NOT_REGISTERED = 42
     S4_WORKFLOW_PATH_STALE = 43
@@ -139,6 +171,8 @@ class ErrorClass(enum.StrEnum):
     UNKNOWN = "UNKNOWN"
     # S0
     WARNING_UNCONFIRMED = "WARNING_UNCONFIRMED"
+    #: Not-a-missing-library warning; see S0_WARNING_OTHER.
+    WARNING_OTHER = "WARNING_OTHER"
     PYTHON_BLOCK = "PYTHON_BLOCK"
     CUDA_BLOCK = "CUDA_BLOCK"
     ARCH_UNSUPPORTED = "ARCH_UNSUPPORTED"

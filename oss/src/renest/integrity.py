@@ -25,6 +25,7 @@ __all__ = [
     "PROBED_SUFFIXES",
     "TINY_BYTES",
     "WEIGHT_SUFFIXES",
+    "cache_stated_sha256",
     "declared_base_model",
     "dirty_gap",
     "git_dirty",
@@ -121,6 +122,38 @@ def probe_model_bytes(
         return (f"Can't read {name} ({e}), so we couldn't check whether it is a "
                 f"whole model. Please check it yourself before you pack.")
     return None
+
+
+#: A model cache names its large files after their own sha256; the small ones
+#: sitting beside them carry a 40-character git hash instead.
+_CACHE_REPO_PREFIXES = ("models--", "datasets--")
+_SHA256_NAME = re.compile(r"^[0-9a-f]{64}$")
+
+
+def cache_stated_sha256(path: Path) -> str | None:
+    """The sha256 a model cache states for this file, taken from its file name.
+
+    **Named "stated", not "claimed", on purpose**: in this tree the word "claim"
+    belongs to handing a nest to somebody else, and a gate keeps that vocabulary
+    out of here so the two never blur. This is about bytes, not about people.
+
+    Free to read and in the same digest as the addresses used everywhere here,
+    which makes it a useful second opinion on bytes we hashed ourselves.
+    **A second opinion is all it may ever be**: an address we did not compute
+    is someone else's claim about the bytes, and when the claim is wrong the
+    nest carries an address its own bytes do not answer to -- which reaches the
+    rebuilding machine as a broken download and points nowhere near the cause.
+
+    Length is the whole test: 64 hex characters is a sha256, and the
+    40-character names in the same folder are a different digest that must
+    never be read as one. Returns ``None`` for those, and for anything that is
+    not a cache blob. Never raises, never reads a byte.
+    """
+    if path.parent.name != "blobs":
+        return None
+    if not path.parent.parent.name.startswith(_CACHE_REPO_PREFIXES):
+        return None
+    return path.name if _SHA256_NAME.match(path.name) else None
 
 
 #: The one digest of a base model that is comparable with the addresses used

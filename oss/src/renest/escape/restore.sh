@@ -2,10 +2,10 @@
 # =============================================================================
 # Renest restore.sh — the escape hatch
 #
-# Nest formats this copy reads: 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8  (and, with a warning,
+# Nest formats this copy reads: 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9  (and, with a warning,
 #   any later 2.x — a higher minor version only ever adds optional fields, and
 #   refusing one would turn a nest whose bytes restore perfectly into a brick).
-#   Written for format 2.8, 2026-08-17. Keep this line: from format 2.3 on a
+#   Written for format 2.9, 2026-08-30. Keep this line: from format 2.3 on a
 #   copy of this script travels inside every nest at .renest/escape/restore.sh,
 #   and this comment is how you tell which copy you are holding — there is no
 #   version field anywhere else.
@@ -20,10 +20,18 @@
 #   is their code on your machine. Use your own copy, or check its hash against
 #   the one recorded in the nest's own file list first.
 #
+#   Every version of this script we have shipped is listed by sha256 in
+#   specs/escape-hatch-versions.md at github.com/renest-ai/renest -- which format
+#   each was written for, and what was found wrong with it later. A hash that is
+#   not on that list is not one of ours. Nothing here reads that list; it is for
+#   you, and the script works the same when you cannot reach it.
+#
 # Promise: this script needs only curl, jq, sha256sum (or shasum), tar and uv,
-# plus the stock Unix text tools every base system already ships (grep, sed,
-# sort, cut, tr, paste, df). It does not need Renest, our servers, or anything
-# else we ship. Read it, keep a copy, and you can always rebuild a nest without us.
+# plus the stock tools every base system already ships (grep, sed, sort, cut, tr,
+# paste, df, cat, head, tail, wc, ls, mkdir, rm, cp, mv, dirname, basename, date,
+# uname, getconf, tee, sleep, awk, find, chmod, touch, and bash itself). It does not need Renest,
+# our servers, or anything else we ship. Read it, keep a copy, and you can always
+# rebuild a nest without us.
 # (git was on this list until 2026-08-08 but the script never once called it —
 # code archives are unpacked from tar, never cloned — so it is no longer required.)
 #
@@ -191,7 +199,11 @@ hsize() { # human-readable size (integer arithmetic only, one decimal, rounded; 
 }
 
 # ---- Required tools (missing one stops the run) -----------------------------
-need() { command -v "$1" >/dev/null 2>&1 || die DEP-MISSING "$1 is not installed. Install it and run this again. This script needs curl, jq, sha256sum (or shasum), tar and uv — nothing else beyond stock Unix text tools."; }
+# Name the package, not just the tool: GPU images ship curl and tar but often
+# leave out jq, so this is the first wall most people hit. "Install it" alone
+# turns a one-line fix into a search.
+apt_pkg() { case "$1" in sha256sum) printf 'coreutils' ;; *) printf '%s' "$1" ;; esac; }
+need() { command -v "$1" >/dev/null 2>&1 || die DEP-MISSING "$1 is not installed. On Debian/Ubuntu machines: apt-get install -y $(apt_pkg "$1") — then run this again. This script needs curl, jq, sha256sum (or shasum), tar and uv — nothing else beyond stock Unix text tools."; }
 for c in curl jq tar; do need "$c"; done
 
 # sha256: GNU systems call it sha256sum, a stock macOS/BSD only has shasum.
@@ -204,7 +216,7 @@ if command -v sha256sum >/dev/null 2>&1; then
 elif command -v shasum >/dev/null 2>&1; then
   sha256_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
 else
-  die DEP-MISSING "Neither sha256sum nor shasum is installed, so nothing can be byte-checked. Install one and run this again."
+  die DEP-MISSING "Neither sha256sum nor shasum is installed, so nothing can be byte-checked. On Debian/Ubuntu machines: apt-get install -y $(apt_pkg sha256sum) — then run this again."
 fi
 if ! command -v uv >/dev/null 2>&1; then
   log "uv not found — installing it…"
@@ -215,8 +227,20 @@ if ! command -v uv >/dev/null 2>&1; then
   command -v uv >/dev/null 2>&1 || die DEP-UV "uv installed but still is not on PATH. PATH=$PATH"
 fi
 
-mkdir -p "$TARGET/.renest" 2>/dev/null || die TARGET-PERM "Cannot write to $TARGET. Machine images differ in who owns what — pick another TARGET, or chown this one first."
-[ -w "$TARGET" ] || die TARGET-PERM "Cannot write to $TARGET"
+# Two checks, not one: mkdir -p returns 0 when .renest is already there from an
+# earlier run, so a folder that has since been chowned away slips past it.
+# Both say the same thing -- a named failure with no way out reads like an
+# unknown one, and this is the branch a second attempt lands on.
+_NO_WRITE="Cannot write to $TARGET. Machine images differ in who owns what — pick another TARGET, or chown this one first."
+mkdir -p "$TARGET/.renest" 2>/dev/null || die TARGET-PERM "$_NO_WRITE"
+[ -w "$TARGET" ] || die TARGET-PERM "$_NO_WRITE"
+
+# Say the landing spot out loud before a single byte is written. Someone who
+# packed ~/Documents/ComfyUI naturally expects a rebuild to put it back there;
+# it does not, and a nest carries no absolute path from the machine it was
+# packed on. Printed resolved, so "TARGET=." still names a real place.
+_LANDING="$(cd "$TARGET" 2>/dev/null && pwd || printf '%s' "$TARGET")"
+log "Everything from this nest lands under $_LANDING — not wherever it lived on the machine it was packed on."
 
 STAGE="S1-fetch"
 # ---- 1. Fetch the manifest --------------------------------------------------
@@ -297,9 +321,9 @@ FV=$(jq -r '.format_version' "$MANIFEST")
 # last (section 5b). Still different → it says so and carries on. Every 2.0–2.7 nest
 # restores unchanged: the field is absent there, and absent means "do nothing".
 case "$FV" in
-  2.0|2.1|2.2|2.3|2.4|2.5|2.6|2.7|2.8) ;;
+  2.0|2.1|2.2|2.3|2.4|2.5|2.6|2.7|2.8|2.9) ;;
   2.*)
-    warn "This nest says format $FV; this script knows up to 2.8. Same major version, so it only adds optional fields this script does not use — carrying on. A newer Renest will make full use of them." ;;
+    warn "This nest says format $FV; this script knows up to 2.9. Same major version, so it only adds optional fields this script does not use — carrying on. A newer Renest will make full use of them." ;;
   *)
     # Same three facts the agent side gives, in the same order: how old this nest is,
     # that there is no upgrade path and why, and that the files themselves are fine.
@@ -307,7 +331,7 @@ case "$FV" in
     # is not (the manifest still lists every one of them, with fingerprints).
     _WHEN=$(jq -r '.created_at // empty' "$MANIFEST" 2>/dev/null | cut -c1-10)
     _NFILES=$(jq -r '(.files // []) | length' "$MANIFEST" 2>/dev/null)
-    die FORMAT-VERSION "Unrecognised nest format version: $FV — this script reads format 2.x (knows 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7 and 2.8).${_WHEN:+ This nest was packed on ${_WHEN}.} Nests in the older 1.x format cannot be read here, and **there is no upgrade path**: format 2.0 made it compulsory to say which parts of a nest are the application and which are your own code, and nobody can work that out after the fact.${_NFILES:+ **Your files are not lost** — this nest still lists all ${_NFILES} of them with their fingerprints, so they can be fetched one by one even though the environment cannot be rebuilt automatically.} If you still have the environment, pack it again with a current Renest." ;;
+    die FORMAT-VERSION "Unrecognised nest format version: $FV — this script reads format 2.x (knows 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8 and 2.9).${_WHEN:+ This nest was packed on ${_WHEN}.} Nests in the older 1.x format cannot be read here, and **there is no upgrade path**: format 2.0 made it compulsory to say which parts of a nest are the application and which are your own code, and nobody can work that out after the fact.${_NFILES:+ **Your files are not lost** — this nest still lists all ${_NFILES} of them with their fingerprints, so they can be fetched one by one even though the environment cannot be rebuilt automatically.} If you still have the environment, pack it again with a current Renest." ;;
 esac
 
 # ---- Where the files may land ------------------------------------------------
@@ -316,6 +340,7 @@ esac
 # cache, and it will not run if they are somewhere else. Those two folders are
 # named here, resolved the same way the Hugging Face tools resolve them, and
 # nothing else outside $TARGET is ever written.
+# BEGIN cache-roots -- the landing test runs exactly these lines, so they cannot drift
 if [ -n "${HF_HUB_CACHE:-}" ]; then
   HF_HUB_ROOT="$HF_HUB_CACHE"
 elif [ -n "${HF_HOME:-}" ]; then
@@ -336,6 +361,7 @@ root_dir() {
     *)       printf '%s' "$TARGET" ;;
   esac
 }
+# END cache-roots
 
 # ---- Where-it-lands safety check --------------------------------------------
 # We warn rather than refuse about compatibility, but not about this: a nest
@@ -358,6 +384,7 @@ root_dir() {
 #      never program code, which travels in code_deps instead. This check is
 #      what enforces that, and it looks only at the path: since format 2.7 the
 #      category beside it is free text, so trusting it would trust the nest.
+# BEGIN landing-gate -- the three-way parity test runs exactly these lines, so they cannot drift
 BADPATH=$(jq -r '
   [ (.files[]? | (.root // "env") as $r | (.path // "") as $p
       | if ($r != "env" and $r != "hf_hub" and $r != "hf_home")
@@ -377,6 +404,12 @@ BADPATH=$(jq -r '
       | if ($p == "") or ($p | test("^(/|~)")) or ($p | test("(^|/)\\.\\.(/|$)"))
           then "a path that writes outside where it belongs: \($p)"
         else empty end),
+    # The name of a code folder becomes a file name (<name>.tar.gz), and the format
+    # leaves it free text -- so "../../x" drops that archive outside your folder.
+    (.code_deps[]? | (.name // "") as $n
+      | if ($n == "") or ($n | test("[/\\\\]")) or ($n == "..")
+          then "a code folder whose name is a path: \($n)"
+        else empty end),
     # The two paths format 2.6 added get the same check: a nest that names a spot
     # outside the rebuild folder is refused here too, not quietly ignored.
     (((.python_lock.lockfile_path // empty), (.adapters.comfyui.workflow_path // empty))
@@ -385,6 +418,7 @@ BADPATH=$(jq -r '
         else empty end)
   ] | .[0] // empty' "$MANIFEST")
 [ -n "$BADPATH" ] && die MANIFEST-BAD "This nest asks for something we will not do — it names $BADPATH. Refusing to restore it."
+# END landing-gate
 # How many files a nest may list. Not a security limit — a sanity one: this script
 # starts a couple of processes per file, so a manifest with a million entries would
 # keep your machine busy all night without ever moving a byte worth having. A real
@@ -402,6 +436,7 @@ log "Nest: $(jq -r '.name // .id' "$MANIFEST")"
 
 # ---- 1b. Precheck: disk space (do not waste half an hour downloading) -------
 STAGE="S0-precheck"
+# BEGIN disk-precheck -- the disk test runs exactly these lines, so they cannot drift
 # Counted per folder, not in one lump: the model cache is often on a different
 # disk from the rebuild folder, and one number for both would be a lie in either
 # direction — blocking a run that fits, or letting one start that cannot finish.
@@ -414,15 +449,44 @@ check_space() { # check_space <folder> <bytes needed>
   # with available KiB in the 4th column.
   avail_kb=$(df -Pk "$dir" 2>/dev/null | { read -r _ || true; read -r _ _ _ a _ || true; printf '%s' "${a:-}"; } || true)
   if [ -n "${avail_kb:-}" ] && [ "$avail_kb" -lt "$need_kb" ]; then
-    die DISK-SPACE "Not enough disk space: this nest needs about $(hsize $((need_kb * 1024))) in $dir including headroom, and it has $(hsize $((avail_kb * 1024))) free. Use a bigger disk or attach a volume."
+    die DISK-SPACE "Not enough disk space: this nest needs about $(hsize $((need_kb * 1024))) in $dir including headroom, and it has $(hsize $((avail_kb * 1024))) free. Use a bigger disk or attach a volume. (Sizes added up with $(jq --version 2>/dev/null || printf 'jq of unknown version'), on this machine.)"
   fi
 }
-NEED_ENV=$(jq '[ [.files[] | select((.root // "env") == "env") | .blob.size_bytes] + [.code_deps[].archive.size_bytes] | add // 0 ] | .[0]' "$MANIFEST")
-NEED_HUB=$(jq '[ [.files[] | select((.root // "env") == "hf_hub") | .blob.size_bytes] | add // 0 ] | .[0]' "$MANIFEST")
-NEED_HFH=$(jq '[ [.files[] | select((.root // "env") == "hf_home") | .blob.size_bytes] | add // 0 ] | .[0]' "$MANIFEST")
+# Added up here, not by jq: jq keeps numbers as doubles, and an old build rounds
+# a big total instead of reporting it. A single file's size is nowhere near that
+# limit, so jq prints them one per line and the shell adds them as 64-bit
+# integers — exact, and no extra tool to install.
+sum_bytes() { # sum_bytes <jq filter printing one size per line>
+  jq -r "$1" "$MANIFEST" | {
+    local total=0 n
+    while IFS= read -r n; do
+      case "$n" in '' | *[!0-9]*) continue ;; esac
+      total=$(( total + n ))
+    done
+    printf '%s' "$total"
+  }
+}
+NEED_ENV=$(sum_bytes '[.files[] | select((.root // "env") == "env") | .blob.size_bytes] + [.code_deps[].archive.size_bytes] | .[]')
+NEED_HUB=$(sum_bytes '[.files[] | select((.root // "env") == "hf_hub") | .blob.size_bytes] | .[]')
+NEED_HFH=$(sum_bytes '[.files[] | select((.root // "env") == "hf_home") | .blob.size_bytes] | .[]')
 check_space "$TARGET" "$NEED_ENV"
 check_space "$HF_HUB_ROOT" "$NEED_HUB"
 check_space "$HF_HOME_ROOT" "$NEED_HFH"
+# END disk-precheck
+
+# ---- 1b2. Precheck: folders that already exist and belong to somebody else --
+# The TARGET check above says nothing about them. Machine images ship a ComfyUI
+# tree owned by root, so unpacking stops there -- after every byte is downloaded.
+# Told, not refused (2026-07-15 ruling): a nest still has uses on such a machine.
+# BEGIN landing-writable -- the parity test runs exactly these lines, so they cannot drift
+while IFS= read -r _dep; do
+  [ -n "$_dep" ] || continue
+  _spot="$TARGET/$_dep"
+  if [ -d "$_spot" ] && [ ! -w "$_spot" ]; then
+    warn "$_spot already exists and you cannot write into it — unpacking will stop there, after the download. Take ownership of that folder, or set TARGET to somewhere else."
+  fi
+done < <(jq -r '(.code_deps // [])[] | .install_path // empty' "$MANIFEST")
+# END landing-writable
 
 # ---- 1c. Precheck: what the nest was built on (told, not enforced) ----------
 if jq -e '.fingerprint' "$MANIFEST" >/dev/null 2>&1; then
@@ -497,6 +561,85 @@ if command -v nvidia-smi >/dev/null 2>&1 && jq -e '.gpu.torch_cuda_arch_list' "$
   fi
 fi
 
+# ---- 1e. Precheck: were the compiled extensions built for this card? --------
+# torch covering this card says nothing about the extensions beside it: one
+# attention library shipped a binary built for sm_60/70/90 and skipped sm_86, the
+# packing machine's own card. Those nodes go missing while the app still starts,
+# so this only ever says so out loud -- never a refusal. Same two readings the
+# agent's pre-flight uses, so the two must not answer differently.
+# BEGIN extension-archs -- the parity test runs exactly these lines, so they cannot drift
+_EXT_CC=""; _EXT_SM=""
+if command -v nvidia-smi >/dev/null 2>&1; then
+  _EXT_CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ' || true)
+  _EXT_SM=$(printf '%s' "$_EXT_CC" | tr -d '.')
+fi
+if [ -n "$_EXT_SM" ]; then
+  # Anything a hand-written nest can put in these slots reads as "nothing
+  # recorded": a shape we cannot read must not stop a rebuild that would work.
+  _EXT_MISSING=$(jq -r --arg sm "$_EXT_SM" '
+    [ ((.gpu | if type == "object" then . else {} end)
+       | (.node_native_archs, .package_native_archs)
+       | if type == "array" then .[] else empty end
+       | select(type == "object")) ]
+    | map({ n: (((.code_dep // "") | tostring | select(length > 0))
+                // ((.package // "") | tostring | select(length > 0)) // "?"),
+            s: ([ (.sm_list // []) | if type == "array" then .[] else empty end
+                  | tostring | ascii_downcase | select(startswith("sm_"))
+                  | gsub("[^0-9]"; "") | select(length > 0) | tonumber ] | unique) })
+    | map(select((.s | length) > 0 and (.s | index($sm | tonumber)) == null))
+    | .[] | .n + " (built for " + (.s | map(tostring) | join(", ")) + ")"' \
+    "$MANIFEST" 2>/dev/null || true)
+  if [ -n "$_EXT_MISSING" ]; then
+    _EXT_N=$(printf '%s\n' "$_EXT_MISSING" | wc -l | tr -d ' ')
+    warn "$_EXT_N compiled extension(s) in this nest were not built for this GPU (compute $_EXT_CC, sm_$_EXT_SM): $(printf '%s' "$_EXT_MISSING" | paste -sd ';' - | sed 's/;/; /g'). Those nodes will be missing once the app starts; everything else still works. Carrying on anyway."
+  fi
+fi
+# END extension-archs
+
+
+# ---- 4c. The one CPU instruction set the app cannot start without ------------
+# Measured 2026-08-21 on a rented machine: a CPU without avx2 kills the app with
+# "Illegal instruction" the moment it starts -- torch and kornia are built with it.
+# This script never refuses, but staying silent here costs the whole download
+# before anything says why. Unreadable flags say nothing: inventing a failure is
+# worse than missing one.
+cpu_lacks_avx2() {
+  local text; text=$(cat)
+  case "$text" in *flags*|*Flags*) : ;; *) return 1 ;; esac
+  case " $text " in *" avx2 "*) return 1 ;; *) return 0 ;; esac
+}
+if [ -r /proc/cpuinfo ] && cpu_lacks_avx2 < /proc/cpuinfo; then
+  warn "This machine's CPU does not have avx2, and torch and kornia are built with it — the app will stop with 'Illegal instruction' the moment it starts."
+  warn "  Rent a machine whose CPU has avx2 (anything from about 2015 on). Carrying on anyway."
+fi
+
+# ---- 4d. Which chip family this nest was packed for (format 2.3 on) ----------
+# Sibling of the check above and it sits here for the same reason: the whole
+# download happens before the dependency step, so silence here costs tens of GB
+# and then an error that never mentions the chip. Python packages are built one per
+# chip family, so a nest packed on Intel has no build that installs on ARM -- the
+# agent side calls that a hard stop; this leg only ever tells you. Same two families
+# and the same spellings as the agent side, so they cannot disagree about this
+# machine. No field (nests older than 2.3) or a name neither of us knows = say nothing.
+# BEGIN chip-family-check -- the parity test runs exactly these lines, so they cannot drift
+_arch_family() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    x86_64|amd64|x86|i386|i486|i586|i686) printf 'Intel/AMD' ;;
+    aarch64|arm64|armv8l|armv7l)          printf 'ARM' ;;
+    *)                                    printf '' ;;
+  esac
+}
+WANT_ARCH=$(jq -r '.fingerprint.os.machine // empty' "$MANIFEST")
+if [ -n "$WANT_ARCH" ]; then
+  _WANT_FAM=$(_arch_family "$WANT_ARCH")
+  _HAVE_FAM=$(_arch_family "$(uname -m 2>/dev/null || printf '')")
+  if [ -n "$_WANT_FAM" ] && [ -n "$_HAVE_FAM" ] && [ "$_WANT_FAM" != "$_HAVE_FAM" ]; then
+    warn "This nest was packed on an $_WANT_FAM machine and this one is $_HAVE_FAM. Python packages are built one per chip family, so the exact versions this nest pins have no build that installs here — the dependency step will fail, and its message will not mention the chip."
+    warn "  Use an $_WANT_FAM machine, or pack a fresh nest on this one. Every file is still restored and still checked byte for byte either way. Carrying on anyway."
+  fi
+fi
+# END chip-family-check
+
 STAGE="S1-fetch"
 # ---- Presigned file list (optional) -----------------------------------------
 if [ -n "$BLOB_MANIFEST" ]; then
@@ -550,7 +693,14 @@ fetch_blob() {
     if [ -f "$twin" ] && [ "$twin" != "$dest" ]; then
       cp "$twin" "$dest" || die FETCH-BLOB "Could not copy $twin to $dest"
       got=$(sha256_of "$dest")
-      [ "$got" = "$h" ] || die HASH-MISMATCH "Copying $twin to $dest did not produce the same bytes (expected $h, got $got)."
+      if [ "$got" != "$h" ]; then
+        # The twin was byte-checked when it landed, so getting here means it went bad
+        # on disk afterwards. Drop the note pointing at it along with the bad copy:
+        # keeping the note makes every later run copy the same rotten bytes and stop
+        # here again, while downloading it fresh would have worked.
+        rm -f "$SEEN_BLOBS/$h" "$dest"
+        die HASH-MISMATCH "Copying $twin to $dest did not produce the same bytes (expected $h, got $got). $twin has gone bad on disk since it was checked. The bad copy and the note pointing at it have been cleared, so running this again downloads the file fresh."
+      fi
       log "  ${prefix}same bytes as $(basename "$twin") — copied instead of downloading again"
       return 0
     fi
@@ -590,7 +740,17 @@ fetch_blob() {
     esac
   fi
   got=$(sha256_of "$tmp")
-  [ "$got" = "$h" ] || die HASH-MISMATCH "$dest does not match what the nest says it should be (expected $h, got $got). The download was damaged, or the source was tampered with."
+  if [ "$got" != "$h" ]; then
+    # Clear the bad bytes before stopping. `-C -` above resumes into this file, so
+    # leaving it makes every later run fail the same way for ever: measured, a
+    # full-size wrong file makes curl ask for a range past the end, read the 416 as
+    # "already complete", exit 0 and change nothing; a short wrong prefix gets the
+    # real tail appended and comes out the right size and still wrong.
+    # A transfer cut short is the opposite case and is kept on purpose: curl fails
+    # there, we stop above, and the genuine prefix is what the next run resumes.
+    rm -f "$tmp"
+    die HASH-MISMATCH "$dest does not match what the nest says it should be (expected $h, got $got). The download was damaged, or the source was tampered with. That copy has been deleted, so running this again fetches the file fresh."
+  fi
   mv "$tmp" "$dest"
   # Remember where these bytes landed, so a second path referring to the same sha256
   # copies from here instead of paying for the download twice.
@@ -654,8 +814,18 @@ if [ -n "$WANT_LIBC" ]; then
 fi
 # END libc-check
 
+# BEGIN machine-libs -- the parity test runs exactly these lines, so they cannot drift
 NL_METHOD=$(jq -r '.runtime.native_libs.method // empty' "$MANIFEST")
-if [ -n "$NL_METHOD" ]; then
+# The names in a nest are Linux shared-object names looked up in Linux library
+# folders. Ask that on macOS and every single one reads as missing, so a machine
+# short of nothing is handed a full list of things it lacks -- and a warning that
+# is always wrong is how people learn to skip the real one. Only a system that
+# says outright it is not Linux silences this; unreadable still gets checked,
+# because losing a true warning costs more than an unnecessary look.
+NL_OS=$(uname -s 2>/dev/null || printf '')
+if [ -n "$NL_METHOD" ] && [ -n "$NL_OS" ] && [ "$NL_OS" != Linux ]; then
+  log "Machine libraries not checked here: this nest names Linux library files and this machine runs $NL_OS. Nothing is claimed either way."
+elif [ -n "$NL_METHOD" ]; then
   NL_MISSING=""
   for _lib in $(jq -r '.runtime.native_libs.names[]?' "$MANIFEST"); do
     _found=0
@@ -688,10 +858,12 @@ if [ -n "$NL_METHOD" ]; then
     log "  This list was read off the installed packages rather than off the working run, so it names libraries that may never be used. Carrying on; come back to this only if something fails to load later."
   fi
 fi
+# END machine-libs
 
 # ---- 4. Put the source code back --------------------------------------------
 STAGE="S2-place"
 log "Restoring source code…"
+_HOLLOW=""       # code folders whose archive held nothing; said again at the end
 while read -r dep; do
   name=$(jq -r '.name' <<<"$dep")
   path="$TARGET/$(jq -r '.install_path' <<<"$dep")"
@@ -700,7 +872,18 @@ while read -r dep; do
   log "  $name @ ${commit:0:8}"
   fetch_blob "$h" "$TARGET/.renest/archives/$name.tar.gz"
   mkdir -p "$path"
+  # BEGIN code-dep-unpack -- the parity test runs exactly these lines, so they cannot drift
   tar -xzf "$TARGET/.renest/archives/$name.tar.gz" -C "$path" --strip-components=1
+  # Nothing landed = that folder was a symlink when it was packed: tar stored the link
+  # and not the tree, and stripping the top level leaves no member at all. The archive
+  # still matches the nest byte for byte, so every check below stays green over an empty
+  # folder. The agent side refuses such a nest outright; this leg only ever tells you.
+  if [ -z "$(ls -A "$path" 2>/dev/null)" ]; then
+    _HOLLOW="$_HOLLOW $name"
+    warn "$name arrived empty. Its archive matches this nest byte for byte, but there is nothing inside it to unpack — that happens when that folder was a symlink on the machine it was packed from."
+    warn "  Nothing is wrong on this machine and running this again will not help: whoever packed it has to replace the link with the real folder and pack again. Carrying on — everything else is still restored and still checked byte for byte."
+  fi
+  # END code-dep-unpack
   post=$(jq -r '.post_install // empty' <<<"$dep")
   # The escape hatch tells you, it does not stop you (that is the whole promise).
   # But "does not stop you" is not "does not tell you": this is a plain command
@@ -709,7 +892,14 @@ while read -r dep; do
   if [ -n "$post" ]; then
     warn "$name brought setup commands. Running them now — they run as you, on this machine:"
     printf '    %s\n' "$post" >&2
-    ( cd "$path" && bash -c "$post" )
+    # Report and carry on. Bare, `set -e` ended the run here with the command's own
+    # exit code and nothing else, and the byte check never ran — so whoever hit this
+    # never learnt whether their files arrived intact. Stopping is wrong anyway: this
+    # script promises bytes, not a working app, and opening a nest for the models is fair.
+    # BEGIN dep-post-install-run -- the parity test runs exactly these lines, so they cannot drift
+    ( cd "$path" && bash -c "$post" ) \
+      || warn "$name's setup commands failed (exit $?) — carrying on. They came from whoever packed this nest and ran as you, in $path. Every file is still restored and still checked byte for byte; what may be missing is whatever those commands were meant to set up."
+    # END dep-post-install-run
   fi
 done < <(jq -c '.code_deps[]' "$MANIFEST")
 
@@ -721,6 +911,12 @@ log "Rebuilding the Python environment…"
 # (Real-machine proof 2026-07-26: this script once tried to download
 #  blobs/sha256/nu/null. The escape hatch informs, it never refuses.)
 LOCK_H=$(jq -r '.python_lock.lockfile.sha256 // empty' "$MANIFEST")
+# Which Python to build with. Packing drops this line when it cannot find the
+# interpreter, so nests without it are real. Read as "" rather than the word "null":
+# bare, `uv venv --python null` failed here and the run stopped **before a single
+# model was placed** -- the files come after this section. Same reason as the lockfile
+# line above: skip what cannot be done, and still get every byte back.
+PYVER=$(jq -r '.runtime.python_version // empty' "$MANIFEST")
 T_DEPS_START=$(date +%s)
 if [ -z "$LOCK_H" ]; then
   warn "This nest carries no python_lock (no dependency lockfile was captured at pack time) — skipping the environment rebuild; dependencies are up to the current machine."
@@ -735,6 +931,11 @@ fetch_blob "$LOCK_H" "$TARGET/.renest/requirements.lock"
 LOCK_LANDING=$(jq -r '.python_lock.lockfile_path // "requirements.lock"' "$MANIFEST")
 mkdir -p "$(dirname "$TARGET/$LOCK_LANDING")"
 cp "$TARGET/.renest/requirements.lock" "$TARGET/$LOCK_LANDING"
+if [ -z "$PYVER" ]; then
+  # The lockfile is down and byte-checked by now; only the environment is out of reach.
+  warn "This nest does not say which Python version it needs, so the environment cannot be built from it — skipping that step. Every file is still restored and still checked byte for byte, and the dependency list is back in place."
+  warn "  That happens when it was packed from a setup where the interpreter could not be found. Pack it again from that machine with --env-python pointing at the interpreter the app starts with, or build the environment yourself from $TARGET/$LOCK_LANDING."
+else
 # ---- Which servers may we install from? -------------------------------------
 # Whoever packed this nest wrote the lockfile, and uv installs whatever it points
 # at — which means running their code on this machine, with access to everything
@@ -753,7 +954,7 @@ EXTRA_HOSTS=$(printf '%s' "${RENEST_TRUSTED_HOSTS:-}" | tr ';,' '\n\n' | tr -d '
 #   A consistency test (oss/tests/consistency/test_trusted_hosts_snapshot.py)
 #   fails the moment one side is edited without the other.
 TRUSTED_HOSTS_SNAPSHOT="
-pypi.org files.pythonhosted.org download.pytorch.org download-r2.pytorch.org download-r2.pytorch.org
+pypi.org files.pythonhosted.org download.pytorch.org download-r2.pytorch.org
 pypi.nvidia.com pypi.ngc.nvidia.com data.pyg.org
 developer.download.nvidia.com developer.download.nvidia.cn developer.nvidia.cn
 github.com codeload.github.com objects.githubusercontent.com
@@ -855,7 +1056,6 @@ $(printf '%s\n' "$UNSAFE_URLS" | head -5 | sed -e 's/?.*//' -e 's/^/       /')
            exactly this step, and the restore looks normal the whole time."
   fi
 fi
-PYVER=$(jq -r '.runtime.python_version' "$MANIFEST")
 # Re-running has to be safe: anyone who hits a failure will try again. uv fails
 # hard when the directory exists but is not a venv, and --clear does not save it,
 # so remove it first. Only the .venv this script created — nothing else.
@@ -918,6 +1118,7 @@ while [ "$_i" -lt "$_N_CM" ]; do
     warn "The copy of $_MOD installed here is not the one your working setup used; $_WIN was reinstalled and now writes last, but its $_REL is a different build from the one your working setup had. Carrying on: anything that imports $_MOD may behave differently from the run that worked."
   fi
 done
+fi
 fi
 T_DEPS_END=$(date +%s)
 
@@ -1015,7 +1216,14 @@ POST=$(jq -r '.post_install // empty' "$MANIFEST")
 if [ -n "$POST" ]; then
   warn "This nest brought setup commands. Running them now — they run as you, on this machine:"
   printf '    %s\n' "$POST" >&2
-  bash -c "$POST"
+  # Run them where the nest landed: the agent side uses the target as its working
+  # directory and the per-dependency commands above cd into their own folder, while
+  # this one used to run wherever the user happened to be standing — so a hand-written
+  # relative path did different things depending on which leg you took.
+  # BEGIN post-install-run -- the parity test runs exactly these lines, so they cannot drift
+  ( cd "$TARGET" && bash -c "$POST" ) \
+    || warn "This nest's setup commands failed (exit $?) — carrying on. They came from whoever packed this nest and ran as you, in $TARGET. Every file is still restored and still checked byte for byte; what may be missing is whatever those commands were meant to set up."
+  # END post-install-run
 fi
 
 # ---- 8. Check every file, byte for byte -------------------------------------
@@ -1049,15 +1257,66 @@ cat > "$TARGET/.renest/restore-metrics.json" <<JSON
 }
 JSON
 
+# Your own material never travels in a nest -- the format lists it and deliberately
+# does not carry it. Nobody used to say so, so the first run after a rebuild failed
+# looking for a file the user still had at home, with nothing here explaining why.
+# Read line by line, not word by word: these are the user's own file names, so
+# "my holiday photo.png" is the normal case, and splitting on spaces tested the
+# wrong paths and printed names that never existed. One line per entry, root and
+# path split on a tab. Each entry is looked for under its own landing root: an
+# input listed against a model cache used to be called missing while it sat there.
+# BEGIN your-own-material -- the parity test runs exactly these lines, so they cannot drift
+_YOURS=""
+while IFS=$'\t' read -r _root _p; do
+  _full="$(root_dir "$_root")/$_p"
+  if [ -n "$_p" ] && [ ! -e "$_full" ]; then
+    _YOURS="$_YOURS
+    $_full"
+  fi
+done < <(jq -r '(.files // [])[] | select(.kind == "input_asset")
+                | select(.path | type == "string")
+                | (((.root // "env") | tostring) + "\t" + .path)' "$MANIFEST")
+# END your-own-material
+if [ -n "$_YOURS" ]; then
+  warn "This workflow uses material of your own, which a nest lists but never carries:$_YOURS"
+  warn "  Put each file back at the path listed above before the first run, or the app will stop looking for it."
+fi
+
 rm -f "$FAILFILE"
 log "✅ Done. Every file checked, byte for byte. Your setup is back."
 log "   Moving files ${XFER_SECS}s / dependencies $((T_DEPS_END - T_DEPS_START))s / checking $((T_VERIFY_END - T_VERIFY_START))s"
-if [ "$HOME_FILES" -gt 0 ]; then
-  log "   Everything is under $TARGET, apart from $HOME_FILES model-cache files in $HF_HOME_ROOT"
+# The two cache roots are separate folders and the machine's own settings decide
+# where each one sits, so counting them as one lot and naming a single folder sent
+# people to a directory their files were never in -- and to the wrong one to clear
+# when the disk filled up. Name each root that actually received something.
+# BEGIN cache-landing -- the landing test runs exactly these lines, so they cannot drift
+_LANDED=""
+_N_HUB=$(jq '[.files[]? | select((.root // "env") == "hf_hub")] | length' "$MANIFEST")
+_N_HOME=$(jq '[.files[]? | select((.root // "env") == "hf_home")] | length' "$MANIFEST")
+if [ "$_N_HUB" -gt 0 ]; then
+  _LANDED="$_LANDED, $_N_HUB model-cache file(s) in $(root_dir hf_hub)"
+fi
+if [ "$_N_HOME" -gt 0 ]; then
+  _LANDED="$_LANDED, $_N_HOME settings file(s) in $(root_dir hf_home)"
+fi
+if [ -n "$_LANDED" ]; then
+  log "   Everything is under $TARGET, apart from${_LANDED#,}"
 else
   log "   Everything is under $TARGET"
 fi
+# END cache-landing
 log "   Python environment: $TARGET/.venv"
+# uv never travels in a nest: uv itself, the Pythons it downloads and its package
+# cache all land outside TARGET and are shared with every other rebuild on this
+# machine. Say where, so "everything is under TARGET" is not read as "this is all
+# that landed" -- and so the disk it filled up can be found. Read from uv's own
+# variables rather than the usual defaults, or the line names the wrong place.
+# BEGIN toolchain-landing -- the parity test runs exactly these lines, so they cannot drift
+_UV_BIN="$(command -v uv 2>/dev/null || echo "$HOME/.local/bin/uv")"
+_UV_PY="${UV_PYTHON_INSTALL_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/uv/python}"
+_UV_CACHE="${UV_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/uv}"
+log "   What is yours is under $TARGET. The toolchain is not part of this nest and is shared with every other rebuild on this machine: uv $_UV_BIN, the Pythons uv downloads $_UV_PY, uv's package cache $_UV_CACHE."
+# END toolchain-landing
 # Said once already, before the download -- and by now that is a big nest, half an
 # hour and a thousand progress lines ago, with a clean "Done" as the last thing on
 # screen. Measured 2026-08-12: three restores on a machine short of one library came
@@ -1068,4 +1327,11 @@ if [ -n "${NL_SHORT:-}" ]; then
   warn "Read this before you call it done: every byte is back, but this machine is missing the library file(s) the working run used:$NL_SHORT"
   warn "   Until they are here, parts of this environment load as nothing. It will start and answer, and your own workflow is what will fail."
   [ -n "$WANT_REF" ] && warn "   Surest fix: start again from the image this was packed on ($WANT_REF) -- it brings all of them at once."
+fi
+# Same reason as the block above: this was said before the download, and by now that is
+# a big nest and a thousand progress lines ago. "Your setup is back" must not be the last
+# word on screen while a code folder sits there empty.
+if [ -n "${_HOLLOW:-}" ]; then
+  warn "Read this before you call it done: these code folder(s) arrived empty:$_HOLLOW"
+  warn "   Their archives match this nest byte for byte and hold nothing to unpack. Nothing on this machine can fix that — whoever packed it has to replace the symlink with the real folder and pack again."
 fi

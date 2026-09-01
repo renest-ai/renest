@@ -47,6 +47,11 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("an AWS access key id", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("a GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}")),
     ("a Slack token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}")),
+    # Our own account token. The ``rnt_``/``rna_`` prefix exists so scanners can spot
+    # it, and two other scanners in this project already do -- this one, the only
+    # scanner that protects the person packing, did not. A nest gets handed to someone
+    # else, so this token travelling inside one gives the recipient the sender's drive.
+    ("a Renest account token", re.compile(r"\brn[ta]_[A-Za-z0-9_-]{32,}")),
     ("a private key file", re.compile(r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----")),
     # Cloud video/image services hand out signed tokens in this shape. Added as a shape
     # (three base64url parts, fixed header prefix) rather than per vendor: a new hosted
@@ -87,11 +92,47 @@ def _is_probably_text(head: bytes) -> bool:
     return b"\x00" not in head
 
 
+def _read_text_to_scan(path: Path) -> str | None:
+    """The file's text, or ``None`` when it is too big, binary, or unreadable.
+
+    The head is read first and the rest only if the head looks like text. The
+    order matters once whole node folders are in scope: measured 2026-08-30 on a
+    real ComfyUI tree, node packs ship demo .jpg/.png/.mp4 next to their code, and
+    reading each one whole before throwing it away for containing a NUL byte cost
+    195 MiB of reads per pack against 18 MiB this way -- for exactly the same
+    findings.
+    """
+    try:
+        if path.stat().st_size > _MAX_BYTES:
+            return None
+        with path.open("rb") as f:
+            head = f.read(4096)
+            if not _is_probably_text(head):
+                return None
+            raw = head + f.read()
+    except OSError:
+        return None
+    return raw.decode("utf-8", errors="replace")
+
+
+def _excluded(rel: Path, exclude: frozenset[str]) -> bool:
+    """Is this path inside one of the excluded subtrees?
+
+    Matched as a whole path anchored at the tree root, the same way the archive's
+    own ``code_deps[].exclude`` is anchored, so ``custom_nodes/foo`` means that one
+    node folder and not everything under ``custom_nodes/``.
+    """
+    r = rel.as_posix()
+    return any(r == e or r.startswith(e + "/") for e in exclude)
+
+
 def scan_tree(src_dir: Path, *, exclude: frozenset[str] = frozenset()) -> tuple[list[SecretHit], list[str]]:
     """Scan a directory tree. Returns ``(hard-stop hits, suspicious filenames)``.
 
-    ``exclude`` names subdirectories, relative to ``src_dir``, that count as a
-    code_dep of their own -- skipping them avoids scanning the same bytes twice.
+    ``exclude`` holds subtree paths relative to ``src_dir`` -- whole anchored
+    paths, not bare top-level names. They are the subtrees that count as a
+    code_dep of their own, so skipping them avoids scanning the same bytes twice.
+    Anything the caller does not list stays in scope, whatever it sits next to.
     """
     hits: list[SecretHit] = []
     suspicious: list[str] = []
@@ -99,23 +140,14 @@ def scan_tree(src_dir: Path, *, exclude: frozenset[str] = frozenset()) -> tuple[
         return hits, suspicious
     for p in sorted(src_dir.rglob("*")):
         rel = p.relative_to(src_dir)
-        if _SKIP_DIRS.intersection(rel.parts) or (rel.parts and rel.parts[0] in exclude):
+        if _SKIP_DIRS.intersection(rel.parts) or _excluded(rel, exclude):
             continue
         if not p.is_file() or p.is_symlink():
             continue
         if p.name in SUSPICIOUS_NAMES:
             suspicious.append(str(rel))
-        try:
-            if p.stat().st_size > _MAX_BYTES:
-                continue
-            raw = p.read_bytes()
-        except OSError:
-            continue
-        if not _is_probably_text(raw[:4096]):
-            continue
-        try:
-            text = raw.decode("utf-8", errors="replace")
-        except Exception:  # pragma: no cover - decode with replace does not raise
+        text = _read_text_to_scan(p)
+        if text is None:
             continue
         for lineno, line in enumerate(text.splitlines(), 1):
             for what, pat in _PATTERNS:
@@ -132,15 +164,9 @@ def scan_file(path: Path, *, label: str = "") -> list[SecretHit]:
     training recipe is ordinary practice."""
     if not path.is_file() or path.is_symlink():
         return []
-    try:
-        if path.stat().st_size > _MAX_BYTES:
-            return []
-        raw = path.read_bytes()
-    except OSError:
+    text = _read_text_to_scan(path)
+    if text is None:
         return []
-    if not _is_probably_text(raw[:4096]):
-        return []
-    text = raw.decode("utf-8", errors="replace")
     out: list[SecretHit] = []
     name = label or path.name
     for lineno, line in enumerate(text.splitlines(), 1):

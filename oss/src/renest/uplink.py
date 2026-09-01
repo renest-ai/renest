@@ -31,7 +31,29 @@ __all__ = [
     "scrub_events",
     "machine_facts",
     "disclosure",
+    "USER_AGENT",
 ]
+
+
+def _user_agent() -> str:
+    """What every request to our own service calls itself.
+
+    Anything sent with :mod:`urllib.request` **must** set this. Left unset, urllib
+    signs itself ``Python-urllib/3.x``, and the edge in front of our API answers that
+    signature with 403 before the request reaches the server -- so the send fails,
+    every caller here swallows failures by design, and the whole channel is silently
+    dead. Measured 2026-08-29 against the live API: unset 403, any other name 200.
+
+    Name and version only, no address: a service address in a module that is not the
+    one place allowed to hold it is how a sign-up pitch gets in, and a guard exists to
+    stop that. The name alone already says who is calling.
+    """
+    from . import __version__
+
+    return f"renest/{__version__}"
+
+
+USER_AGENT = _user_agent()
 
 # --------------------------------------------------------------------------
 # Value shapes (the whitelist lets only these through; anything else is dropped)
@@ -262,6 +284,43 @@ _CLOUD_MARKERS = {
     "PAPERSPACE_CLUSTER_ID": "paperspace",
 }
 
+#: What ``vram_gb`` says when nothing on this machine could report a number. A dropped
+#: field looks exactly like "that card has no video memory", which is another machine.
+_VRAM_UNREADABLE = "unreadable"
+
+#: Total video memory of the first GPU, in bytes. Asked of torch only when the driver tool
+#: did not answer with a number.
+_VRAM_PROBE_SRC = "import torch;print(int(torch.cuda.get_device_properties(0).total_memory))"
+
+
+def _vram_gb_from_torch(timeout: float = 10) -> float | None:
+    """How much video memory the first GPU has, per torch. ``None`` when it cannot say.
+
+    Run out of process on purpose: importing torch in here would cost seconds on
+    every run and leave a CUDA context inside the tool. A second small probe rather
+    than the one in ``fingerprint`` -- see the note in :func:`machine_facts` about
+    not sharing collectors. Never raises: a machine without torch is ordinary.
+    """
+    import subprocess
+    import sys
+
+    try:
+        proc = subprocess.run(  # noqa: S603 - fixed program, this interpreter
+            [sys.executable, "-c", _VRAM_PROBE_SRC],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        total = int(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+    return round(total / 2**30, 1) if total > 0 else None
+
 
 def machine_facts(target: str | os.PathLike[str] | None = None) -> dict[str, Any]:
     """Collect the facts about this machine -- **only** the entries in
@@ -278,8 +337,9 @@ def machine_facts(target: str | os.PathLike[str] | None = None) -> dict[str, Any
 
     **No hostname, user name, IP or network address** (a hostname is very often a person's
     name) and **no speed test** (tens of seconds, and the uplink does not get to slow a
-    restore down). Whatever cannot be collected is left out, and **no exception may
-    escape this function**.
+    restore down). Whatever cannot be collected is left out -- except video memory, which
+    says so instead, because a missing number there reads as a card without any. **No
+    exception may escape this function.**
     """
     import platform
 
@@ -313,7 +373,12 @@ def machine_facts(target: str | os.PathLike[str] | None = None) -> dict[str, Any
             try:
                 facts["vram_gb"] = round(float(parts[2]) / 1024, 1)
             except ValueError:
-                pass
+                # The driver tool prints "[N/A]" on a machine that shares memory with
+                # the system (measured 2026-08-11), and a newer driver prints an English
+                # sentence. Losing the field here reads as "no video memory", so ask
+                # torch, and when torch cannot answer either, say so in the field.
+                gib = _vram_gb_from_torch()
+                facts["vram_gb"] = gib if gib is not None else _VRAM_UNREADABLE
             if parts[3]:
                 facts["driver"] = parts[3]
     except Exception:  # noqa: BLE001 - no GPU and no driver are both normal cases

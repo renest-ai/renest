@@ -16,7 +16,7 @@
 
 | Component | Version | Status | Document |
 |---|---|---|---|
-| manifest format | 2.3 | **frozen** | [`manifest.md`](manifest.md) + [`manifest.schema.json`](manifest.schema.json) |
+| manifest format | 2.9 | **current** | [`manifest.md`](manifest.md) + [`manifest.schema.json`](manifest.schema.json) |
 | exit codes / `error_class` | — | frozen baseline | [`restore-protocol.md`](restore-protocol.md) |
 
 Every document here has a Chinese twin alongside it, named `*.cn.md`. The plain
@@ -31,7 +31,7 @@ the English one is authoritative.
    in `manifest.md`. The two are maintained in the same change.
 2. **[`restore-protocol.md`](restore-protocol.md)** — the **only authority** for
    the exit-code table and the `error_class` vocabulary. Pre-gate codes 0/2/3,
-   the S0 pre-flight (60–66), and the five stage gates S1..S5 (10–59), each with
+   the S0 pre-flight (60–67), and the five stage gates S1..S5 (10–59), each with
    its name, whether it is retryable, who may produce it, and what it means;
    plus the one-line `RESTORE_FAIL` / `RESTORE_NOTICE` contract. The
    authoritative implementation is `../src/renest/errors.py`, and the two are
@@ -49,6 +49,13 @@ the English one is authoritative.
    **Do not model a new nest on it.**
 4. **[`conformance/`](conformance/)** — golden (must pass) and invalid (must
    fail) fixtures; see that directory's README.
+5. **[`escape-hatch-versions.md`](escape-hatch-versions.md)** — every version of
+   `restore.sh` there has ever been, listed by the sha256 of the script itself,
+   with the nest format it was written for and the issues found in it later.
+   From format 2.3 on a copy of the script travels inside every nest at
+   `.renest/escape/restore.sh` and is frozen there, so this table is the only way
+   to tell which copy you are holding. Machine-readable twin:
+   [`escape-hatch-versions.json`](escape-hatch-versions.json).
 
 ## Layout
 
@@ -59,6 +66,8 @@ specs/
 ├── manifest.schema.json        # manifest JSON Schema (authoritative for shape)
 ├── restore-protocol.md         # exit codes and error_class, the one authority
 ├── serve-api.md                # the local HTTP surface
+├── escape-hatch-versions.md    # every restore.sh there has been, by sha256
+├── escape-hatch-versions.json  # the same table, machine-readable
 ├── examples/                   # verified nest and pack-spec samples
 └── conformance/                # golden and invalid fixtures
     ├── golden/

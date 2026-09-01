@@ -1,4 +1,4 @@
-# manifest v2.8 · Nest manifest specification
+# manifest v2.9 · Nest manifest specification
 
 <!-- Version tripwire: the line "current version **x.y**" below is parsed by
      oss/tests/consistency/test_format_version_pinned.py and must agree with
@@ -6,11 +6,11 @@
      top line of the change log. This is the fifth place the version appears --
      the prose is not allowed to drift from the other four. -->
 
-> Status: **current version 2.8** (2026-08-17). Any field change is a format
+> Status: **current version 2.9** (2026-08-30). Any field change is a format
 > change: bump the version and update `manifest.schema.json`, `restore.sh` and
 > `renest lint` in the same change.
 >
-> **Readable versions**: `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8`, plus **any future minor
+> **Readable versions**: `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9`, plus **any future minor
 > version of the same major** (a reader meeting a newer minor number warns and
 > continues; it does not reject the nest -- see §2).
 > **1.x is refused outright** (a one-time clean break taken while there were no
@@ -69,7 +69,7 @@ have restored perfectly into a brick.
 
 | Field | Required | Type | One line |
 |---|---|---|---|
-| `format_version` | ✔ | enum `2.0` … `2.8` | Format version (the schema enum is the only source of truth) |
+| `format_version` | ✔ | enum `2.0` … `2.9` | Format version (the schema enum is the only source of truth) |
 | `id` | ✔ | string (ULID) | Nest identifier, 26-character Crockford base32 |
 | `created_at` | ✔ | date-time | When it was packed |
 | `name` | | string ≤120 | Human-chosen name |
@@ -112,7 +112,7 @@ of truth.
 
 ## 2. Identity and metadata
 
-### `format_version` — enum `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` `[schema]`
+### `format_version` — enum `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` `[schema]`
 
 **The `enum` in the schema is the only source of truth.** Everywhere else,
 including this document, is a restatement. Changing the version means changing
@@ -236,7 +236,11 @@ C library alone** -- one machine reported 690 acceptable tags, and the C library
 is only one of the things shaping that list. **Advisory only: warn, never
 refuse.**
 
-**`native_libs` (2.6)** -- `{ "method": "loaded" | "declared", "names": [...] }`.
+**`native_libs` (2.6; `packages` / `packages_from` added in 2.9)** -- `{ "method": "loaded" | "declared", "names": [...], "packages": {name: package}, "packages_from": "ubuntu 22.04" }`.
+
+**`packages` / `packages_from` (2.9)** record which installed package owned each library file **on the machine that packed the nest**, and which distribution named them. They exist so a consumer that finds a library missing can name a real package instead of telling the user to go and look it up. **Recorded, never looked up:** one library name maps to a different package on every distribution (`libGL.so.1` is `libgl1` on Ubuntu, `mesa-libGL` on Fedora, `libglvnd` on Arch) and between releases of one, because the soname carries the version (`libicudata.so.75` comes from `libicu75` on 24.04 and `libicu70` on 22.04) -- a shipped table would go stale on the next release with nobody noticing. Both are optional and **partial by design**: a library whose owner could not be established is left out, because a wrong package name is worse than none. A reader must show `packages_from` next to any install command it suggests -- a package name means nothing without the distribution it came from.
+
+`{ "method": "loaded" | "declared", "names": [...] }`.
 These libraries belong to the machine's distribution, not to the nest, so they
 cannot be packed; a machine missing one restores every byte correctly and still
 loses whole plugins `[measured]`. Three obligations on anyone writing or reading
@@ -443,8 +447,10 @@ recipient -- including yourself six months later -- **could not tell whether the
 code in a nest was complete or had been cut down**: same repository, same commit,
 one directory missing, and nothing in the manifest looks wrong. It carries both
 what the pack spec asked to leave out and **what packing decided to drop by
-itself** (compiled `.so` files it expects to be rebuilt, and `build/`), because
-the recipient's question is about the archive, not about who chose.
+itself** (compiled `.so` files it expects to be rebuilt, `build/`, and assets named
+in `files[]` that sit inside the folder -- each of those travels as its own file,
+so a copy here would be the same bytes twice), because the recipient's question
+is about the archive, not about who chose.
 
 **This is disclosure, not an instruction.** A reader unpacks the archive as it
 is; nothing here is replayed. Entries mean what they mean in the pack spec:
@@ -538,8 +544,12 @@ fail or fabricate. From 2.3, in order:
 | Case | Situation | What to do |
 |---|---|---|
 | ① | A lockfile exists | Archive it as-is |
-| ② | No lockfile, but **the interpreter that runs this environment can be found** | **Ask it for the installed package list** (reading a fact, not guessing); archive that and state the source in the report |
-| ③ | Not even the interpreter can be found | **Leave the field empty and warn.** Do not invent |
+| ② | No lockfile, but **the interpreter that runs this environment can be found and can be run here** | **Ask it for the installed package list** (reading a fact, not guessing); archive that and state the source in the report |
+| ③ | The interpreter is there but **cannot be run on this machine** (an all-in-one bundle built for another operating system) | **Read the installed packages' own metadata off disk**; archive that, and state in the report both where it came from and what it cannot carry -- no package hashes, no original index URLs, and anything installed from a source folder cannot be expressed this way at all |
+| ④ | Not even that | **Leave the field empty and warn.** Do not invent |
+
+Cases ② and ③ both produce a list rather than a file that ever sat on disk, so
+both leave `lockfile_path` out rather than name a path that never existed.
 
 A nest with this empty **cannot rebuild its Python environment**. That is its own
 honest labelling, not a defect: `renest lint` warns `lockfile-missing`, and the
@@ -968,12 +978,13 @@ differently named files with identical contents are the same block of content.
 **A restore path should deduplicate by content: fetch once, land in every
 place.**
 
-> **This is a "should", not a "must", and today's implementations do not do it**
-> -- stated plainly so nobody assumes otherwise. Both legs currently **download
-> repeatedly**: a model referenced N times is fetched N times. A 20 GB model
-> referenced twice costs twice the time and twice the traffic.
-> **This version writes the "should" into the specification; the implementation
-> follows later.**
+> **Both legs do this now.** When 2.3 wrote the "should" neither of them did,
+> and this note said so in as many words; leaving that sentence standing after the
+> work landed would have told every reader the opposite of the truth. Today the
+> escape hatch notes where each sha256 landed and copies from there, and the agent
+> side fetches one sha256 once and lands the rest from the first copy. Either way
+> the copy is checked against the same sha256, and a copy that does not match is a
+> failure **at that moment** rather than a puzzle three stages later.
 
 **Landing during deduplication is governed by §5.2**: the second and subsequent
 places use hard links or real copies, **never symlinks**.
@@ -1012,6 +1023,16 @@ has two layers --
 > **A nest someone gave you**: use your own copy. If you really want to use
 > theirs, **check the content hash first** -- it is recorded in that same
 > `files[]` entry, so checking is free.
+
+**Where the hash is checked against.** The `files[]` entry only says that the
+bytes in the nest are the bytes whoever packed it recorded -- and on a nest
+someone gave you, that is their word about their own file. The list of every
+`restore.sh` we have ever shipped, by sha256, is published at
+[`escape-hatch-versions.md`](escape-hatch-versions.md) (machine-readable twin:
+`escape-hatch-versions.json`); a hash that is not in that list is not one of
+ours. The same list is how a holder of an old nest finds out which version their
+frozen copy is and what was found wrong with it afterwards -- the script itself
+carries no version field, only the comment at the top of the file.
 
 ## 7. `$defs.blob` — content-addressed file pointer
 
@@ -1210,8 +1231,10 @@ decisions directly:
 **One more note for consumers**: a package may ship **one binary per CUDA
 version** (one library shipped seven), selecting at runtime. So you cannot
 naively intersect every entry of a package -- intersect **the ones that would
-actually be loaded**. This field only records the shape faithfully; consuming it
-belongs to the cross-generation migration work, not to this version.
+actually be loaded**. Both legs read this field before a rebuild and name every
+extension whose targets do not include this card's generation -- a warning on
+either leg, never a refusal: the application still starts, those nodes are the
+part that goes missing.
 
 ## 10. What 2.0 changed (2026-07-26)
 

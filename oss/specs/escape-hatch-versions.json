@@ -1,0 +1,1833 @@
+{
+  "_what_this_is": "Every version of restore.sh, the escape hatch, that has existed in this project, listed by the sha256 of the script itself. From nest format 2.3 on, a copy of the script travels inside every nest at .renest/escape/restore.sh, and that copy is frozen: fixes made later never reach it. This table is how you tell which copy you are holding.",
+  "_how_to_use": "sha256sum .renest/escape/restore.sh inside your nest, then find that hash below. known_issues lists what was wrong with that copy and fixed later.",
+  "_an_empty_issue_list_means": "No issue has been recorded against that version -- not that it is known to have none. Only issues we found and fixed appear here.",
+  "current": "a1aea8967e5c64c2abf0d1a2c5f3bb82414157aed70c00626b5db32e734f0cd8",
+  "known_issues": [
+    {
+      "id": "no-transfer-speed-floor",
+      "fixed_on": "2026-07-25",
+      "summary": "A stalled download was never given up on, so the script could hang indefinitely instead of failing."
+    },
+    {
+      "id": "stale-failure-record",
+      "fixed_on": "2026-07-26",
+      "summary": "A leftover failure record from an earlier run made a fully successful run report itself as failed."
+    },
+    {
+      "id": "git-https-source-refused",
+      "fixed_on": "2026-08-12",
+      "summary": "Dependency sources of the form git+https:// were judged untrusted and refused, so nests using several of the most common extensions could not be rebuilt."
+    },
+    {
+      "id": "nest-own-code-treated-as-remote",
+      "fixed_on": "2026-08-12",
+      "summary": "Code carried inside the nest itself was treated as an outside server, so fine-tuning nests could not be rebuilt at all."
+    },
+    {
+      "id": "missing-library-notice-buried",
+      "fixed_on": "2026-08-12",
+      "summary": "On a machine short of a system library, the closing line saying so was covered up by the Done line above it."
+    },
+    {
+      "id": "no-libc-check",
+      "fixed_on": "2026-08-20",
+      "summary": "The C library version was not checked, so a nest packed on a newer system passed every byte check on an older one and then crashed on first start."
+    },
+    {
+      "id": "presigned-urls-printed",
+      "fixed_on": "2026-08-20",
+      "summary": "Presigned download links were printed in full in the script's own output, including on the success path."
+    },
+    {
+      "id": "failure-output-scrolls-away",
+      "fixed_on": "2026-08-21",
+      "summary": "When a rebuild failed, the output explaining why only flashed past the screen instead of being kept."
+    },
+    {
+      "id": "silent-on-cpu-shortfall",
+      "fixed_on": "2026-08-22",
+      "summary": "Said nothing when the machine's processor lacked instructions the environment needs."
+    },
+    {
+      "id": "silent-on-chip-family-change",
+      "fixed_on": "2026-08-22",
+      "summary": "Said nothing when the target machine was a different processor family than the one the nest was packed on; the failure surfaced only after the whole download."
+    },
+    {
+      "id": "three-hard-edges",
+      "fixed_on": "2026-08-22",
+      "summary": "Three defects at once: wrong bytes were left in place instead of being removed, a failed install command was not reported, and a material file whose name contains a space produced a wrong error."
+    },
+    {
+      "id": "no-word-on-your-own-material",
+      "fixed_on": "2026-08-22",
+      "summary": "After a rebuild it never said which of your own material files you have to put back yourself."
+    },
+    {
+      "id": "false-alarms-off-linux",
+      "fixed_on": "2026-08-23",
+      "summary": "On machines that are not Linux it raised a string of alarms that did not apply."
+    }
+  ],
+  "versions": [
+    {
+      "sha256": "c36e9317b18cc69f4df77f13436bcdd021eb384650740c4afaf46db9d60b738e",
+      "bytes": 7505,
+      "first_seen": "2026-07-09",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-transfer-speed-floor",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "1cdf6972c2ba321a530b8907bf91fff711a5be25fc6311264c8eb6280d0c1e87",
+      "bytes": 13508,
+      "first_seen": "2026-07-14",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-transfer-speed-floor",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "ca219be0e3341bca1e40268afb3f00edc9e4e9d0ce1d85e5b791db2421b4827a",
+      "bytes": 13932,
+      "first_seen": "2026-07-15",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-transfer-speed-floor",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "afcdeb6c655d1d53e4db9d9be7f898677936450eddc5530283d2f6a5359b985f",
+      "bytes": 15840,
+      "first_seen": "2026-07-18",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-transfer-speed-floor",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "40c4dec207ed8af6270f3785620c5a6a636c77c8b0482f7fe8b5bbf634a79ca7",
+      "bytes": 17527,
+      "first_seen": "2026-07-22",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-transfer-speed-floor",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "88aeb513f5d835fbcde1769d1803c5cf208ee07b63fa3dc43bd082ce473e1133",
+      "bytes": 17474,
+      "first_seen": "2026-07-22",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-transfer-speed-floor",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "ca868f50b2505148139bed671f4b408bd2b2cf85cff8cda91fce99c86896d0b1",
+      "bytes": 17637,
+      "first_seen": "2026-07-23",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-transfer-speed-floor",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "1a63749fc9c322bbdca449f90de05130dbc2d75ec22df0e5bb82cfa9e4bc7c78",
+      "bytes": 18195,
+      "first_seen": "2026-07-24",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-transfer-speed-floor",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "f9b33b11f5cb7d5a1251b2da30af51bdc714773787de7307d94da59d41a64361",
+      "bytes": 18345,
+      "first_seen": "2026-07-24",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-transfer-speed-floor",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "1a38512def7aac553c47832220251571a7a1b00f4fe7c49a1da865d55b5afd5e",
+      "bytes": 19740,
+      "first_seen": "2026-07-25",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-transfer-speed-floor",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "98625381ca9c16445e1fb7a931502e03c44ba84bd6c256f4b892068b74a491ab",
+      "bytes": 21532,
+      "first_seen": "2026-07-25",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-transfer-speed-floor",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "a3f0eda352ee73f7e25402151ff57ec34ad0159b8e467d9165068d77ae23ec00",
+      "bytes": 22883,
+      "first_seen": "2026-07-25",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-transfer-speed-floor",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "61951d658efeb6716c3c7f0fc095c4344d1fd3f4d83b076822442b1abb3a6013",
+      "bytes": 23501,
+      "first_seen": "2026-07-25",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-transfer-speed-floor",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "9932297078a5d1da5f0df16e56f1a94cd3bd693b532f53b2d20f6addeb822d1e",
+      "bytes": 23593,
+      "first_seen": "2026-07-25",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-transfer-speed-floor",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "8de40c824aa9698bc30c09ed3bc4a38cf3512c8bd1ef9edc5430e2c92349cbce",
+      "bytes": 23886,
+      "first_seen": "2026-07-25",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-transfer-speed-floor",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "68254214a6ec5c511f3bd32adb111d149107e072ca640fc37aa6496b167747e0",
+      "bytes": 18685,
+      "first_seen": "2026-07-25",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "f9c9608b0b1e38c51898c69f893f931c979022643ef44b4621aa2f0ff0290b38",
+      "bytes": 23987,
+      "first_seen": "2026-07-26",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "0ffa962138f7d90a9763ee54ee2df449f8471cda92a33e25539d77fa17db47a8",
+      "bytes": 24304,
+      "first_seen": "2026-07-26",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "a8055ada840562c0b26f5011f4f273b5ea08cbd6064b8b62178410f9825f341a",
+      "bytes": 19115,
+      "first_seen": "2026-07-26",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "4be9b3b741c4ad9fd65bd987ae77de11b26b1c8b3a5bb69be3fae227d6de5af0",
+      "bytes": 19261,
+      "first_seen": "2026-07-26",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "e3463d8905dd904c649e65dd0936bed16d630823102150745810f6389b76a232",
+      "bytes": 24891,
+      "first_seen": "2026-07-26",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "c41abe918f9bf77e0892be05230a92b51cdf006b311b3b4e55b6a6e1184d1ecf",
+      "bytes": 24983,
+      "first_seen": "2026-07-26",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "4e915293d77a085d6e78cfdf04be02cef7be507d9ea0ee40c853a9757c558aef",
+      "bytes": 24939,
+      "first_seen": "2026-07-26",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "stale-failure-record",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "4345faa45e20e93b0b4f5271b6a25ce24258173f3aa5c1bbb566ef7754b6c32b",
+      "bytes": 19588,
+      "first_seen": "2026-07-26",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "70fb19bd015a2f6cd86b9ca91fb3ee2e24557a9f15e5f402c066604181a564e4",
+      "bytes": 30983,
+      "first_seen": "2026-07-26",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "6b21089a7e9929b3697e5ea0ba4e1d8b59300ac23d54e3c25be72e4e74d79d5f",
+      "bytes": 31800,
+      "first_seen": "2026-07-26",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "2a5dd6e1d013f5705b0e87c835140fb02823f16e8686d68bbc0968429d96aaab",
+      "bytes": 33536,
+      "first_seen": "2026-07-26",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "68d46426bf4148107f1db07c4fa0e99537b718a00ab3842eeddf18cf6b37e67a",
+      "bytes": 34438,
+      "first_seen": "2026-07-26",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "6ea49e66c112ebdefdbf051de329684b13f62c1e3529f4380ec4afcddc19d28e",
+      "bytes": 35038,
+      "first_seen": "2026-07-26",
+      "written_for_format": null,
+      "reads_formats": [],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "3234ba488fe81e43b7460126c2cea490e595c24da2ae77284f2df319cb4737b8",
+      "bytes": 36369,
+      "first_seen": "2026-07-29",
+      "written_for_format": null,
+      "reads_formats": [
+        "2.0",
+        "2.1"
+      ],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "e1e340b2a669b2c680bf19b60819647f0a7c2e925dfdd9f9a5650c939353058d",
+      "bytes": 36405,
+      "first_seen": "2026-07-29",
+      "written_for_format": null,
+      "reads_formats": [
+        "2.0",
+        "2.1"
+      ],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "ca57ee7051e2ecdef20e996c211bd4e04a2d5eedd9d96c5dea54931ac4f3c4fd",
+      "bytes": 36947,
+      "first_seen": "2026-07-29",
+      "written_for_format": null,
+      "reads_formats": [
+        "2.0",
+        "2.1"
+      ],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "6a172284815c2d2b4899ce09757896a203b11655f61948fa4b274ecb5fb63cd0",
+      "bytes": 37628,
+      "first_seen": "2026-07-29",
+      "written_for_format": null,
+      "reads_formats": [
+        "2.0",
+        "2.1"
+      ],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "8cd5926db639d19ae3c7e5ff35bb893d298f28011ca4f5d10a61fd201056d4c9",
+      "bytes": 37632,
+      "first_seen": "2026-07-29",
+      "written_for_format": null,
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2"
+      ],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "50069b312b049109ba2b7040c01ad907f716cb7519856d6a4f8835894d588e08",
+      "bytes": 39210,
+      "first_seen": "2026-08-03",
+      "written_for_format": null,
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2"
+      ],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "7ae454a40ebce13142900bb9d2cccff465478ed933a34a3254d4b3fe1327af7e",
+      "bytes": 39845,
+      "first_seen": "2026-08-08",
+      "written_for_format": null,
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2"
+      ],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "05d02b390a087026e0e6b060e318d3bd25ee615fa136238fc4e767b10c9bc360",
+      "bytes": 39850,
+      "first_seen": "2026-08-08",
+      "written_for_format": null,
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2"
+      ],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "06d252ee0f5482b9fb031f611f11e76f2326a9935d5eab12028ea3f75ff084bf",
+      "bytes": 40561,
+      "first_seen": "2026-08-08",
+      "written_for_format": null,
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2"
+      ],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "194704b0d51a5c47146e27a9a9b270a3c97ae695df50820f21d33d722a488090",
+      "bytes": 42730,
+      "first_seen": "2026-08-08",
+      "written_for_format": "2.3",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "ab34e690c49f4746eddad6977335069fd3462a983cd85452563d0f33063ba96f",
+      "bytes": 41436,
+      "first_seen": "2026-08-08",
+      "written_for_format": null,
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2"
+      ],
+      "travels_in_nests": false,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "ef5b5a5a6837c3b6518898b2defa164c2eea4d488b2118121c612123ad67799c",
+      "bytes": 44260,
+      "first_seen": "2026-08-09",
+      "written_for_format": "2.3",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "7e2cf75dfb0721fb6f9b2656a6088dd3cb6293c658e0da0f2e36dcbb3242c61d",
+      "bytes": 44672,
+      "first_seen": "2026-08-11",
+      "written_for_format": "2.4",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "1b225d2adb4aa29c06b698e9fef2b5dca1b4c8eb91005159521037b21150a550",
+      "bytes": 45953,
+      "first_seen": "2026-08-11",
+      "written_for_format": "2.4",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "3089c12c8d54e39454230752b33b919aee54c876090645236ce5fde97d0e9365",
+      "bytes": 46364,
+      "first_seen": "2026-08-12",
+      "written_for_format": "2.5",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "git-https-source-refused",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "261126b535c781dda0fd01720f10d4654084256173de6f01cfd8eee0d6357d78",
+      "bytes": 47393,
+      "first_seen": "2026-08-12",
+      "written_for_format": "2.5",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "missing-library-notice-buried",
+        "nest-own-code-treated-as-remote",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "af79a3cc0d25f929b4e154ca4c1cf234bfdad3093d373ed96a245924cebbd01d",
+      "bytes": 48425,
+      "first_seen": "2026-08-12",
+      "written_for_format": "2.5",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "missing-library-notice-buried",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "2013453e9e21bc05d4a9f2f072292aa792af7207b681d514829c9536de2f00a9",
+      "bytes": 54294,
+      "first_seen": "2026-08-12",
+      "written_for_format": "2.6",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "missing-library-notice-buried",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "be79de470daa4c3439ac202319880884db553f22123e234fd21a955dc310b17d",
+      "bytes": 54538,
+      "first_seen": "2026-08-12",
+      "written_for_format": "2.6",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "missing-library-notice-buried",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "224fbf292592ab40e9554e600065da6f8bf9c46657b6e4e847d7b17ad854cce7",
+      "bytes": 55545,
+      "first_seen": "2026-08-12",
+      "written_for_format": "2.6",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "fc26d9975a4371bc0a8eb31869fb70fc5673fdcaf3efc4089248382e558db944",
+      "bytes": 56071,
+      "first_seen": "2026-08-12",
+      "written_for_format": "2.7",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "559e04ac3dfd3590ff4e3c08bcfd48dacb479dac471463c3d9e685f3f079f0f4",
+      "bytes": 56081,
+      "first_seen": "2026-08-13",
+      "written_for_format": "2.7",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "29a888ae619d6f88dea6071124f1058f59a880ca671c6d8af8d0b451c259ced8",
+      "bytes": 56500,
+      "first_seen": "2026-08-15",
+      "written_for_format": "2.7",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "b62e4bcebf07148b319a97919b0046425d3477b8a4671bd44b488ba86b207db4",
+      "bytes": 59814,
+      "first_seen": "2026-08-17",
+      "written_for_format": "2.8",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "presigned-urls-printed",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "4343c4d458b3b255f12bc95b7c75210881c0587ab78bbc3b7a11d5922913404a",
+      "bytes": 60182,
+      "first_seen": "2026-08-20",
+      "written_for_format": "2.8",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "no-libc-check",
+        "no-word-on-your-own-material",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "f22dcdfdae8cf5a06d8bfaea98528ffdb072108b1f04855b9175affed67497f7",
+      "bytes": 62031,
+      "first_seen": "2026-08-20",
+      "written_for_format": "2.8",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "no-word-on-your-own-material",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "b077d7bad3f12bf2e833c6be6fd0f25d273ca316235792905f8d600b60649023",
+      "bytes": 62983,
+      "first_seen": "2026-08-20",
+      "written_for_format": "2.8",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "no-word-on-your-own-material",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "20b8274aa8869bb6c79a48dd1e019ecd7a6caaab266f4b5d1d7ca5e4fe7e2763",
+      "bytes": 64493,
+      "first_seen": "2026-08-20",
+      "written_for_format": "2.8",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "no-word-on-your-own-material",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "15d9403ef1c7767999c63857a927017e4af28dc1d638a9ef03ae140cc040af9c",
+      "bytes": 65119,
+      "first_seen": "2026-08-20",
+      "written_for_format": "2.8",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "failure-output-scrolls-away",
+        "false-alarms-off-linux",
+        "no-word-on-your-own-material",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "99ee7fdf45a283af556c2d441ec9d1718d42925a716a1dce892152b95e5425aa",
+      "bytes": 66039,
+      "first_seen": "2026-08-21",
+      "written_for_format": "2.8",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "false-alarms-off-linux",
+        "no-word-on-your-own-material",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "8736308364f802ba2409880d2424543c431e28ddd1d5c00a42a39ddb669c5718",
+      "bytes": 67163,
+      "first_seen": "2026-08-21",
+      "written_for_format": "2.8",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "false-alarms-off-linux",
+        "no-word-on-your-own-material",
+        "silent-on-chip-family-change",
+        "silent-on-cpu-shortfall",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "b9f9a3d32699668ab16df4a1164444319c7eed75d7b79faddbb2bdc056077ffd",
+      "bytes": 68088,
+      "first_seen": "2026-08-22",
+      "written_for_format": "2.8",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "false-alarms-off-linux",
+        "no-word-on-your-own-material",
+        "silent-on-chip-family-change",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "71eeba833978e3969294e61cf472fe5f48bce605682c4850127e574119256909",
+      "bytes": 68728,
+      "first_seen": "2026-08-22",
+      "written_for_format": "2.8",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "false-alarms-off-linux",
+        "silent-on-chip-family-change",
+        "three-hard-edges"
+      ]
+    },
+    {
+      "sha256": "8695f2b051c856910767dd62071c70faa7261bb7e71ec3d2533bd1374893a407",
+      "bytes": 71909,
+      "first_seen": "2026-08-22",
+      "written_for_format": "2.8",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "false-alarms-off-linux",
+        "silent-on-chip-family-change"
+      ]
+    },
+    {
+      "sha256": "70a76fd3489352750488b61034013e29ea9f36df1d3253ffbe76c5aa8c973629",
+      "bytes": 73694,
+      "first_seen": "2026-08-22",
+      "written_for_format": "2.8",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "false-alarms-off-linux"
+      ]
+    },
+    {
+      "sha256": "4e47876f0021791fba2c246544551159374d932bf2a3506b8b29f5510a6b7a6f",
+      "bytes": 73810,
+      "first_seen": "2026-08-22",
+      "written_for_format": "2.8",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "false-alarms-off-linux"
+      ]
+    },
+    {
+      "sha256": "a7c4504bfbf30a81457f5c46a85d6d302c4a7485d532c230a5951064b7b181b1",
+      "bytes": 76340,
+      "first_seen": "2026-08-22",
+      "written_for_format": "2.8",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "false-alarms-off-linux"
+      ]
+    },
+    {
+      "sha256": "b4ae8c53fbf9b8da890593e2f206055fe4e1dfa857958060d07bea01d067f93b",
+      "bytes": 79362,
+      "first_seen": "2026-08-23",
+      "written_for_format": "2.8",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8"
+      ],
+      "travels_in_nests": true,
+      "known_issues": [
+        "false-alarms-off-linux"
+      ]
+    },
+    {
+      "sha256": "ddcc2a0ce43cbe77651489ff4bce2c37340c43f7c484809fc208aec04b44a9f2",
+      "bytes": 81086,
+      "first_seen": "2026-08-23",
+      "written_for_format": "2.8",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8"
+      ],
+      "travels_in_nests": true,
+      "known_issues": []
+    },
+    {
+      "sha256": "50b78e513401bd5219cb7c4b62864e772c2c30881538eea05d7c14bada1d694b",
+      "bytes": 81338,
+      "first_seen": "2026-08-29",
+      "written_for_format": "2.8",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8"
+      ],
+      "travels_in_nests": true,
+      "known_issues": []
+    },
+    {
+      "sha256": "1cfa36d0936633385a0da6a774c105ef5d6230e5b95287024de59ab9790b27af",
+      "bytes": 83669,
+      "first_seen": "2026-08-29",
+      "written_for_format": "2.8",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8"
+      ],
+      "travels_in_nests": true,
+      "known_issues": []
+    },
+    {
+      "sha256": "97bd5a3e6577fc3a7522922abb610bfdf1d95cff277ee9d7e08a94c755854b4a",
+      "bytes": 84495,
+      "first_seen": "2026-08-30",
+      "written_for_format": "2.8",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8"
+      ],
+      "travels_in_nests": true,
+      "known_issues": []
+    },
+    {
+      "sha256": "e12a2c877afbe44fc7a5c20693a8621273441e242d6d33f13427806afcf97dcb",
+      "bytes": 84800,
+      "first_seen": "2026-08-30",
+      "written_for_format": "2.8",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8"
+      ],
+      "travels_in_nests": true,
+      "known_issues": []
+    },
+    {
+      "sha256": "917b4281ebd6a5e9ee1e22a80d3f8108ee2c3a8dcc39ff52405fde1d8772dc31",
+      "bytes": 84814,
+      "first_seen": "2026-08-30",
+      "written_for_format": "2.9",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8",
+        "2.9"
+      ],
+      "travels_in_nests": true,
+      "known_issues": []
+    },
+    {
+      "sha256": "e9e7ab4f401c9a4e704859265072fe5462df18bebbcc03c8561e9e979d6c70f5",
+      "bytes": 85197,
+      "first_seen": "2026-08-30",
+      "written_for_format": "2.9",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8",
+        "2.9"
+      ],
+      "travels_in_nests": true,
+      "known_issues": []
+    },
+    {
+      "sha256": "a1aea8967e5c64c2abf0d1a2c5f3bb82414157aed70c00626b5db32e734f0cd8",
+      "bytes": 85173,
+      "first_seen": "2026-08-30",
+      "written_for_format": "2.9",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8",
+        "2.9"
+      ],
+      "travels_in_nests": true,
+      "known_issues": []
+    }
+  ]
+}

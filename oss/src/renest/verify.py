@@ -61,6 +61,12 @@ class ByteDiff:
     def passed(self) -> bool:
         return not self.missing and not self.mismatch
 
+    @property
+    def examined(self) -> int:
+        """How many files this check actually looked at. Zero means it compared
+        nothing, which must never be reported as a pass."""
+        return self.ok + len(self.missing) + len(self.mismatch)
+
 
 @dataclass
 class ImageResult:
@@ -165,6 +171,18 @@ def verify(
                 f"{len(diff.mismatch)} differ",
                 stage="S2",
             )
+        # A check that compared nothing looks exactly like a clean pass. Point the
+        # user at the likeliest cause instead: the file handed in is not a nest
+        # manifest (any other JSON parses fine and simply lists no files).
+        if diff.examined == 0:
+            report.exit_code = int(ExitCode.USAGE)
+            report.summary = (
+                "Nothing to check: this file lists no stored files, so nothing was "
+                "compared. The first argument must be the manifest.json of the nest "
+                "you rebuilt."
+            )
+            report.ok = False
+            return report
         if not diff.passed:
             report.exit_code = int(ExitCode.S2_HASH_MISMATCH)
             report.summary = (
@@ -189,7 +207,18 @@ def verify(
             emitter.log(f"Image check: SSIM {img.ssim} (threshold {img.threshold})", stage="S5")
         if not img.ok:
             report.exit_code = int(ExitCode.S5_IMAGE_MISMATCH)
-            report.summary = f"Image check failed: SSIM {img.ssim} < {img.threshold}"
+            # The verifier's own sentence is the only one that says *why*, and the
+            # human path prints this summary and nothing else. Dropping it answered
+            # "Image check failed: SSIM None < 0.98" to someone whose nest simply
+            # carries no sample picture (normal since 2026-08-11) or who has not
+            # installed the two optional comparison packages.
+            report.summary = (
+                f"Image check failed: SSIM {img.ssim} < {img.threshold}"
+                if img.ssim is not None
+                else "Image check could not be completed — no similarity was measured"
+            )
+            if img.detail:
+                report.summary += "\n  " + img.detail
             report.ok = False
             return report
 
@@ -405,7 +434,31 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--report", help="write the full JSON report to this file")
 
 
+def picture_option_problem(args: argparse.Namespace) -> str | None:
+    """Why the picture options as typed cannot be honoured, or ``None``.
+
+    Both of them ask for the same thing by different routes, and neither does
+    anything unless ``--check`` asks for the picture — silently ignoring them
+    returned a green "Verified" to someone who asked for a render.
+    """
+    render, rendered = getattr(args, "render", False), getattr(args, "rendered", None)
+    if render and rendered:
+        return ("✗ --render and --rendered ask for the same check two ways: --render lets "
+                "Renest render the picture, --rendered takes one you rendered yourself. "
+                "Pass one of them, not both.")
+    if (render or rendered) and args.check == "bytes":
+        used = "--render" if render else "--rendered"
+        return (f"✗ {used} only does something when the picture is being checked, and "
+                f"--check is 'bytes'. Add --check image to compare the picture, or "
+                f"--check both to compare the files as well.")
+    return None
+
+
 def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
+    problem = picture_option_problem(args)
+    if problem is not None:
+        print(problem, file=sys.stderr)
+        return int(ExitCode.USAGE)
     try:
         manifest = json.loads(Path(args.manifest).read_text())
     except (OSError, json.JSONDecodeError) as e:
@@ -425,7 +478,14 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
         emitter=None,
     )
     if args.report:
-        Path(args.report).write_text(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+        # A destination that cannot be written must not swallow the verdict: the
+        # check already ran, and its answer is the thing the user came for.
+        try:
+            Path(args.report).write_text(
+                json.dumps(report.to_dict(), ensure_ascii=False, indent=2)
+            )
+        except OSError as e:
+            print(f"⚠ Could not write the report to {args.report}: {e}", file=sys.stderr)
     if args.json:
         print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
     else:

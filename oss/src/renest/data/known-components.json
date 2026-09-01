@@ -1,0 +1,8 @@
+{
+  "schema": "ai.renest.rules.known-components",
+  "schema_version": "1.0",
+  "updated": "2026-08-22",
+  "provenance": "One text encoder or VAE sits inside dozens of unrelated bundles, so a content-hash lookup on a community site returns whichever bundle somebody uploaded first, and that stranger's permission flags then decide the licence of a file they did not publish. Each entry here is a file whose sha256 was traced back to the repository that actually publishes it, together with the licence tag that repository declares. Entries are added one misjudged case at a time; a mirror, a re-upload or a guess is not a source.",
+  "components": [],
+  "components_note": "Empty is the correct starting state, not an oversight: this table only ever releases, so an empty table releases nothing and every file keeps the deny-by-default answer. Entries arrive through the signed rules channel, which is the whole point of putting them here rather than in code - a shared part judged wrongly is fixed for everyone without a release. Each entry needs sha256, origin_url and spdx; the reader in licensing.py refuses any entry whose origin is not an authority it recognises or whose licence is not one we already pass on, so adding a row cannot widen either of those."
+}

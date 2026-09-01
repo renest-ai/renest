@@ -19,6 +19,9 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
+
+from .rules import KNOWN_COMPONENTS, load_rules
 
 if TYPE_CHECKING:
     # Imported for type annotations only. httpx is never imported at runtime here:
@@ -36,9 +39,11 @@ __all__ = [
     "LicenseClues",
     "LicenseVerdict",
     "hf_repo_from_path",
+    "known_component",
     "parse_allow_commercial_use",
     "judge_hf",
     "judge_civitai",
+    "base_in_words",
     "unknown_verdict",
     "lookup",
     "github_repo_from_url",
@@ -209,6 +214,10 @@ def permissive_licenses() -> frozenset[str]:
     licence text, or adds a name to ``_CONDITIONAL_LICENSES`` whose text we do not have,
     **it stops releasing that licence on the spot** instead of quietly distributing on
     someone's behalf without the terms attached.
+
+    **Cannot find a licence text? Suspect your own search string before the sources.**
+    This family spells itself ``Open RAIL-M`` in the body -- with a space -- so a grep for
+    ``OpenRAIL`` discards the correct file and reports that no source carries it.
     """
     ok = set(PERMISSIVE_LICENSES)
     for spdx in _CONDITIONAL_LICENSES:
@@ -319,12 +328,22 @@ def judge_hf(repo_id: str, payload: dict) -> LicenseVerdict:
     # 4. Any other value, including the two waves not yet released -> restricted, but
     #    say clearly why.
     pending = lic in _STAGE_2_PENDING or lic in _STAGE_3_PENDING
-    why = (
-        f"{repo_id} is {lic}. That licence does allow passing it on, but only if its own "
-        f"terms travel with the files, and we do not do that yet — so for now it stays with you."
-        if pending
-        else f"{repo_id} is {lic}, which is not one of the licences we pass on."
-    )
+    if pending:
+        why = (
+            f"{repo_id} is {lic}. That licence does allow passing it on, but only if its own "
+            f"terms travel with the files, and we do not do that yet — so for now it stays "
+            f"with you."
+        )
+    elif lic:
+        why = f"{repo_id} is {lic}, which is not one of the licences we pass on."
+    else:
+        # A model card with no licence field at all is common on Hugging Face. Saying
+        # "X is , which is not one of the licences we pass on" both reads as broken and
+        # claims we read a licence we never found. This sentence travels in the manifest.
+        why = (
+            f"{repo_id} does not state a licence, so we cannot pass it on for you — "
+            f"fetch it from the source yourself."
+        )
     return LicenseVerdict(
         serving_scope="gated",
         shareable=False,
@@ -335,7 +354,98 @@ def judge_hf(repo_id: str, payload: dict) -> LicenseVerdict:
     )
 
 
-def judge_civitai(version: dict, model: dict, *, kind: str = "") -> LicenseVerdict | None:
+#: Repositories whose licence tag we take as the answer. **Kept in code, never in the
+#: rules file**: the cloud channel may add a component, but it must not be able to widen
+#: what counts as an authority -- that is the one thing signing a file cannot check.
+_AUTHORITATIVE_ORIGINS: frozenset[str] = frozenset({"huggingface.co"})
+
+
+def _origin_host(url: str) -> str:
+    """Host of an ``https://`` address, lowercased. Empty for anything else.
+
+    Deliberately strict: only ``https``, and the host comes from a real URL parse so that
+    ``https://huggingface.co@example.com/x`` reads as ``example.com``, which is what it is.
+    """
+    parts = urlsplit((url or "").strip())
+    if parts.scheme != "https":
+        return ""
+    host = (parts.hostname or "").lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def known_component(sha256: str) -> LicenseVerdict | None:
+    """A shared part already traced back to the repository that publishes it.
+
+    Asked **before** the community lookup, because a content-hash hit there identifies
+    whichever bundle happened to be uploaded first -- and one text encoder or VAE sits
+    inside dozens of unrelated bundles, so a stranger's permission flags end up deciding
+    the licence of a file they did not publish. That misjudgement is invisible from the
+    outside: the answer merely looks stricter.
+
+    Three gates, all in code so the data channel cannot widen them: a full sha256, an
+    origin on a repository we treat as an authority, and a licence already on the
+    allow-list. Anything else returns ``None`` and the normal lookup carries on.
+    """
+    sha = (sha256 or "").strip().lower()
+    if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
+        return None
+    try:
+        table = load_rules(KNOWN_COMPONENTS)
+    except (KeyError, RuntimeError, OSError):
+        return None      # judging is optional; it must never be able to fail packing
+    for entry in table.get("components") or []:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("sha256") or "").strip().lower() != sha:
+            continue
+        origin = str(entry.get("origin_url") or "").strip()
+        spdx = str(entry.get("spdx") or "").strip().lower()
+        if _origin_host(origin) not in _AUTHORITATIVE_ORIGINS:
+            return None
+        if spdx not in permissive_licenses():
+            return None
+        name = str(entry.get("name") or "").strip() or "This file"
+        return LicenseVerdict(
+            serving_scope="open",
+            shareable=True,
+            spdx=spdx,
+            tag="permissive",
+            origin_url=origin,
+            reason=(
+                f"{name} is a shared part published at {origin} under {spdx}, "
+                f"which allows redistribution."
+            ),
+        )
+    return None
+
+
+#: Longest trainer-written base-model name this will repeat back. The header is
+#: written by whoever built the file, so it is untrusted text; a name is a few
+#: characters, and anything longer is not a name.
+_STATED_BASE_MAX = 64
+
+
+def base_in_words(base: str, declared: object) -> str:
+    """What to call the base model in the sentence below, best evidence first.
+
+    The community record comes first: this judgement is made from it. When it
+    names no base, the file's own header often does, and saying "we cannot
+    identify it" while the nest's own ``declared_base_model`` field reads
+    ``flux1`` is our two ends contradicting each other.
+    **Naming it never relaxes the verdict** -- it is the trainer's statement,
+    marked as such, which is all that field has ever been.
+    """
+    if base:
+        return base
+    family = str((declared or {}).get("family") or "").strip() if isinstance(declared, dict) else ""
+    if family and len(family) <= _STATED_BASE_MAX:
+        return f"{family} (what the file's own header says, which we have not confirmed)"
+    return "a base model we cannot identify"
+
+
+def judge_civitai(
+    version: dict, model: dict, *, kind: str = "", declared_base: object = None
+) -> LicenseVerdict | None:
     """Judge once from Civitai's answer. ``None`` = this record cannot speak for this file.
 
     **These two payloads take two calls to obtain**: ``by-hash`` returns only the model
@@ -343,6 +453,8 @@ def judge_civitai(version: dict, model: dict, *, kind: str = "") -> LicenseVerdi
 
     ``kind`` is the ``files[].kind`` of the file being judged. It only ever matters for
     :data:`SHARED_COMPONENT_KINDS`, and only for the base-model question -- see there.
+    ``declared_base`` is the file's own ``declared_base_model``; it is named in the
+    wording only and decides nothing.
     """
     model_id = version.get("modelId") or model.get("id") or ""
     origin = f"https://civitai.com/models/{model_id}" if model_id else ""
@@ -386,7 +498,7 @@ def judge_civitai(version: dict, model: dict, *, kind: str = "") -> LicenseVerdi
             tag="unknown",
             origin_url=origin,
             reason=(
-                f"This was trained on top of {base or 'a base model we cannot identify'}, "
+                f"This was trained on top of {base_in_words(base, declared_base)}, "
                 f"and we cannot confirm what that base allows. What the author of an add-on "
                 f"says cannot speak for the model it was built on, so this one stays with you."
             ),
@@ -529,6 +641,12 @@ def lookup(fspec: dict, *, client: "httpx.Client | None" = None) -> LicenseVerdi
         sha = ((fspec.get("blob") or {}).get("sha256")) or fspec.get("sha256") or ""
         if len(sha) != 64:
             return None
+        # Our own table of shared parts answers first, and without a request. See
+        # `known_component` for why a hash lookup on a community site cannot answer for
+        # a file that sits inside dozens of unrelated bundles.
+        mine = known_component(sha)
+        if mine is not None:
+            return mine
         r = c.get(f"https://civitai.com/api/v1/model-versions/by-hash/{sha}")
         if r.status_code != 200:
             return None
@@ -540,7 +658,10 @@ def lookup(fspec: dict, *, client: "httpx.Client | None" = None) -> LicenseVerdi
         r2 = c.get(f"https://civitai.com/api/v1/models/{model_id}")
         if r2.status_code != 200:
             return None
-        return judge_civitai(version, r2.json(), kind=str(fspec.get("kind") or ""))
+        return judge_civitai(
+            version, r2.json(), kind=str(fspec.get("kind") or ""),
+            declared_base=fspec.get("declared_base_model"),
+        )
     except Exception:
         return None      # a site being down is not our fault, and must not fail packing
     finally:

@@ -56,14 +56,24 @@ def load_run_record(path: str | Path) -> dict:
 
 
 # ---------------------------------------------------------------- helpers --
-def _flag(argv: list[str], name: str) -> str | None:
-    """Take ``--name=value`` or ``--name value``; return None when absent (never guess)."""
+def _flag_at(argv: list[str], name: str) -> tuple[str | None, int | None]:
+    """``--name=value`` or ``--name value`` → (value, index of the token holding it).
+
+    The index comes from the same pass that found the value; searching for it again by
+    string match answered "nowhere" for a quoted value and fell back to index 0, which
+    addresses the program name.
+    """
     for i, a in enumerate(argv):
         if a == name and i + 1 < len(argv):
-            return argv[i + 1].strip("\"'")
+            return argv[i + 1].strip("\"'"), i + 1
         if a.startswith(name + "="):
-            return a.split("=", 1)[1].strip("\"'")
-    return None
+            return a.split("=", 1)[1].strip("\"'"), i
+    return None, None
+
+
+def _flag(argv: list[str], name: str) -> str | None:
+    """Take ``--name=value`` or ``--name value``; return None when absent (never guess)."""
+    return _flag_at(argv, name)[0]
 
 
 def _rel_to(p: Path, root: Path) -> str | None:
@@ -238,23 +248,33 @@ def _capture_kohya(rec: dict, root: Path, hub_root: Path, hf_home: Path) -> tupl
     # Declaring them in redactions is not enough on its own: the folder holding the config
     # is archived whole further down, and it is usually the folder holding these too.
     user_data: list[str] = []
+    # ---- The user's images: kohya's other form names them on the command line ----
+    # `--dataset_config` hides them in a TOML and each key there gets a redaction. The plain
+    # `--train_data_dir` form got none, so a rebuild ran against a folder that is not there
+    # and said only "no images found" — while the path itself rode into the manifest.
     for flag in ("--train_data_dir", "--reg_data_dir"):
-        val = _flag(argv, flag)
-        if val:
-            user_data.append(str(_abs_from(val, root)))
+        val, idx = _flag_at(argv, flag)
+        if val is None or idx is None:
+            continue
+        user_data.append(str(_abs_from(val, root)))
+        redactions.append({
+            "locator": {"argv_index": idx},
+            "role": "dataset",
+            "placeholder": "<point this at your own images after rebuilding>",
+            "note": "This pointed at your training images. Your data never travels "
+                    "with the nest.",
+        })
 
     # ---- Outputs: never packed, but accounted for honestly (never dropped silently) ----
     for flag, role in (("--output_dir", "output_dir"), ("--output_name", "output_name"),
                        ("--logging_dir", "log_dir")):
-        val = _flag(argv, flag)
-        if val is None:
+        val, idx = _flag_at(argv, flag)
+        if val is None or idx is None:
             continue
         if flag != "--output_name":
             user_data.append(str(_abs_from(val, root)))
-        idx = next((i for i, a in enumerate(argv)
-                    if a == val or a.endswith("=" + val)), None)
         redactions.append({
-            "locator": {"argv_index": idx if idx is not None else 0},
+            "locator": {"argv_index": idx},
             "role": role,
             "placeholder": "<pick your own output folder after rebuilding>",
             "note": "This pointed at where your training results went. Results don't travel "
@@ -311,8 +331,12 @@ def _capture_kohya(rec: dict, root: Path, hub_root: Path, hf_home: Path) -> tupl
                     "locator": {"file": rel, "key": key},
                     "role": "dataset",
                     "placeholder": "<point this at your own images after rebuilding>",
-                    "note": f"This pointed at your training images ({value}). Your data never "
-                            f"travels with the nest.",
+                    # The folder it used to point at is not repeated here on purpose: that
+                    # path is usually under a home directory, so it carries the packer's
+                    # user name, and the manifest is the part that gets read by whoever
+                    # receives the nest. The locator above already says which key to fill in.
+                    "note": "This pointed at your training images. Your data never "
+                            "travels with the nest.",
                 })
         else:
             gaps.append(f"The dataset config sits outside the folder being packed: {ds_cfg}")
@@ -409,11 +433,14 @@ def _capture_llamafactory(rec: dict, root: Path, hub_root: Path, hf_home: Path) 
         return {"files": files, "redactions": redactions, "config_files": config_files}, {"gaps": gaps}
 
     ypath = Path(yaml_arg)
-    rel = _rel_to(ypath, root)
-    if rel:
-        config_files.append(rel)
+    # **Its own name, never reused below.** The redaction locators point at *this* file, and
+    # a shared `rel` got overwritten by the base-model branch — sending whoever rebuilds to
+    # edit `output_dir` inside a model directory that has no such key.
+    cfg_rel = _rel_to(ypath, root)
+    if cfg_rel:
+        config_files.append(cfg_rel)
         files.append({
-            "path": rel, "kind": "other",
+            "path": cfg_rel, "kind": "other",
             "license": {"shareable": True, "serving_scope": "private", "tag": "permissive",
                         "note": "Your training recipe — treated as yours."},
         })
@@ -421,7 +448,8 @@ def _capture_llamafactory(rec: dict, root: Path, hub_root: Path, hf_home: Path) 
         gaps.append(f"The training config sits outside the folder being packed: {ypath}")
 
     cfg = _read_yaml(ypath)
-    if cfg is None:
+    unreadable = cfg is None
+    if unreadable:
         gaps.append(f"Couldn't read the training config as YAML: {ypath}")
         cfg = {}
 
@@ -433,24 +461,33 @@ def _capture_llamafactory(rec: dict, root: Path, hub_root: Path, hf_home: Path) 
         # root being packed, and kills the pack with "asset file is missing" — the fetch-from-
         # cache branch below never runs. So only a file that really exists counts as a path.
         local = Path(repo_id) if Path(repo_id).is_absolute() else (root / repo_id)
-        rel = _rel_to(local, root) if local.is_file() or local.is_dir() else None
-        if rel:
-            files.append({"path": rel, "kind": "checkpoint",
+        model_rel = _rel_to(local, root) if local.is_file() or local.is_dir() else None
+        if model_rel:
+            files.append({"path": model_rel, "kind": "checkpoint",
                           "license": _license_unknown("The base model this run trained from.")})
         else:
             files.extend(_collect_hf_repo(hub_root, _hf_repo_dir(repo_id), gaps))
-    else:
+    elif not unreadable:
+        # Only when the file really was read: after a parse failure every key looks absent,
+        # and "it doesn't say which base model" sends people to add a line that is already there.
         gaps.append("The training config doesn't say which base model to use (model_name_or_path).")
 
     # The output directory is **always the user's own**, so it must be called out.
     if cfg.get("output_dir") is not None:
         redactions.append({
-            "locator": {"file": rel or ypath.name, "key": "output_dir"},
+            "locator": {"file": cfg_rel or ypath.name, "key": "output_dir"},
             "role": "output_dir",
             "placeholder": "<pick your own output folder after rebuilding>",
             "note": "This pointed at where your training results went.",
         })
-    for key in ("output_dir", "dataset_dir"):
+    ds = cfg.get("dataset")
+    builtin = ds is not None and _is_builtin_dataset(ds, root, rec)
+    # `dataset_dir` defaults to the framework's own `data/`, which holds `dataset_info.json`
+    # and every dataset it ships. Excluding that folder deletes exactly what we tell the user
+    # travels with the nest, and the rebuilt run cannot even find its dataset index — so it
+    # counts as the user's own only when the dataset it holds is theirs.
+    keys = ("output_dir",) if builtin else ("output_dir", "dataset_dir")
+    for key in keys:
         val = cfg.get(key)
         if isinstance(val, str) and val:
             user_data.append(str(_abs_from(val, ypath.parent)))
@@ -460,9 +497,8 @@ def _capture_llamafactory(rec: dict, root: Path, hub_root: Path, hf_home: Path) 
     # every `dataset` entry "your data, point it back after restoring" is a false alarm that
     # makes people think something is missing. Telling them apart: a shipped dataset is a
     # **name** findable in the framework's dataset index, the user's own is a **path**.
-    ds = cfg.get("dataset")
     if ds is not None:
-        if _is_builtin_dataset(ds, root, rec):
+        if builtin:
             gaps.append(
                 f"The training data named here ({ds}) ships with the framework itself, "
                 f"so it travels with the nest — nothing for you to point at after rebuilding.")
@@ -472,7 +508,7 @@ def _capture_llamafactory(rec: dict, root: Path, hub_root: Path, hf_home: Path) 
             if isinstance(ds, str) and ("/" in ds or "\\" in ds):
                 user_data.append(str(_abs_from(ds, ypath.parent)))
             redactions.append({
-                "locator": {"file": rel or ypath.name, "key": "dataset"},
+                "locator": {"file": cfg_rel or ypath.name, "key": "dataset"},
                 "role": "dataset",
                 "placeholder": "<point this at your own data after rebuilding>",
                 "note": "This named your training data. Your data never travels with the nest.",
@@ -606,6 +642,10 @@ def _read_yaml(path: Path) -> dict | None:
 _ENV_WHITELIST = ("VIRTUAL_ENV", "CUDA_VERSION", "LD_LIBRARY_PATH",
                   "HF_HOME", "HF_HUB_CACHE", "FORCE_TORCHRUN")
 
+#: Stands in for an argument naming somewhere outside the nest. Deliberately worded so
+#: `renest lint` does not read it as an uncleaned blank -- it is a finished value.
+_OUT_OF_NEST = "<point this at the matching place on this machine>"
+
 
 def _in_venv(rel: str) -> bool:
     """Does this relative path point into a venv's bin? (venvs aren't packed: no path form.)"""
@@ -650,6 +690,8 @@ def _entrypoint(rec: dict, root: Path, redactions: list[dict], gaps: list[str],
     # Only paths **inside the environment root** are rewritten; the result may contain `..`,
     # which is fine for an argument (the placement gate governs placement paths, not argv).
     cwd_abs = Path(rec["cwd"]).resolve() if rec.get("cwd") else root
+    stand_in = {r["locator"]["argv_index"]: r.get("placeholder") or _OUT_OF_NEST
+                for r in redactions if "argv_index" in (r.get("locator") or {})}
     for i in range(1, len(argv)):
         tok = argv[i]
         flag, sep, val = tok.partition("=")
@@ -657,8 +699,18 @@ def _entrypoint(rec: dict, root: Path, redactions: list[dict], gaps: list[str],
         if cand is None:
             continue
         if _rel_to(Path(cand), root) is None:
-            continue                    # outside the environment root: never rewritten
-        rel = os.path.relpath(Path(cand).resolve(), cwd_abs)
+            # **Outside the environment root, so it cannot travel — and it must not.** Left
+            # as it was, the packing machine's absolute path ships inside the manifest the
+            # recipient reads, and a training folder normally sits under a home directory,
+            # so that path carries the packer's user name. Hand on a stand-in instead.
+            rel = stand_in.get(i, _OUT_OF_NEST)
+            gaps.append(
+                f"{flag if sep else 'One argument'} pointed outside the folder being packed, "
+                f"so the nest carries a fill-in marker rather than that path — a path from "
+                f"this machine would name you, and would not exist on the rebuilt one."
+            )
+        else:
+            rel = os.path.relpath(Path(cand).resolve(), cwd_abs)
         argv[i] = f"{flag}={rel}" if sep else rel
 
     env: dict[str, str] = {}
@@ -918,6 +970,19 @@ def capture_training(
     if adapter:
         pack_spec["adapters"] = {framework: adapter}
 
+    # Read what is still missing off the spec we just built, instead of naming the same four
+    # fields every time. Everything above tries hard to fill these in, so a fixed list sends
+    # people to re-type values that are already there.
+    needs_manual = []
+    if str(base_image.get("ref", "")).startswith("<"):
+        needs_manual.append("base_image.ref")
+    if str(base_image.get("digest", "")).startswith(("<", "sha256:<")):
+        needs_manual.append("base_image.digest")
+    if str(runtime.get("python_version", "")).startswith("<"):
+        needs_manual.append("runtime.python_version")
+    if "python_lock" not in pack_spec:
+        needs_manual.append("python_lock.lockfile_path")
+
     report = {
         "capture_version": CAPTURE_VERSION,
         "framework": framework,
@@ -925,8 +990,7 @@ def capture_training(
         "hf_cache_files": sum(1 for f in files if f.get("root") == "hf_hub"),
         "redactions": len(parsed["redactions"]),
         "config_files": parsed["config_files"],
-        "needs_manual_fill": ["base_image.ref", "base_image.digest", "runtime.python_version",
-                              "python_lock.lockfile_path"],
+        "needs_manual_fill": needs_manual,
         "gaps": gaps,
     }
     return CaptureResult(pack_spec=pack_spec, report=report)

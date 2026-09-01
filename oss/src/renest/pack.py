@@ -24,6 +24,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -56,9 +57,17 @@ from .envlock import (
 from .errors import NestFailure, ErrorClass, ExitCode
 from .events import EventEmitter
 from .doctor import LEVEL_PASS, check_lock_cuda_family
-from .fingerprint import collect, collect_gpu, collect_wheel_env
-from .syslibs import collect_native_libs, contested_winners, interpreter_site_packages
+from .fingerprint import CRITICAL_PACKAGES, collect, collect_gpu, collect_wheel_env
+from .syslibs import (
+    collect_native_libs_with_layers,
+    contested_winners,
+    interpreter_site_packages,
+    read_run_record,
+    record_search_roots,
+)
+from .vram_watch import observed_use_from_record
 from .integrity import (
+    cache_stated_sha256,
     declared_base_model,
     dirty_gap,
     looks_like_lfs_pointer,
@@ -164,7 +173,120 @@ def ulid() -> str:
     return "".join(reversed(out))
 
 
-def _sha256_stream(path: Path) -> tuple[str, int]:
+#: Where the "already read this file, here is its fingerprint" record sits,
+#: relative to the target folder (same state area as the nest memory below).
+HASH_CACHE_REL = ".renest/state/hash-cache.json"
+
+#: Names that never travel inside a user's code archive. **One list, read by both
+#: the archiver and the `.so` scan** -- they used to be two hand-written copies that
+#: said they mirrored each other, and a test could pass against one while the other
+#: still let the file through (found 2026-08-23, by a falsification that refused to
+#: go red).
+ARCHIVE_JUNK = (".git", "__pycache__", ".venv", "venv", "node_modules", ".renest")
+_HASH_CACHE_FORMAT = 1
+
+
+class HashCache:
+    """Lets a repeat pack of the same folder skip re-reading files that did not
+    change, so a 100 GB folder does not cost a full disk read every time.
+
+    An entry is believed only while size, modification time and inode all still
+    match; any one of them moving means the file is read again. That is a
+    heuristic — a rewrite that puts all three back exactly as they were would
+    slip through, which is what ``--full-rehash`` is for. It is an optimisation
+    and nothing else: an unreadable, stale or wrong-shaped record costs a
+    re-read, never a wrong fingerprint. sha256 stays sha256; what is saved is
+    reading bytes that nobody touched.
+    """
+
+    def __init__(self, path: Path | None = None, *, trust: bool = True) -> None:
+        self.path = Path(path) if path is not None else None
+        self.trust = trust
+        self.hits = 0
+        self.misses = 0
+        self._entries: dict[str, list] = {}
+        self._lock = threading.Lock()
+        if self.path is not None:
+            self._load()
+
+    def attach(self, path: Path) -> None:
+        """Point an in-memory record at its file and take in what is already
+        recorded there; entries read this session win. Lets the caller hold one
+        record across capture and pack **before** knowing where it lives — a dry
+        run writes nothing, so a shared file cannot carry hashes between the two
+        and every weight got read twice (measured 2026-08-30: 2.00x)."""
+        if self.path is not None:
+            return
+        self.path = Path(path)
+        mine = dict(self._entries)
+        self._entries = {}
+        self._load()
+        self._entries.update(mine)
+
+    def _load(self) -> None:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return
+        if not isinstance(data, dict) or data.get("cache_format") != _HASH_CACHE_FORMAT:
+            return
+        entries = data.get("entries")
+        if not isinstance(entries, dict):
+            return
+        for key, val in entries.items():
+            if (
+                isinstance(key, str)
+                and isinstance(val, list)
+                and len(val) == 4
+                and all(isinstance(v, int) and not isinstance(v, bool) for v in val[:3])
+                and isinstance(val[3], str)
+                and len(val[3]) == 64
+            ):
+                self._entries[key] = list(val)
+
+    @staticmethod
+    def _key(path: str | os.PathLike[str]) -> str:
+        # One file, one entry, whichever spelling reached us. Capture keys a model by
+        # the path written in the folder; pack dereferences a symlink before hashing
+        # (a HuggingFace cache is all symlinks). Two spellings of one file meant two
+        # entries, and the first pack read a symlinked weight twice.
+        return os.path.realpath(os.fspath(path))
+
+    def lookup(self, path: str | os.PathLike[str], st: os.stat_result) -> str | None:
+        """The recorded sha256 for ``path``, or None when it has to be read."""
+        if not self.trust:
+            return None
+        key = self._key(path)
+        with self._lock:
+            ent = self._entries.get(key)
+            if ent is not None and tuple(ent[:3]) == (st.st_size, st.st_mtime_ns, st.st_ino):
+                self.hits += 1
+                return ent[3]
+            self.misses += 1
+        return None
+
+    def remember(self, path: str | os.PathLike[str], st: os.stat_result, sha256: str) -> None:
+        with self._lock:
+            self._entries[self._key(path)] = [st.st_size, st.st_mtime_ns, st.st_ino, sha256]
+
+    def save(self) -> None:
+        """Atomic write; failing to write is never an error. Entries whose file
+        is gone drop out here, so the record cannot grow without bound."""
+        if self.path is None:
+            return
+        with self._lock:
+            keep = {k: v for k, v in self._entries.items() if os.path.exists(k)}
+        payload = {"cache_format": _HASH_CACHE_FORMAT, "entries": keep}
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_name(self.path.name + ".tmp")
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            os.replace(tmp, self.path)
+        except OSError:
+            return
+
+
+def _sha256_stream(path: Path, cache: HashCache | None = None) -> tuple[str, int]:
     # If the source is written while we read it (ComfyUI or a downloader still
     # running), the fingerprint is void and the restore side would only ever see
     # "corrupt download" — fail loudly here rather than ship a poisoned nest.
@@ -172,6 +294,12 @@ def _sha256_stream(path: Path) -> tuple[str, int]:
     # hard-linked, so whatever writes the original writes the blob -- is closed on the
     # upload side (see hosted.py, one stat before each send).
     before = path.stat()
+    if cache is not None:
+        # Unchanged size, time and inode since the last pack of this folder also
+        # means nothing is writing to it now, so the guard above loses nothing.
+        known = cache.lookup(path, before)
+        if known is not None:
+            return known, before.st_size
     h = hashlib.sha256()
     with path.open("rb") as f:
         for chunk in iter(lambda: f.read(1 << 22), b""):
@@ -186,7 +314,10 @@ def _sha256_stream(path: Path) -> tuple[str, int]:
             "and the byte check will fail on restore, looking like a broken transfer.",
             exit_code=int(ExitCode.S2_HASH_MISMATCH),
         )
-    return h.hexdigest(), after.st_size
+    digest = h.hexdigest()
+    if cache is not None:
+        cache.remember(path, after, digest)
+    return digest, after.st_size
 
 
 def _copy(src: Path, dest: Path) -> None:
@@ -209,7 +340,10 @@ def _copy(src: Path, dest: Path) -> None:
             tmp.unlink()
 
 
-def _place_blob(src: Path, out_blobs: Path, hardlink: bool = True) -> dict:
+def _place_blob(
+    src: Path, out_blobs: Path, hardlink: bool = True, cache: HashCache | None = None,
+    on_copy_fallback: Callable[[Path, OSError], None] | None = None,
+) -> dict:
     """Place ``src`` content-addressed into ``out_blobs/<first 2 chars>/<hash>``.
 
     The same hash being placed twice concurrently is **normal** (under content
@@ -222,7 +356,7 @@ def _place_blob(src: Path, out_blobs: Path, hardlink: bool = True) -> dict:
     # blobs/sha256/xx/ — so the blob never lands while the hash is already
     # correct, giving a manifest that looks complete with the bytes missing.
     real = src.resolve() if src.is_symlink() else src
-    h, size = _sha256_stream(real)
+    h, size = _sha256_stream(real, cache)
     dest = out_blobs / h[:2] / h
     dest.parent.mkdir(parents=True, exist_ok=True)
     if not dest.exists():
@@ -231,8 +365,15 @@ def _place_blob(src: Path, out_blobs: Path, hardlink: bool = True) -> dict:
                 os.link(real, dest)
             except FileExistsError:
                 pass                      # another thread just placed it — exactly what we want
-            except OSError:
-                _copy(real, dest)         # cross-device and friends: fall back to a real copy
+            except OSError as e:
+                # Cross-device, or a quota that refuses hard links: fall back to a
+                # real copy. **Say so** -- copying is the one path that needs a
+                # second full-size disk, and it used to be silent: a 20 GB volume
+                # ran out mid-pack packing 6.9 GB of models and the error named
+                # the disk, not the reason (measured 2026-07-13).
+                if on_copy_fallback is not None:
+                    on_copy_fallback(real, e)
+                _copy(real, dest)
         else:
             _copy(real, dest)
     # Prove the placement right here: whether the bytes landed must be answered
@@ -246,9 +387,52 @@ def _place_blob(src: Path, out_blobs: Path, hardlink: bool = True) -> dict:
     return {"sha256": h, "size_bytes": size}
 
 
-def _tar_code_dep(root: Path, install_path: str, work: Path, extra_excludes=(), raw_excludes=()) -> Path:
-    """Tar ``root/install_path`` into a ``--strip-components=1``-compatible
-    tar.gz (single top-level component = basename).
+def _spec_source(root: Path, entry: dict, fallback: str) -> Path:
+    """Where packing reads this entry from (pack-spec 1.3 ``source_path``).
+
+    ``install_path``/``path`` say where a **rebuild** writes; ``source_path`` says
+    where the bytes are **right now**. The two differ when an application keeps
+    its program in one tree and its nodes, models and workflows in another (the
+    ComfyUI desktop build does). Relative is taken from the environment root,
+    absolute as given. Absent = the old behaviour, ``root / fallback``.
+    """
+    sp = str(entry.get("source_path") or "").strip()
+    if not sp:
+        return root / fallback
+    p = Path(sp).expanduser()
+    return p if p.is_absolute() else root / p
+
+
+def _run_record_roots(root: Path, spec: dict, program_dir: Path | None = None) -> list[Path]:
+    """Every tree the extension may have left its run record in, in search order.
+
+    It writes beside ComfyUI's own source, because that is where ``folder_paths``
+    lives. On an installation that keeps the program in a separate tree from the
+    nodes and models (the ComfyUI desktop build), that is **not** under the folder
+    a pack is rooted at, so looking only there finds nothing and the nest quietly
+    carries the guessed-at library list instead of the measured one.
+
+    The program tree comes from ``--program-dir`` or, for a spec that already
+    names it, the host entry's ``source_path`` -- both routes, one answer.
+    """
+    extra: list[Path] = []
+    if program_dir is not None:
+        extra.append(Path(program_dir))
+    for dep in spec.get("code_deps") or []:
+        if isinstance(dep, dict) and dep.get("role") == "host" and dep.get("source_path"):
+            extra.append(_spec_source(root, dep, dep.get("install_path", "")))
+    # Program tree first when there is one: on a two-tree install the data tree
+    # holds no record at all, and anything it does hold is left over from an
+    # earlier single-tree layout.
+    return record_search_roots(root, [*extra, _locate_comfyui_dir(root, None)])
+
+
+def _tar_code_dep(root: Path, install_path: str, work: Path, extra_excludes=(), raw_excludes=(),
+                  source_dir: Path | None = None) -> Path:
+    """Tar the code dep into a ``--strip-components=1``-compatible tar.gz
+    (single top-level component = the source directory's basename; the rebuild
+    strips it and lands the contents at ``install_path``, so the two names are
+    free to differ when ``source_path`` points at another tree).
 
     Generic junk is excluded by name; scene-specific excludes come from the
     spec's ``code_deps[].exclude`` so the tool stays scene-neutral. Spec excludes
@@ -259,8 +443,7 @@ def _tar_code_dep(root: Path, install_path: str, work: Path, extra_excludes=(), 
     ``raw_excludes`` go to ``tar`` unanchored — the auto-detected
     ``*.so``/``build`` patterns are compiler artifacts that sit at any depth, and
     GNU tar matches unanchored patterns by basename at any depth."""
-    ip = Path(install_path)
-    src_dir = root / ip
+    src_dir = source_dir if source_dir is not None else root / Path(install_path)
     if not src_dir.is_dir():
         raise PackError(f"Can't find the code folder to pack: {src_dir}", exit_code=int(ExitCode.USAGE))
     if src_dir.is_symlink():
@@ -278,15 +461,30 @@ def _tar_code_dep(root: Path, install_path: str, work: Path, extra_excludes=(), 
             exit_code=int(ExitCode.USAGE),
         )
     _refuse_undownloaded_code(src_dir, install_path, extra_excludes)
-    parent = root / ip.parent if ip.parent != Path(".") else root
-    base = ip.name
+    parent = src_dir.parent
+    base = src_dir.name
     out_tar = work / f"{base}.tar.gz"
-    junk = [".git", "__pycache__", "*.pyc", ".venv", "venv", "node_modules"]
+    # `.renest` is **our own** state area inside the user's environment (hash cache,
+    # restore state, evidence, the extension's run record). It never travels: it holds
+    # this machine's absolute paths -- a home directory carries the user's name -- and
+    # it is one machine's measurement, so a nest packed after restoring it elsewhere
+    # would carry the first machine's reading as its own.
+    # End-to-end guard: tests/consistency/test_nest_carries_no_machine_paths.py
+    junk = [*ARCHIVE_JUNK, "*.pyc"]
     anchored = [f"{base}/{e.strip('/')}" for e in extra_excludes]
     excludes = junk + anchored + list(raw_excludes)
     subprocess.run(  # noqa: S603
         ["tar", *[f"--exclude={e}" for e in excludes], "-czf", str(out_tar), "-C", str(parent), base],
         check=True,
+        # COPYFILE_DISABLE stops macOS tar writing an `._name` sidecar next to every file
+        # carrying an extended attribute. Those sidecars are not on disk -- tar invents
+        # them -- and on a Linux pod they unpack as real files. A `._node.py` beside a
+        # node's `node.py` is binary junk that anything scanning the folder may try to
+        # read; this project already lost a deploy to exactly that (alembic read a
+        # `._auth.py` and died on "source code string cannot contain null bytes").
+        # Measured 2026-08-14: packing the same fixture with and without it, the archive
+        # goes from 6 members to 3. Ignored by GNU tar on Linux, so it is safe everywhere.
+        env={**os.environ, "COPYFILE_DISABLE": "1"},
     )
     _zero_gzip_mtime(out_tar)
     return out_tar
@@ -310,16 +508,15 @@ def _zero_gzip_mtime(path: Path) -> None:
 #: dirs never scanned for `.so` / never treated as a node's own build signal
 #: (mirrors _tar_code_dep's junk list — a vendored dep's own .venv shouldn't
 #: count as "this node has a build path").
-_JUNK_DIRS = frozenset({".git", "__pycache__", ".venv", "venv", "node_modules"})
+_JUNK_DIRS = frozenset(ARCHIVE_JUNK)
 
 
-def _packed_files(src_dir: Path, exclude=()):
-    """Iterate the files of a code dep that really end up in its archive
-    (junk dirs and the spec's own excludes come off first)."""
+def _packed_entries(src_dir: Path, exclude=()):
+    """Every path of a code dep that survives the archive's filters — files,
+    folders and symlinks alike (junk dirs and the spec's own excludes come off
+    first)."""
     ex_prefixes = [e.strip("/") for e in exclude]
     for p in src_dir.rglob("*"):
-        if not p.is_file():
-            continue
         parts = p.relative_to(src_dir).parts
         if _JUNK_DIRS & set(parts) or any(part.endswith(".pyc") for part in parts):
             continue
@@ -327,6 +524,29 @@ def _packed_files(src_dir: Path, exclude=()):
         if any(rel == e or rel.startswith(e + "/") for e in ex_prefixes):
             continue
         yield rel, p
+
+
+def _packed_files(src_dir: Path, exclude=()):
+    """Iterate the files of a code dep that really end up in its archive."""
+    for rel, p in _packed_entries(src_dir, exclude):
+        if p.is_file():
+            yield rel, p
+
+
+def _symlinks_leaving_the_archive(src_dir: Path, exclude=()) -> list[tuple[str, str]]:
+    """Symlinks inside a code dep that point out of it, as (path, where it points).
+
+    tar stores such a link, never the bytes behind it, so the archive verifies by
+    sha256 and the restored tree holds a link to a path nobody else has."""
+    base = src_dir.resolve()
+    out: list[tuple[str, str]] = []
+    for rel, p in _packed_entries(src_dir, exclude):
+        if not p.is_symlink():
+            continue
+        with contextlib.suppress(OSError):
+            if not p.resolve().is_relative_to(base):
+                out.append((rel, os.readlink(p)))
+    return sorted(out)
 
 
 def _lfs_pointer_files(src_dir: Path, exclude=()) -> list[str]:
@@ -407,6 +627,36 @@ def _dir_size_as_packed(src_dir: Path, exclude=()) -> int:
     return total
 
 
+def _declared_assets_inside(spec: dict, install_path: str, already=()) -> list[str]:
+    """Assets named in ``files[]`` that physically sit inside this code directory.
+
+    Returned relative to the archive root, so a caller can anchor them like any
+    other exclude. Each of these already travels as its own blob, so a copy in
+    the archive is the same bytes packed a second time — a real run doubled the
+    nest that way. Worse for a restricted file: it must not travel, yet the
+    archive would carry it anyway. Entries the spec already excludes are left
+    out, so a spec that got this right stays silent.
+    """
+    ip = str(install_path).strip("/")
+    if not ip:
+        return []
+    covered = [str(e).strip("/") for e in already]
+    out: set[str] = set()
+    for f in spec.get("files") or []:
+        # Files rooted in a model cache live outside the environment root, so
+        # they can never be inside a code directory.
+        if not isinstance(f, dict) or (f.get("root") or "env") != "env":
+            continue
+        rel = str(f.get("path") or "").strip("/")
+        if not rel or not rel.startswith(ip + "/"):
+            continue
+        inner = rel[len(ip) + 1:]
+        if any(inner == c or inner.startswith(c + "/") for c in covered):
+            continue
+        out.add(inner)
+    return sorted(out)
+
+
 def _find_so_files(src_dir: Path, exclude=()) -> list[Path]:
     """`.so` files anywhere under ``src_dir``, excluding junk dirs and any
     subtree already covered by ``exclude`` — a nested dir that is its own
@@ -454,14 +704,31 @@ def _has_build_path(src_dir: Path) -> bool:
     return False
 
 
+#: Where a CUDA install puts the binary reader when it is not on PATH. The machine
+#: this was measured on (2026-07-26) had it only here, and looking on PATH alone
+#: would have recorded nothing at all for an environment full of CUDA extensions.
+_CUOBJDUMP_FALLBACK = "/usr/local/cuda/bin/cuobjdump"
+
+
+def _cuobjdump() -> str | None:
+    """The CUDA binary reader, or ``None`` when this machine has none."""
+    found = shutil.which("cuobjdump")
+    if found:
+        return found
+    return _CUOBJDUMP_FALLBACK if Path(_CUOBJDUMP_FALLBACK).is_file() else None
+
+
 def _probe_so_arch(so_path: Path) -> list[str] | None:
     """Best effort at detecting which GPU architectures a kept vendored ``.so``
     was compiled for (``cuobjdump --list-elf``, parsing ``sm_NN``). No
     ``cuobjdump`` / not a CUDA binary / nothing parseable → honestly return
     ``None`` (skip, never invent — the same discipline manifest.gpu follows)."""
+    tool = _cuobjdump()
+    if tool is None:
+        return None
     try:
         result = subprocess.run(  # noqa: S603
-            ["cuobjdump", "--list-elf", str(so_path)],
+            [tool, "--list-elf", str(so_path)],
             capture_output=True,
             text=True,
             timeout=30,
@@ -472,6 +739,84 @@ def _probe_so_arch(so_path: Path) -> list[str] | None:
         return None
     archs = sorted({f"sm_{m}" for m in re.findall(r"sm_(\d+)", result.stdout)})
     return archs or None
+
+
+#: Ceilings on reading installed binaries. One environment can hold hundreds of
+#: them and each is opened on its own, so without a ceiling this one step could
+#: outlast the packing of the bytes themselves. Order decides what fits: the
+#: packages a rebuild is known to fail on go first, the rest alphabetically.
+_ARCH_SCAN_MAX_FILES = 200
+_ARCH_SCAN_BUDGET_S = 180.0
+
+
+def _package_so_files(site: Path) -> list[Path]:
+    """Compiled binaries installed under ``site``, most decisive first.
+
+    Fixed order, so two packs of one environment record the same thing. A file
+    sitting straight in ``site`` with no package folder above it is left out --
+    there is no owner name to put beside it, and inventing one is worse than
+    recording nothing.
+    """
+    seen: dict[Path, None] = {}
+    for pattern in ("*.so", "*.so.*"):
+        for p in site.rglob(pattern):
+            rel = p.relative_to(site)
+            if len(rel.parts) < 2 or _JUNK_DIRS & set(rel.parts) or not p.is_file():
+                continue
+            seen.setdefault(p, None)
+    critical = set(CRITICAL_PACKAGES)
+    return sorted(
+        seen,
+        key=lambda p: (
+            0 if p.relative_to(site).parts[0] in critical else 1,
+            p.relative_to(site).as_posix(),
+        ),
+    )[:_ARCH_SCAN_MAX_FILES]
+
+
+def _target_site_packages(python_path: str | None) -> Path | None:
+    """Where the environment being packed keeps its installed packages.
+
+    Asked of that interpreter itself, never assumed from the folder layout: a pack
+    can be pointed at another environment's Python with ``--env-python``. With no
+    interpreter named, the one running pack **is** the environment's -- the same
+    fallback the rest of the fingerprint takes. ``None`` when neither can answer.
+    """
+    if python_path:
+        return interpreter_site_packages(python_path)
+    import sysconfig
+
+    here = sysconfig.get_paths().get("purelib")
+    return Path(here) if here else None
+
+
+def _collect_package_native_archs(site: Path) -> list[dict]:
+    """Which card generations each installed compiled package was built for.
+
+    Reading PyTorch's own list alone is wrong in both directions (measured
+    2026-07-26 on an RTX 3060): one attention library's main binary covered
+    sm_60/70/75/80/90 and omitted sm_86 -- the packing machine's own card --
+    while a quantisation library shipped binaries covering more than PyTorch
+    did. Recorded per binary, because binaries inside one package differ.
+
+    Yielding nothing is the normal outcome, not an error: 18 of 29 binaries in
+    that measurement gave nothing (pure-CPU libraries, non-NVIDIA variants, C++
+    glue). Those are left out entirely -- never written down as "no targets",
+    which a reader would take for a positive finding.
+    """
+    if _cuobjdump() is None:
+        return []
+    deadline = time.monotonic() + _ARCH_SCAN_BUDGET_S
+    out: list[dict] = []
+    for so in _package_so_files(site):
+        if time.monotonic() > deadline:
+            break
+        archs = _probe_so_arch(so)
+        if not archs:
+            continue
+        rel = so.relative_to(site)
+        out.append({"package": rel.parts[0], "path": rel.as_posix(), "sm_list": archs})
+    return out
 
 
 def _declare_mine(fspec: dict, mine: set[str] | None, warnings: list[str]) -> dict:
@@ -772,9 +1117,10 @@ def _attach_recipes(manifest: dict, place, dry_run: bool, work: Path, recipes: l
 def _scan_spec_for_secrets(root: Path, spec: dict) -> tuple[list, list[str]]:
     """[SECURITY-REVIEW] Scan every **code directory** that is about to be packed.
 
-    What gets scanned are the ``code_deps[].install_path`` trees — because those
-    are the places where a whole directory is packed as-is. ``files[]`` holds
-    individually named assets (models, material) and is not in scope here.
+    What gets scanned are the ``code_deps[]`` trees **as they sit on this machine**
+    (``source_path`` when given, else ``install_path``) — because those are the
+    places where a whole directory is packed as-is. ``files[]`` holds individually
+    named assets (models, material) and is not in scope here.
 
     Each tree skips nested subdirectories that are their own ``code_dep``, so the
     same bytes are not reported twice (same handling as :func:`_find_so_files`).
@@ -811,15 +1157,34 @@ def _scan_spec_for_secrets(root: Path, spec: dict) -> tuple[list, list[str]]:
     for d, ip in zip(deps, paths, strict=True):
         if not ip:
             continue
-        src = root / ip
+        # [SECURITY-REVIEW] Read where the bytes actually are. A dep packed out of a
+        # second tree (``source_path``) would otherwise be scanned at a path holding
+        # nothing, and an empty scan is indistinguishable from a clean one.
+        src = _spec_source(root, d, ip)
         # Other code_deps nested inside (e.g. each custom node under ComfyUI)
-        # are scanned on their own pass.
+        # are scanned on their own pass, so they come out of this one.
+        # [SECURITY-REVIEW] The exclusion is the nested dep's **whole path**. It used
+        # to be only its first path component, which meant one node folder having an
+        # entry of its own took all of ``custom_nodes/`` out of the host's scan --
+        # and node folders the workflow never named have no entry, so their bytes
+        # rode into the host archive having never been looked at. The scan report
+        # said "no credentials found" without having opened them. Found 2026-08-30.
         nested = frozenset(
-            Path(o).relative_to(ip).parts[0]
+            Path(o).relative_to(ip).as_posix()
             for o in paths
             if o and o != ip and (o + "/").startswith(ip + "/")
         )
-        h, s = scan_tree(src, exclude=nested)
+        # [SECURITY-REVIEW] The dep's own ``exclude`` comes off too: those bytes never
+        # enter the archive, yet a hit there is a **hard stop** (exit USAGE, nothing
+        # written). ComfyUI excludes ``user/``, and a key typed into its settings screen
+        # lands in ``user/default/comfy.settings.json`` -- that alone made packing
+        # impossible without ``--i-know``. Found 2026-08-30. Only the spec's own list:
+        # ``_declared_assets_inside`` entries leave the code archive merely because each
+        # travels as its own blob, so their bytes DO ship and must stay in scope.
+        own = frozenset(
+            e for e in (str(x).strip("/") for x in (d.get("exclude") or [])) if e
+        )
+        h, s = scan_tree(src, exclude=nested | own)
         prefix = d.get("name") or ip
         hits += [type(x)(f"{prefix}/{x.path}", x.line, x.what, x.sample) for x in h]
         suspicious += [f"{prefix}/{x}" for x in s]
@@ -872,7 +1237,7 @@ class _ProgressTracker:
     def _plan(root: Path, spec: dict) -> int:
         total = 0
         for dep in spec.get("code_deps", []):
-            d = root / dep.get("install_path", "")
+            d = _spec_source(root, dep, dep.get("install_path", ""))
             with contextlib.suppress(OSError):
                 if d.is_dir():
                     # **Only what really gets packed** — same function the dry run uses.
@@ -880,14 +1245,16 @@ class _ProgressTracker:
                     # (they travel one by one through ``files[]``, not in this archive),
                     # and the venv and .git as well: a real 20 GB run reported a
                     # 797 GB denominator, so the bar stopped at 2.6% and looked stuck.
-                    total += _dir_size_as_packed(d, dep.get("exclude", []))
+                    ex = list(dep.get("exclude", [])) + _declared_assets_inside(
+                        spec, dep.get("install_path", ""), dep.get("exclude", []))
+                    total += _dir_size_as_packed(d, ex)
         lock_path = spec.get("python_lock", {}).get("lockfile_path")
         if lock_path:
             with contextlib.suppress(OSError):
                 total += (root / lock_path).stat().st_size
         for fspec in spec.get("files", []):
             with contextlib.suppress(OSError, KeyError):
-                total += (root / fspec["path"]).stat().st_size
+                total += _spec_source(root, fspec, fspec["path"]).stat().st_size
         return total
 
     def advance(self, stage: str, n_bytes: int, source: str) -> None:
@@ -1045,15 +1412,22 @@ def _build_manifest(
     no_licence_lookup: bool = False,
     mine: set[str] | None = None,
     emitter: EventEmitter | None = None,
+    cache: HashCache | None = None,
+    program_dir: Path | None = None,
 ) -> tuple[dict, list[dict]]:
-    """P1 + P2: scan/hash + assemble the v1 manifest. Returns (manifest, inventory)."""
+    """P1 + P2: scan/hash + assemble the v1 manifest. Returns (manifest, inventory).
+
+    ``program_dir`` only says where to also look for the extension's run record
+    when the program lives in a tree of its own; every byte still comes from the
+    spec.
+    """
     nest_id = spec.get("id") or ulid()
     # A real pack takes tens of minutes, so without progress events a UI watching
     # through the API can only show a frozen 0% bar: no way to tell "working"
     # from "hung".
     tracker = _ProgressTracker(emitter, root, spec) if (emitter and not dry_run) else None
     manifest: dict = {
-        "format_version": "2.8",
+        "format_version": "2.9",
         "id": nest_id,
         "created_at": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "runtime": spec["runtime"],
@@ -1126,6 +1500,17 @@ def _build_manifest(
                 rt = dict(manifest.get("runtime") or {})
                 rt.setdefault("gpu_model", name)
                 manifest["runtime"] = rt
+        # Which card generations each installed compiled package was built for.
+        # PyTorch's own list answers for PyTorch and nothing else -- measured, one
+        # library was built for every card except the packing machine's own. The
+        # field and the machine check that reads it have both existed since 2.0;
+        # nothing ever filled it in. setdefault because the node side lands in the
+        # same block after the code_deps loop below.
+        _site = _target_site_packages(py)
+        if _site is not None and _site.is_dir():
+            _pkg_archs = _collect_package_native_archs(_site)
+            if _pkg_archs:
+                manifest.setdefault("gpu", {})["package_native_archs"] = _pkg_archs
         # Two facts that decide whether a pre-built wheel can install on the target
         # (format 2.4). The platform tag is the authority; the C library is one of
         # the things that shapes it. Measured: one machine accepted 690 tags.
@@ -1150,7 +1535,25 @@ def _build_manifest(
         # (format 2.6). They cannot be packed, so a machine missing one restores every
         # byte and still loses whole plugins. Collected nothing → write nothing: an
         # empty list would read as "this run needed none".
-        libs = collect_native_libs(root, py)
+        # Where the extension may have left its run record is a fact about how the
+        # application is installed, not about this stage -- `_run_record_roots` answers
+        # it, and the video-memory reading further down reads the same record.
+        _rec_roots = _run_record_roots(root, spec, program_dir)
+        libs, _own = collect_native_libs_with_layers(root, py, record_roots=_rec_roots)
+        if _own:
+            # Left off the list on purpose, and said out loud rather than dropped: a
+            # rebuild creates its own interpreter, so a machine without these is short
+            # of nothing. Listing them made a machine that worked perfectly report
+            # three missing libraries (measured 2026-08-30, nest 01M186XFJ9Y9WBJN3H66CY8F5A).
+            _where = sorted({str(Path(p).parent) for p in _own.values()})
+            warnings.append(
+                f"{len(_own)} librar{'y' if len(_own) == 1 else 'ies'} this run loaded "
+                f"came from the Python installation that packed it ({', '.join(_where[:2])}), "
+                f"not from the machine: {', '.join(sorted(_own)[:5])}"
+                f"{'…' if len(_own) > 5 else ''}. They are not recorded as machine "
+                f"requirements, because a rebuild builds its own Python and never uses "
+                f"that one."
+            )
         if libs:
             rt = dict(manifest.get("runtime") or {})
             rt.setdefault("native_libs", libs)
@@ -1171,6 +1574,17 @@ def _build_manifest(
                     "load once, and pack again with it still running -- then we ask it what "
                     "it actually loaded."
                 )
+
+        # How much video memory the working run was seen using, out of that same
+        # record. Only something inside the application can read it while the run is
+        # alive, and by packing time the process is usually gone. Nothing read → write
+        # nothing: a nest without the figure means nobody measured, and the check that
+        # reads it says exactly that instead of quietly passing.
+        for candidate in _rec_roots:
+            seen_vram = observed_use_from_record(read_run_record(candidate))
+            if seen_vram:
+                manifest.setdefault("gpu", {})["observed_use"] = seen_vram
+                break
 
     inventory: list[dict] = []
     node_arch_entries: list[dict] = []  # kept-vendored .so target archs -> manifest.gpu
@@ -1193,7 +1607,24 @@ def _build_manifest(
             if dep.get(k):
                 entry[k] = dep[k]
         entry["install_path"] = dep["install_path"]
-        src_dir = root / dep["install_path"]
+        # install_path is the destination recorded in the nest; source_path (when
+        # given) is the only thing that changes -- where we read from.
+        src_dir = _spec_source(root, dep, dep["install_path"])
+
+        # Models sitting under the code folder used to need a hand-written exclude to
+        # stay out of its archive; without one the same bytes were packed twice and the
+        # nest doubled. Take them out here instead, and use one exclude list for every
+        # step below so the dry run's size, the scans and the archive agree.
+        auto_ex = _declared_assets_inside(spec, dep["install_path"], dep.get("exclude", []))
+        dep_ex = list(dep.get("exclude", [])) + auto_ex
+        if auto_ex:
+            shown = ", ".join(auto_ex[:3]) + (f" and {len(auto_ex) - 3} more"
+                                              if len(auto_ex) > 3 else "")
+            warnings.append(
+                f"{dep['name']}: {len(auto_ex)} file(s) listed under files[] sit inside this "
+                f"code folder ({shown}). They are left out of its archive — each one travels "
+                f"on its own, and packing them twice would make the nest twice the size."
+            )
 
         # -- "strip by default, tell the user to recompile": node .so routing --
         raw_excludes: list[str] = []
@@ -1205,7 +1636,20 @@ def _build_manifest(
             dg = dirty_gap(dep["name"], src_dir)
             if dg:
                 warnings.append(dg)
-            so_files = _find_so_files(src_dir, dep.get("exclude", []))
+            # Symlinks reaching out of the tree. We warn instead of following them:
+            # a link into a shared model cache would drag that whole cache into the
+            # code archive, and the manifest's files[] paths say nothing about links.
+            escaping = _symlinks_leaving_the_archive(src_dir, dep_ex)
+            if escaping:
+                shown = "; ".join(f"{rel} -> {target}" for rel, target in escaping[:3])
+                warnings.append(
+                    f"{dep['name']}: {len(escaping)} symlink(s) point outside the code "
+                    f"archive, so they travel as links and come back as dead links after a "
+                    f"restore — the nest still passes its byte check ({shown}). Replace them "
+                    f"with the real files, or list them in code_deps[].exclude if the "
+                    f"rebuild does not need them."
+                )
+            so_files = _find_so_files(src_dir, dep_ex)
             if so_files:
                 if _has_build_path(src_dir):
                     raw_excludes = ["*.so", "build"]
@@ -1246,12 +1690,13 @@ def _build_manifest(
         # counting the host app itself among the "custom nodes".
         dep_ident = {"dep_role": role, "path": dep["install_path"]}
         if dry_run:
-            size = _dir_size_as_packed(src_dir, dep.get("exclude", []))
+            size = _dir_size_as_packed(src_dir, dep_ex)
             inventory.append(
                 {"role": "code_dep", "name": dep["name"], **dep_ident, "approx_bytes": size}
             )
         else:
-            tar = _tar_code_dep(root, dep["install_path"], work, dep.get("exclude", []), raw_excludes)
+            tar = _tar_code_dep(root, dep["install_path"], work, dep_ex, raw_excludes,
+                                source_dir=src_dir)
             blob = place(tar, hardlink=False)
             if blob["size_bytes"] > FAT_ARCHIVE:
                 warnings.append(
@@ -1267,11 +1712,11 @@ def _build_manifest(
             entry["post_install"] = dep["post_install"]
         # What was deliberately left out of this archive (format 2.6). Both halves
         # belong in it: the spec's own list and what we dropped by ourselves above
-        # (compiled .so files we expect to be rebuilt, and build/). Without this a
-        # recipient cannot tell a complete source tree from a trimmed one — same
-        # repository, same commit, one directory missing, manifest looks healthy.
-        # Disclosure only; nothing on the reading side replays it.
-        _left_out = [str(x) for x in (dep.get("exclude") or [])] + list(raw_excludes)
+        # (compiled .so files we expect to be rebuilt, build/, and assets that travel
+        # on their own). Without this a recipient cannot tell a complete source tree
+        # from a trimmed one — same repository, same commit, one directory missing,
+        # manifest looks healthy. Disclosure only; nothing on the reading side replays it.
+        _left_out = [str(x) for x in dep_ex] + list(raw_excludes)
         if _left_out:
             entry["exclude"] = _left_out
         # What licence this code is under. The host app is usually copyleft ("use
@@ -1285,7 +1730,7 @@ def _build_manifest(
         # Whether this code matches the upstream it claims to be. It has to land
         # in the manifest, not just in a hint to the packer: "this extension has
         # been modified" is how a recipient spots a poisoned supply chain.
-        um = upstream_match(root / str(dep.get("install_path") or ""))
+        um = upstream_match(src_dir)
         if um:
             entry["upstream_match"] = um
         manifest["code_deps"].append(entry)
@@ -1316,14 +1761,14 @@ def _build_manifest(
             f"pack-spec, if whoever restores this should get it too."
         )
 
-    # -- python_lock: the dependency list is collected in three tiers, in order --
-    #   1. the environment has a lock file → pack it as-is;
-    #   2. no lock file, but the Python that runs this environment can be found →
-    #      ask it right now for the list of what is installed;
-    #   3. not even an interpreter → leave the field out and warn.
-    # Tier 2 must fire for **every** entry point, not only for capture-inferred
-    # specs: a nest with no dependency list makes the restore side type in
-    # hundreds of versions by hand, which is the same as not having packed.
+    # -- python_lock: four tiers, in order (the format spec carries the full table) --
+    #   1. a lock file in the environment → pack it as-is;
+    #   2. no lock file but its Python runs here → ask it what is installed;
+    #   3. that Python will not run here (built for another operating system) →
+    #      read the installed packages' own metadata off disk;
+    #   4. not even that → leave the field out and warn.
+    # Tiers 2-3 must fire for **every** entry point: a nest with no dependency list
+    # makes the restore side type in hundreds of versions by hand.
     pl = spec.get("python_lock")
     if pl is None:
         _exe = env_python or find_env_python(venv_python_candidates(root))
@@ -1448,38 +1893,43 @@ def _build_manifest(
                 "archive is still a faithful record of this machine."
             )
         pinned: list[tuple[str, str]] = []
-        if local_ver and pin_wheels and not dry_run:
+        if pin_wheels and not dry_run:
             # Explicit pinning (--pin-wheels): the one step in pack that touches
             # the network; the zero-network default is unchanged.
             py_ver = (spec.get("runtime") or {}).get("python_version", "")
-            try:
-                new_text, pinned = pin_lock_text(
-                    lock_text,
-                    python_tag_of(py_ver),
-                    # **Wheels must be chosen for the chip doing the packing.**
-                    # Omit this and the x86_64 default applies: packing on ARM
-                    # pins Intel wheels, and the archive verifies green while
-                    # installing nowhere.
-                    wheel_platform_tags(),
-                    client=client,
-                )
-            except WheelPinError as e:
-                # Honest boundary: a failed pin is a hard failure. Skipping
-                # silently = shipping a nest that passes sha256 and can never be
-                # installed again.
-                raise PackError(str(e), exit_code=int(ExitCode.USAGE)) from e
-            if pinned:
-                lock_src = work / "requirements.lock"
-                lock_src.write_text(new_text)
-                warnings.append(
-                    f"{len(pinned)} package(s) carry a vendor-only version PyPI doesn't have; "
-                    f"they now point at direct wheel URLs: "
-                    + ", ".join(name for name, _ in pinned)
-                    + ". From here on this lock is betting that wheel host stays up. "
-                    "(The wheels_archived switch that would bundle the wheel files into "
-                    "the nest is designed but NOT built yet — setting it only records "
-                    "your intent in the manifest, it does not archive anything.)"
-                )
+            # **Fingerprints are not conditional on there being a vendor build.**
+            # This block used to also require local_ver, so an ordinary lock got no
+            # fingerprints at all and --package-source then promised a check that
+            # could not happen. Pinning needs local_ver; recording hashes does not.
+            if local_ver:
+                try:
+                    new_text, pinned = pin_lock_text(
+                        lock_text,
+                        python_tag_of(py_ver),
+                        # **Wheels must be chosen for the chip doing the packing.**
+                        # Omit this and the x86_64 default applies: packing on ARM
+                        # pins Intel wheels, and the archive verifies green while
+                        # installing nowhere.
+                        wheel_platform_tags(),
+                        client=client,
+                    )
+                except WheelPinError as e:
+                    # Honest boundary: a failed pin is a hard failure. Skipping
+                    # silently = shipping a nest that passes sha256 and can never be
+                    # installed again.
+                    raise PackError(str(e), exit_code=int(ExitCode.USAGE)) from e
+                if pinned:
+                    lock_src = work / "requirements.lock"
+                    lock_src.write_text(new_text)
+                    warnings.append(
+                        f"{len(pinned)} package(s) carry a vendor-only version PyPI doesn't "
+                        f"have; they now point at direct wheel URLs: "
+                        + ", ".join(name for name, _ in pinned)
+                        + ". From here on this lock is betting that wheel host stays up. "
+                        "(The wheels_archived switch that would bundle the wheel files into "
+                        "the nest is designed but NOT built yet — setting it only records "
+                        "your intent in the manifest, it does not archive anything.)"
+                    )
             # While we are online, also record a content fingerprint for every
             # package. It can only come from the index: once a package is
             # installed the .whl is gone, so the question is unanswerable
@@ -1638,7 +2088,12 @@ def _build_manifest(
                 f"itself, plus the two known model-cache folders, can be packed."
             )
             return None
-        if froot == "env":
+        if fspec.get("source_path"):
+            # pack-spec 1.3: read the bytes from a second tree, land them at `path`.
+            # `root`/`path` still decide where a rebuild writes, so the allowlist
+            # check above keeps its full meaning.
+            src = _spec_source(root, fspec, fspec["path"])
+        elif froot == "env":
             src = root / fspec["path"]
             if not src.is_file():
                 src = _resolve_via_extra_model_paths(root, fspec["path"]) or src
@@ -1647,10 +2102,27 @@ def _build_manifest(
         if not src.is_file():
             raise PackError(f"Asset file is missing: {src}", exit_code=int(ExitCode.USAGE))
         if dry_run:
-            h, size = _sha256_stream(src)
+            h, size = _sha256_stream(src, cache)
             blob = {"sha256": h, "size_bytes": size}
         else:
             blob = place(src, hardlink=True)
+        # Cross-check against the hash capture measured. The window between
+        # capture and pack is real (a download finishing, a model swapped by
+        # hand), and without this the nest verifies green byte for byte while
+        # holding a file the recipe was never proven against. Both now read
+        # through one hash record, so what watches this window on a first pack
+        # is the size/time/inode triple -- either event moves one of the three
+        # and forces the re-read; `--full-rehash` forces it unconditionally.
+        want = fspec.get("expected_sha256")
+        if want and want != blob["sha256"]:
+            raise PackError(
+                f"This is not the file that was captured: {fspec['path']}. Captured "
+                f"{want[:12]}…, on disk now {blob['sha256'][:12]}… — it was replaced or "
+                "rewritten in between, so the run this nest is built from never used these "
+                "bytes. Capture again to pack what is there now; if you swapped it on "
+                "purpose, delete that file's expected_sha256 line from the spec.",
+                exit_code=int(ExitCode.S2_HASH_MISMATCH),
+            )
         # Bad-bytes health check: a hand-written spec bypasses capture entirely,
         # so this is the last gate asking "do these bytes look like complete
         # weights". Report only, never block — the user may genuinely want to
@@ -1658,6 +2130,26 @@ def _build_manifest(
         bad = probe_model_bytes(src, blob["size_bytes"], logical_name=fspec["path"])
         if bad:
             warnings.append(f"Doesn't look like a complete file: {bad}")
+        # A model cache names its big files after their own sha256, so that name
+        # is a free second opinion on the bytes we just hashed. It stays a second
+        # opinion: the address recorded below is always the one we computed, never
+        # a name read off the disk. Names of any other length in that folder are a
+        # different digest and are ignored, not converted.
+        claimed = cache_stated_sha256(src.resolve() if src.is_symlink() else src)
+        if claimed and claimed != blob["sha256"]:
+            warnings.append(
+                f"{fspec['path']}: the model cache holds this file under the name "
+                f"{claimed}, but its bytes are {blob['sha256']}. We store the bytes "
+                f"that are here, so this nest is exact; the cached copy has changed "
+                f"since it was downloaded, so download it again before your next run."
+            )
+        # Format 2.4: copy across what the file's own header says its base model
+        # was. A transcription, not our judgement -- measured to match the fed
+        # file's whole-file sha256 character for character. Same header read as
+        # above, so it costs nothing extra. Read **before** the licence lookup:
+        # that lookup names the base in what it tells the user, and the header is
+        # often the only place the name exists.
+        base = declared_base_model(src)
         entry = {
             "path": fspec["path"],
             "blob": blob,
@@ -1665,7 +2157,9 @@ def _build_manifest(
             # returns None and _license_of keeps what the user wrote, marked as
             # their claim — packing must never fail because a lookup failed.
             "license": _license_of(
-                _declare_mine(fspec | {"blob": blob}, mine, warnings), warnings,
+                _declare_mine(
+                    fspec | {"blob": blob, "declared_base_model": base}, mine, warnings
+                ), warnings,
                 license_lookup=None if no_licence_lookup else (
                     lambda fs: _licence_lookup(fs, client=client)
                 ),
@@ -1678,11 +2172,6 @@ def _build_manifest(
         ser = serialization_of(src, logical_name=fspec["path"])
         if ser:
             entry["serialization"] = ser
-        # Format 2.4: copy across what the file's own header says its base model
-        # was. A transcription, not our judgement -- measured to match the fed
-        # file's whole-file sha256 character for character. Same header read as
-        # above, so it costs nothing extra.
-        base = declared_base_model(src)
         if base:
             entry["declared_base_model"] = base
         if froot != "env":
@@ -1814,15 +2303,33 @@ def _iso_utc(ts: float) -> str:
     return datetime.datetime.fromtimestamp(ts, tz=datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _hash_record(cache: HashCache | None, env_root: Path, full_rehash: bool) -> HashCache:
+    """The one record capture and pack share, wherever it came from."""
+    if cache is None:
+        return HashCache(env_root / HASH_CACHE_REL, trust=not full_rehash)
+    cache.attach(env_root / HASH_CACHE_REL)
+    return cache
+
+
 def infer_spec(
     target: str | os.PathLike[str],
     workflow: dict | str | os.PathLike[str],
     *,
     comfyui_dir: str | os.PathLike[str] | None = None,
+    program_dir: str | os.PathLike[str] | None = None,
     env_python: str | os.PathLike[str] | None = None,
+    full_rehash: bool = False,
+    persist_hashes: bool = True,
+    hash_cache: HashCache | None = None,
 ) -> tuple[Path, dict, dict]:
     """Reverse-infer a pack-spec (draft) from a ComfyUI ``target`` + a run-through
     ``workflow`` (inline API-format dict, or a path to one) via :func:`capture`.
+
+    Capture and the pack that follows share one record of what has been hashed,
+    so a weight is read once and not twice; ``full_rehash`` reads regardless, and
+    ``persist_hashes=False`` keeps a dry run from writing anything. Pass
+    ``hash_cache`` to hand that record in — a dry run persists nothing, so
+    sharing the object is the only way the pack after it skips a second read.
 
     Returns ``(env_root, spec, capture_report)`` where ``env_root`` is the root
     the spec's paths are relative to (= the ComfyUI dir's parent). The workflow is
@@ -1849,7 +2356,11 @@ def infer_spec(
         except ValueError:
             wf_rel = None  # workflow outside the env → capture leaves a placeholder
 
-    result = capture(wf_json, cdir, workflow_relpath=wf_rel)
+    hashes = _hash_record(hash_cache, env_root, full_rehash)
+    result = capture(wf_json, cdir, workflow_relpath=wf_rel, hash_cache=hashes,
+                     program_dir=Path(program_dir).resolve() if program_dir else None)
+    if persist_hashes:
+        hashes.save()
     spec, report = result.pack_spec, result.report
     _fill_python_lock_and_version(spec, env_root, cdir, env_python)
 
@@ -1864,9 +2375,17 @@ def infer_spec_current_state(
     target: str | os.PathLike[str],
     *,
     comfyui_dir: str | os.PathLike[str] | None = None,
+    program_dir: str | os.PathLike[str] | None = None,
     env_python: str | os.PathLike[str] | None = None,
+    full_rehash: bool = False,
+    persist_hashes: bool = True,
+    hash_cache: HashCache | None = None,
 ) -> tuple[Path, dict, dict]:
     """Pack the environment as it stands, without asking which run to trust.
+
+    ``full_rehash`` / ``persist_hashes`` carry the same meaning as in
+    :func:`infer_spec`: one shared record of what has been hashed, so the pack
+    that follows does not read the same weights a second time.
 
     Verified evidence comes only from pictures ComfyUI itself wrote under
     ``output/`` — a run that actually finished. A workflow saved under
@@ -1907,7 +2426,11 @@ def infer_spec_current_state(
         except ValueError:
             wf_rel = None
 
-    result = capture(wf_json, cdir, workflow_relpath=wf_rel)
+    hashes = _hash_record(hash_cache, env_root, full_rehash)
+    result = capture(wf_json, cdir, workflow_relpath=wf_rel, hash_cache=hashes,
+                     program_dir=Path(program_dir).resolve() if program_dir else None)
+    if persist_hashes:
+        hashes.save()
     spec, report = result.pack_spec, result.report
     _fill_python_lock_and_version(spec, env_root, cdir, env_python)
 
@@ -2059,6 +2582,7 @@ def pack(
     no_fingerprint: bool = False,
     workflow: dict | str | os.PathLike[str] | None = None,
     comfyui_dir: str | os.PathLike[str] | None = None,
+    program_dir: str | os.PathLike[str] | None = None,
     auto: bool = False,
     framework: str | None = None,
     run_record: dict | None = None,
@@ -2069,6 +2593,8 @@ def pack(
     i_know: bool = False,
     no_licence_lookup: bool = False,
     mine: set[str] | None = None,
+    full_rehash: bool = False,
+    hash_cache: HashCache | None = None,
 ) -> PackReport:
     """Pack a working environment into a nest. Never raises for a pack failure —
     the report's ``exit_code`` carries the verdict.
@@ -2081,10 +2607,27 @@ def pack(
     ``framework`` + ``run_record`` — then :func:`renest.training.capture_training`
     reverse-infers it from the record of the training run that worked (the
     fine-tuning side). The "unreferenced big file" hint and every capture gap
-    land in ``report.findings`` (advisory, never blocks)."""
+    land in ``report.findings`` (advisory, never blocks).
+
+    ``hash_cache`` lets a caller hand in the record of what has already been
+    read. The ComfyUI panel needs it: its confirm page runs a dry run first, and
+    a dry run writes nothing to the user's folder, so without a shared object
+    the pack behind the button reads every weight a second time (measured
+    2026-08-30 through ``renest serve``: 2.00x)."""
     root = Path(root).resolve()
+    # Kept for the manifest stage too, not just for capture: with a spec handed in
+    # ready-made, capture never runs, and this is the only thing that says which
+    # tree the extension wrote its run record in.
+    _program_dir = Path(program_dir).resolve() if program_dir else None
     report = PackReport(dry_run=dry_run)
     warnings: list[str] = []
+    # One record of what has been read, held across capture and the pack that
+    # follows. It gets its file below, once the environment root is known.
+    if hash_cache is None:
+        hash_cache = HashCache(None, trust=not full_rehash)
+    elif full_rehash:
+        # A handed-in record must not quietly outrank "read everything again".
+        hash_cache.trust = False
 
     if spec is None and framework is not None:
         # Fine-tuning side: reverse-infer the spec from the execution record of
@@ -2104,7 +2647,10 @@ def pack(
     if spec is None and workflow is None and auto:
         try:
             root, spec, cap_report = infer_spec_current_state(
-                root, comfyui_dir=comfyui_dir, env_python=env_python
+                root, comfyui_dir=comfyui_dir, program_dir=program_dir,
+                env_python=env_python,
+                full_rehash=full_rehash, persist_hashes=not dry_run,
+                hash_cache=hash_cache,
             )
         except (OSError, ValueError, json.JSONDecodeError) as e:
             report.exit_code = int(ExitCode.USAGE)
@@ -2123,7 +2669,10 @@ def pack(
             return report
         try:
             root, spec, cap_report = infer_spec(
-                root, workflow, comfyui_dir=comfyui_dir, env_python=env_python
+                root, workflow, comfyui_dir=comfyui_dir, program_dir=program_dir,
+                env_python=env_python,
+                full_rehash=full_rehash, persist_hashes=not dry_run,
+                hash_cache=hash_cache,
             )
         except (OSError, ValueError, json.JSONDecodeError) as e:
             report.exit_code = int(ExitCode.USAGE)
@@ -2197,6 +2746,11 @@ def pack(
         if emitter is not None:
             emitter.log(msg, **extra)
 
+    # Repeat packs of the same folder read only what moved. A dry run reads the
+    # record but never writes it — a dry run changes nothing on disk. (A no-op
+    # when capture already attached it: same object, same file.)
+    hash_cache.attach(root / HASH_CACHE_REL)
+
     try:
         with tempfile.TemporaryDirectory() as _work:
             work = Path(_work)
@@ -2206,7 +2760,7 @@ def pack(
                     root, spec, place=place, work=work, env_python=env_python,
                     no_fingerprint=no_fingerprint, warnings=warnings, dry_run=True,
                     pin_wheels=pin_wheels, client=client, no_licence_lookup=no_licence_lookup,
-                    mine=mine,
+                    mine=mine, cache=hash_cache, program_dir=_program_dir,
                 )
                 report.nest_id = manifest["id"]
                 report.manifest = manifest
@@ -2221,8 +2775,15 @@ def pack(
 
             out_blobs = out / "blobs" / "sha256"
             out_blobs.mkdir(parents=True, exist_ok=True)
+            copied_instead: list[str] = []
+
+            def _note_copy(path: Path, err: OSError) -> None:
+                if not copied_instead:
+                    copied_instead.append(f"{path} ({err.strerror or err})")
+
             place = lambda src, hardlink=True: _place_blob(  # noqa: E731
-                src, out_blobs, hardlink and not no_hardlink
+                src, out_blobs, hardlink and not no_hardlink, cache=hash_cache,
+                on_copy_fallback=None if no_hardlink else _note_copy,
             )
             # Per-stage announcements: whoever is watching needs to know whether
             # we are moving bytes (P1), writing the manifest (P2), or
@@ -2233,8 +2794,20 @@ def pack(
                 root, spec, place=place, work=work, env_python=env_python,
                 no_fingerprint=no_fingerprint, warnings=warnings, dry_run=False,
                 pin_wheels=pin_wheels, client=client, no_licence_lookup=no_licence_lookup,
-                mine=mine, emitter=emitter,
+                mine=mine, emitter=emitter, cache=hash_cache, program_dir=_program_dir,
             )
+            # Saved as soon as the reading is done: what was read stays true even
+            # if a later stage fails, and a retry should not pay for it twice.
+            hash_cache.save()
+            if copied_instead:
+                warnings.append(
+                    "This disk would not let us hard-link files into the nest, so they were "
+                    f"copied instead — the nest now takes a second full-size copy of every "
+                    f"file on it. First one: {copied_instead[0]}. If the disk runs out "
+                    "part-way through, that is why: give the output folder (--out) a disk "
+                    "with room for the whole thing a second time, or put it on the same "
+                    "filesystem as the files being packed."
+                )
             if emitter is not None:
                 emitter.stage_start("P2", "Writing the manifest")
             _refuse_unresolved_placeholders(manifest)
@@ -2393,6 +2966,14 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--comfyui-dir", help="ComfyUI folder (found under --dir automatically if omitted)")
     parser.add_argument(
+        "--program-dir",
+        help="Where ComfyUI's own program files are, when they are not in the same folder "
+             "as your nodes and models — the ComfyUI desktop app keeps them apart. That "
+             "folder supplies ComfyUI itself and the version it is at; your nodes, models "
+             "and workflow still come from the other one. The nest that comes out is an "
+             "ordinary ComfyUI install either way",
+    )
+    parser.add_argument(
         "--framework",
         choices=["kohya", "llamafactory"],
         help="pack a training setup instead of a ComfyUI one — needs --run-record",
@@ -2405,6 +2986,13 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--out", help="Output folder, laid out like the drive (nests/ + blobs/); not needed for --dry-run")
     parser.add_argument("--no-hardlink", action="store_true", help="Always copy files instead of hardlinking them")
+    parser.add_argument(
+        "--full-rehash",
+        action="store_true",
+        help="Read every file from disk again. By default a repeat pack of this folder "
+             "re-reads only files whose size, time or place on disk moved since last "
+             "time — use this if you suspect a file changed without any of those moving",
+    )
     parser.add_argument("--env-python", help="Python interpreter of the environment being packed (we read its details from there)")
     parser.add_argument("--no-fingerprint", action="store_true")
     parser.add_argument(
@@ -2655,6 +3243,7 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
         no_fingerprint=args.no_fingerprint,
         workflow=args.workflow,
         comfyui_dir=getattr(args, "comfyui_dir", None),
+        program_dir=getattr(args, "program_dir", None),
         auto=auto,
         framework=framework,
         run_record=run_record,
@@ -2664,6 +3253,7 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
         i_know=getattr(args, "i_know", False),
         no_licence_lookup=getattr(args, "no_licence_lookup", False),
         mine=set(getattr(args, "mine", None) or ()),
+        full_rehash=getattr(args, "full_rehash", False),
     )
     # Pack succeeded → record "this folder → this nest" in the target
     # directory's state area, so the next pack picks up where this one left off.

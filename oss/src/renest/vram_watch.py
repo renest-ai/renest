@@ -23,10 +23,12 @@ __all__ = [
     "ADVICE_LEVEL",
     "DEFAULT_INTERVAL_S",
     "MISSING_MEANS",
+    "RECORD_KEY",
     "STATS_PATH",
     "DeviceVram",
     "VramWatchResult",
     "VramWatcher",
+    "observed_use_from_record",
     "read_devices",
     "sample_once",
 ]
@@ -52,6 +54,12 @@ MISSING_MEANS = (
     "No reading here means we did not measure video memory use on this run. "
     "It does not mean the run needs none."
 )
+
+
+#: Where a finished run's record keeps these readings. Only something inside the
+#: application is there at the moment they mean anything, so the extension takes them
+#: while the run happens and packing copies them out of the record hours later.
+RECORD_KEY = "video_memory"
 
 
 def _num(value: Any) -> float | None:
@@ -108,6 +116,28 @@ def read_devices(payload: Any) -> list[dict]:
             }
         )
     return out
+
+
+def observed_use_from_record(record: Any) -> dict | None:
+    """A nest's ``gpu.observed_use`` block, out of a finished run's record.
+
+    All three parts have to be sound together or nothing is written. The figure on
+    its own reads as a requirement, and a run that died before touching the card
+    reported a single megabyte -- so an absent block, which honestly says "not
+    measured", beats a lone number a reader would take for a floor.
+    """
+    block = record.get(RECORD_KEY) if isinstance(record, dict) else None
+    if not isinstance(block, dict):
+        return None
+    used, samples = block.get("max_used_bytes"), block.get("samples")
+    interval = _num(block.get("sample_interval_s"))
+    if not isinstance(used, int) or isinstance(used, bool) or used <= 0:
+        return None
+    if not isinstance(samples, int) or isinstance(samples, bool) or samples < 1:
+        return None
+    if interval is None or interval <= 0:
+        return None
+    return {"max_used_bytes": used, "sample_interval_s": interval, "samples": samples}
 
 
 def sample_once(

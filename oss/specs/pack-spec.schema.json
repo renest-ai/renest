@@ -1,13 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "ai.renest.pack-spec",
-  "schema_version": "1.1",
+  "schema_version": "1.3",
   "x-version-policy": "Versioning discipline, the same rule as the manifest. **This project's actual precedent is that additive changes bump the minor version too** (2.0 to 2.1 added a single optional field and still got a number), because the version has to answer \"which revision is this\", not only \"can you read it\". So: adding an optional field = minor bump; changing a field's meaning, adding a required field, or narrowing an enum = minor bump plus the fixed change procedure; a breaking change = major bump. Reader obligations match the manifest: within one major version an unrecognised optional field must be ignored and must not cause rejection; a different major version is refused explicitly and clearly.",
   "title": "pack-spec — the input list for `renest pack --spec`",
-  "description": "The shape of packing input. It governs **the list handed to the packer**, not the manifest that comes out -- that belongs to `manifest.schema.json`. Strictness trade-off: the top level tolerates extra keys (a key the packer does not read is harmless); `role` is a closed enum, word-for-word identical to `manifest.schema.json` and pinned by a consistency test -- change one side and you must change the other. **`kind` stopped being closed in format 2.7**: an enumerated list cannot keep up with an open ecosystem, so it is now an open string sharing that file's shape rule (lower case, digits, underscores, 64 characters at most), also pinned by the same test. A real incident from when it was closed: hand-writing `kind: \"text_encoder\"` (the name that carries the shared-part licence rule is `clip`) cost a paid cloud run before it blew up. That class of mistake can no longer be refused here, so the linter warns about it instead and `renest pack` prints the warning before anything is rented.\n\n**1.1 (2026-08-13)** -- purely additive, two optional fields, so every existing pack-spec still validates: `python_lock.from_environment` (already in use, never written down until now) and `python_lock.from_installed` (new -- for an environment whose own Python cannot be run on the packing machine). Neither reaches the nest: both are resolved into a real lock file while packing.",
+  "description": "The shape of packing input. It governs **the list handed to the packer**, not the manifest that comes out -- that belongs to `manifest.schema.json`. Strictness trade-off: the top level tolerates extra keys (a key the packer does not read is harmless); `role` is a closed enum, word-for-word identical to `manifest.schema.json` and pinned by a consistency test -- change one side and you must change the other. **`kind` stopped being closed in format 2.7**: an enumerated list cannot keep up with an open ecosystem, so it is now an open string sharing that file's shape rule (lower case, digits, underscores, 64 characters at most), also pinned by the same test. A real incident from when it was closed: hand-writing `kind: \"text_encoder\"` (the name that carries the shared-part licence rule is `clip`) cost a paid cloud run before it blew up. That class of mistake can no longer be refused here, so the linter warns about it instead and `renest pack` prints the warning before anything is rented.\n\n**1.1 (2026-08-13)** -- purely additive, two optional fields, so every existing pack-spec still validates: `python_lock.from_environment` (already in use, never written down until now) and `python_lock.from_installed` (new -- for an environment whose own Python cannot be run on the packing machine). Neither reaches the nest: both are resolved into a real lock file while packing.\n\n**1.2 (2026-08-22)** -- purely additive, one optional field: `files[].expected_sha256`, the hash capture already measured, carried through so packing can compare it with the hash it computes itself.\n\n**1.3 (2026-08-30)** -- purely additive, one optional field on two lists: `code_deps[].source_path` and `files[].source_path`, \"read the bytes from here\". It moves nothing in the nest: the manifest has never recorded where packing read from, only where a rebuild writes to, so this is an input-side field and the nest format is untouched. Written for an application whose program and whose data live in two separate trees (the ComfyUI desktop build is one); the nest that comes out is an ordinary single-tree install.",
   "type": "object",
   "required": [
-    "name"
+    "name",
+    "runtime"
   ],
   "properties": {
     "name": {
@@ -50,7 +51,8 @@
           },
           "description": "GPU of the packing machine. Either a string, or a list of candidates (a harness may offer candidates in price order and let the provider pick whichever is in stock, in which case the output is a list). Relaxed to allow the list form after calibrating against 14 real historical pack specs."
         }
-      }
+      },
+      "description": "**Required (2026-08-30).** Packing reads it unconditionally to build the manifest. It used to be optional here while the code required it, so a hand-written spec without it passed validation and then died with a Python traceback -- the one thing this validation exists to prevent."
     },
     "code_deps": {
       "type": "array",
@@ -82,6 +84,11 @@
           "install_path": {
             "type": "string",
             "minLength": 1
+          },
+          "source_path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Optional, input side only. Where to read this code from while packing, for the case where it does not sit at `install_path` under the environment root. Relative is taken from the environment root, absolute is taken as given. `install_path` is unaffected -- it stays the standard-layout place a rebuild writes to, so the nest is an ordinary single-tree install no matter how scattered the machine it was packed from. Leave it out and packing reads `install_path` under the environment root, exactly as before."
           },
           "exclude": {
             "type": "array",
@@ -146,6 +153,11 @@
             "type": "string",
             "minLength": 1
           },
+          "source_path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Optional, input side only. Where to read this file's bytes from while packing, for the case where they do not sit at `path` under `root`. Relative is taken from the environment root, absolute is taken as given. `path` and `root` are unaffected -- they stay where a rebuild writes the file. Leave it out and packing reads `path` under `root`, exactly as before."
+          },
           "kind": {
             "type": "string",
             "pattern": "^[a-z0-9][a-z0-9_]*$",
@@ -169,6 +181,11 @@
           "sha256": {
             "not": {},
             "description": "Do not fill in hashes by hand -- the packer computes them. A hand-written hash overwrites the truth."
+          },
+          "expected_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "description": "Optional cross-check, written by capture, not by hand: the hash this file had when the environment was captured. Packing compares it against the hash it holds for that file -- read fresh, or taken from its own record of what it already hashed, which is believed only while size, modification time and inode are all unchanged since capture measured them -- and stops when the two differ, which catches a file rewritten or swapped between capture and packing; otherwise the nest verifies green byte for byte while holding something the recipe was never proven against. `--full-rehash` reads every file again regardless. It is a check, never a source: the hash that reaches the manifest is always the one packing measured. Changed the file on purpose? Capture again, or drop this line for that file."
           }
         }
       }

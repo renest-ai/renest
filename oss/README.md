@@ -53,11 +53,15 @@ still works if you know your environment is separate.
 ## Use
 
 ```
-renest pack   /path/to/comfyui  --out ./nests      # capture a working setup
-renest verify ./nests/<id>                         # check it end to end
-renest restore <id> --to /path/on/the/new/machine  # rebuild it elsewhere
-renest doctor                                      # will this machine do?
+renest pack --dir /path/to/comfyui --workflow workflow.json --out ./nests
+renest verify ./nests/<id>/manifest.json --dir /path/to/comfyui
+renest restore --manifest ./nests/<id>/manifest.json --dir /path/on/the/new/machine
+renest doctor
 ```
+
+In order: capture a setup that already worked, check a rebuild end to end, rebuild it
+somewhere else, and ask whether this machine can. `--dir` is always the environment root
+— the folder holding `ComfyUI/` — and every path is one you name, never one we guess.
 
 `renest --help` lists the rest (`list`, `lint`, `export`, `serve`, `presign`,
 `update-rules`, `support`).

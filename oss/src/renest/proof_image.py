@@ -40,7 +40,9 @@ class ProofResult:
     a different GPU model, so that is exactly when a human needs to see both."""
 
     ok: bool
-    ssim: float
+    #: ``None`` when no similarity could be measured -- today that means the two
+    #: pictures are not the same size, so there is no single number to give.
+    ssim: float | None
     threshold: float
     side_by_side: Path | None
     detail: str
@@ -58,6 +60,13 @@ def compare_images(
     Structural similarity (SSIM), not a pixel diff: on a different GPU, floating-point
     sampling drifts, so a pixel comparison always differs while no eye can tell -- that
     must not read as a failure. A genuinely broken rebuild lands far below the mark.
+
+    **Two pictures of different sizes are a failure, not something to trim to fit.**
+    Cropping both to their overlap and scoring that answered "matches, similarity
+    1.000000" for a rebuild whose picture was half the height of the baseline -- the
+    clearest possible sign the rebuilt environment renders differently, reported as
+    a pass. Different size, no similarity number, and the side-by-side shows both
+    whole so the difference is the first thing a person sees.
     """
     try:
         import numpy as np
@@ -70,29 +79,38 @@ def compare_images(
         return np.array(Image.open(p).convert("RGB"))
 
     a, b = _load(baseline), _load(rebuilt)
-    h, w = min(a.shape[0], b.shape[0]), min(a.shape[1], b.shape[1])
-    a, b = a[:h, :w], b[:h, :w]
-    score = float(structural_similarity(a, b, channel_axis=2))
+    (ha, wa), (hb, wb) = a.shape[:2], b.shape[:2]
+    same_size = (ha, wa) == (hb, wb)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    canvas = Image.new("RGB", (w * 2 + 8, h), (255, 255, 255))
+    canvas = Image.new("RGB", (wa + 8 + wb, max(ha, hb)), (255, 255, 255))
     canvas.paste(Image.fromarray(a), (0, 0))
-    canvas.paste(Image.fromarray(b), (w + 8, 0))
+    canvas.paste(Image.fromarray(b), (wa + 8, 0))
     side = out_dir / "side-by-side.png"
     canvas.save(side)
 
-    ok = score >= threshold
-    detail = (
-        f"The rebuilt image matches the one from packing time (similarity "
-        f"{score:.6f})."
-        if ok
-        else (
+    score = float(structural_similarity(a, b, channel_axis=2)) if same_size else None
+    ok = score is not None and score >= threshold
+    if score is None:
+        detail = (
+            f"The rebuilt image is {wb}×{hb} pixels but the one from packing time is "
+            f"{wa}×{ha} — different sizes, so they are not the same picture and no "
+            f"similarity was measured. The recipe rendered at a different size here, "
+            f"which is a difference in the environment, not in the picture. See "
+            f"{side}."
+        )
+    elif ok:
+        detail = (
+            f"The rebuilt image matches the one from packing time (similarity "
+            f"{score:.6f})."
+        )
+    else:
+        detail = (
             f"The rebuilt image differs from the one from packing time "
             f"(similarity {score:.6f}, below {threshold}). That can mean the "
             f"environment is broken — or just a different GPU model. Look at "
             f"{side} and judge for yourself."
         )
-    )
     (out_dir / "proof.json").write_text(
         json.dumps(
             {
@@ -100,7 +118,9 @@ def compare_images(
                 "threshold": threshold,
                 "ok": ok,
                 "baseline": str(baseline),
+                "baseline_size": [wa, ha],
                 "rebuilt": str(rebuilt),
+                "rebuilt_size": [wb, hb],
                 "side_by_side": str(side),
             },
             indent=2,

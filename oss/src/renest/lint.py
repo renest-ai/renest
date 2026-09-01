@@ -9,7 +9,8 @@ of weights. That probe warns unless ``--strict``: capture-side discipline is to
 report, never to block.
 
 Exit codes: clean → 0; any error → 23 (S2_HASH_MISMATCH); ``--strict`` promotes
-warnings to errors; a missing schema library → 2 (USAGE). The ``--json`` shape is
+warnings to errors; a missing schema library, or ``--blobs`` / ``--depth`` given so
+that nothing could be checked, → 2 (USAGE). The ``--json`` shape is
 frozen: ``{manifest, ok, unique_blobs, verify, checked, findings}``.
 """
 
@@ -55,6 +56,7 @@ _PLACEHOLDER_IS_THE_POINT = frozenset({"placeholder"})
 
 __all__ = [
     "BLOCK",
+    "blob_option_problem",
     "Finding",
     "LintResult",
     "lint",
@@ -314,6 +316,30 @@ def lint(
              "needed, and then lists none. Collecting nothing means writing nothing: an "
              "empty list reads as 'this run needed no libraries from the machine', which "
              "is a claim, not an absence.")
+    # Format 2.9: package names must belong to the list, and must say where they came
+    # from. The schema can hold the shapes but neither of these two relations:
+    #   * a package name for a library the nest never listed points at a collector bug,
+    #     and a reader would show the user a package it has no reason to install;
+    #   * a package name without its distribution is unusable -- `libgl1` is Ubuntu's
+    #     name, and the same library is `mesa-libGL` on Fedora, so pasting it blind fails.
+    _pk = _nl.get("packages") or {}
+    if _pk:
+        _stray = sorted(set(_pk) - set(_nl.get("names") or ()))
+        if _stray:
+            warn("native-libs-package-for-unlisted",
+                 "this nest names the package that provides "
+                 f"{', '.join(_stray)}, but does not list "
+                 f"{'them' if len(_stray) > 1 else 'it'} among the libraries the run "
+                 "needed. A reader would offer the user a package it has no reason to "
+                 "install.")
+        if not _nl.get("packages_from"):
+            warn("native-libs-packages-without-distro",
+                 "this nest names the packages its libraries came from, but not which "
+                 "distribution named them. A package name is only usable next to its "
+                 "distribution: `libgl1` is Ubuntu's name for the same library Fedora "
+                 "calls `mesa-libGL`, so a reader pasting it blind sends the user to a "
+                 "package manager that has never heard of it.")
+
     # Format 2.8: contested modules. The schema holds the shape (the fingerprint
     # must be 64 lower-case hex characters, the method one of two words); this is
     # the one relation the schema cannot say. The winner is what a restore
@@ -680,22 +706,58 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--depth",
         choices=["size", "sample", "full"],
-        default="size",
-        help="how closely to check the stored files",
+        default=None,
+        help="how closely to check the stored files, when --blobs points at them "
+             "(default: size)",
     )
-    parser.add_argument("--sample-threshold", type=int, default=256 << 20)
+    parser.add_argument("--sample-threshold", type=int, default=None)
     parser.add_argument("--strict", action="store_true", help="treat warnings as failures")
+
+
+#: what --depth means when it is not given
+DEFAULT_DEPTH = "size"
+#: what --sample-threshold means when it is not given, in bytes
+DEFAULT_SAMPLE_THRESHOLD = 256 << 20
+
+
+def blob_option_problem(args: argparse.Namespace) -> str | None:
+    """Why the stored-file options as typed cannot be honoured, or ``None``.
+
+    Both failures used to be silent: a mistyped folder was reported as every blob
+    being absent, and a depth with nothing to apply it to printed a plain "Passed"
+    after checking no bytes at all.
+    """
+    depth, threshold = getattr(args, "depth", None), getattr(args, "sample_threshold", None)
+    if not args.blobs:
+        if depth is not None or threshold is not None:
+            named = "--depth" if depth is not None else "--sample-threshold"
+            return (f"✗ {named} says how closely to check the stored files, but without "
+                    f"--blobs there are no stored files to check. Add --blobs pointing at "
+                    f"the folder holding them.")
+        return None
+    if not Path(args.blobs).is_dir():
+        return (f"✗ There is no folder at {args.blobs}, so the stored files cannot be "
+                f"checked. Point --blobs at the folder holding them.")
+    return None
 
 
 def run_from_args(args: argparse.Namespace, emitter) -> int:
     import sys
 
+    problem = blob_option_problem(args)
+    if problem is not None:
+        print(problem, file=sys.stderr)
+        return int(ExitCode.USAGE)
     try:
         result = lint(
             args.manifest,
             blobs_dir=args.blobs,
-            verify=args.depth,
-            sample_threshold=args.sample_threshold,
+            verify=args.depth if args.depth is not None else DEFAULT_DEPTH,
+            sample_threshold=(
+                args.sample_threshold
+                if args.sample_threshold is not None
+                else DEFAULT_SAMPLE_THRESHOLD
+            ),
             strict=args.strict,
         )
     except ImportError:

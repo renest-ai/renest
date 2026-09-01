@@ -65,16 +65,21 @@ def resolve_file_root(root: str, env_root: Path, env: Mapping[str, str] | None =
     unchanged to the letter.
     """
     e = os.environ if env is None else env
+    # The default branch reads HOME **out of the same mapping**, not out of this
+    # process. Both fallbacks used to call Path.home(), so a caller that handed in
+    # an environment got that environment for the two overrides and this machine's
+    # home directory for the default -- and the default is the usual case.
+    home = Path(e["HOME"]) if e.get("HOME") else Path.home()
     if root == "hf_hub":
         if e.get("HF_HUB_CACHE"):
             return Path(e["HF_HUB_CACHE"])
         if e.get("HF_HOME"):
             return Path(e["HF_HOME"]) / "hub"
-        return Path.home() / ".cache" / "huggingface" / "hub"
+        return home / ".cache" / "huggingface" / "hub"
     if root == "hf_home":
         if e.get("HF_HOME"):
             return Path(e["HF_HOME"])
-        return Path.home() / ".cache" / "huggingface"
+        return home / ".cache" / "huggingface"
     return env_root
 
 

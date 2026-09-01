@@ -47,7 +47,7 @@
 **断点续传** = 同一码重复兑换:journal 已校验的文件不重下,预签名中途过期就重兑。
 一码一跑:进度上行以 grant_id 为 run 身份(broker_runs.id=grant_id,幂等)。
 
-## 4. v1 载荷(兑换响应;冻结,extra=forbid,字段一字不多不少)
+## 4. v1 载荷(兑换响应;冻结,`extra=forbid`,字段一字不多不少)
 
 ```json
 {

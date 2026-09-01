@@ -31,7 +31,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -49,7 +49,16 @@ from .config import (
     parse_iso8601,
     read_json_source,
 )
-from .doctor import LEVEL_WARN, PRECHECK_CLASS, PrecheckReport, run_precheck
+from .doctor import (
+    LEVEL_WARN,
+    LEVEL_WARNING,
+    PRECHECK_CLASS,
+    PrecheckReport,
+    compare_fingerprint,
+    python_is_obtainable,
+    run_precheck,
+)
+from .fingerprint import collect as collect_fingerprint
 from .download import (
     BlobSpec,
     ResolveReport,
@@ -59,7 +68,7 @@ from .download import (
     resolve,
 )
 from .envlock import DISTRO_ONLY_PACKAGES
-from .errors import NestFailure, ErrorClass, ExitCode
+from .errors import RETRYABLE_ERROR_CLASSES, NestFailure, ErrorClass, ExitCode
 from .events import EventEmitter, sanitise_terminal
 from .gated import GatedAsset, check_reach, fetch_from_origin, find_token, gated_assets, summarise
 from .integrity import probe_model_bytes
@@ -76,7 +85,7 @@ from .roots import (
     resolve_file_root,
     unsafe_relpath,
 )
-from .wheels import audit_lock_urls, dead_wheel_fallback
+from .wheels import audit_lock_urls, dead_wheel_fallback, unfingerprinted_packages
 from .uvbin import uv_executable
 
 __all__ = [
@@ -87,6 +96,7 @@ __all__ = [
     "FILE_ROOTS",
     "ROOT_PATH_PATTERNS",
     "resolve_file_root",
+    "cache_landing_line",
     "LOCKFILE_LANDING_REL",
     "ImageMismatch",
     "ComfyUILauncher",
@@ -105,12 +115,26 @@ __all__ = [
     "restore",
 ]
 
-FORMAT_VERSION = "2.8"
+FORMAT_VERSION = "2.9"
 # 2.0 made `code_deps[].role` mandatory and dropped 1.3, so that the consumer
 # side need not sniff /custom_nodes/ paths forever. 2.1 through 2.8 only added
 # fields or relaxed required ones, so **every 2.x package still reads** —
 # nothing here may tighten without a version bump.
-SUPPORTED_FORMAT_VERSIONS = ("2.0", "2.1", "2.2", "2.3", "2.4", "2.5", "2.6", "2.7", "2.8")
+SUPPORTED_FORMAT_VERSIONS = ("2.0", "2.1", "2.2", "2.3", "2.4", "2.5", "2.6", "2.7", "2.8",
+                             "2.9")
+
+
+def _highest_version(versions: tuple[str, ...]) -> str:
+    """Highest of these, compared as numbers rather than as text.
+
+    Text order starts lying the moment a 2.10 exists, because "2.9" sorts above
+    "2.10". The number that goes wrong is the one in the sentence the user reads;
+    the version logic itself compares numerically already and stays right either way.
+    """
+    return max(versions, key=lambda v: tuple(int(p) for p in v.split(".")))
+
+
+HIGHEST_SUPPORTED_FORMAT_VERSION = _highest_version(SUPPORTED_FORMAT_VERSIONS)
 GRANT_VERSION = "1"
 GRANT_ENVELOPE_VERSION = "2"  # grant-code envelope (server token); redeems to a v1 payload
 # When the free-tier retention window has this many days or fewer left, print a
@@ -207,6 +231,146 @@ def _say_if_the_recipe_points_elsewhere(
         stage="S2",
         level="warning",
     )
+
+
+def _nearest_existing(path: Path) -> Path:
+    """The closest ancestor of ``path`` that exists, so it can be stat-ed."""
+    for candidate in [path, *path.parents]:
+        if candidate.exists():
+            return candidate
+    return Path("/")
+
+
+def bytes_by_filesystem(plan: RestorePlan) -> dict[str, int]:
+    """How many bytes land on each distinct filesystem: one path to check, and how much.
+
+    Files do not all land in one place. The environment goes under the target while the
+    model cache follows the machine's own settings, and on a rented machine those are
+    routinely different disks -- a large volume mounted for work, the container's small
+    root for a home directory. Measuring the whole nest against the target's free space
+    is wrong in **both** directions: it never looks at the disk that will actually fill
+    up, and it demands room on the target for bytes that will never land there.
+    Filesystems are told apart by device id, so two roots on one disk add up as one.
+    """
+    per_device: dict[int, tuple[str, int]] = {}
+    for item in plan.items:
+        anchor = _nearest_existing(item.dest)
+        try:
+            device = anchor.stat().st_dev
+        except OSError:
+            continue
+        path, total = per_device.get(device, (str(anchor), 0))
+        per_device[device] = (path, total + int(item.size_bytes))
+    return {path: total for path, total in per_device.values()}
+
+
+def _landing_dirs(mani: dict, plan: RestorePlan, target: Path) -> list[Path]:
+    """Every folder a rebuild writes into: the app, each extension, each model folder.
+
+    Handed to the pre-flight writability probe. The target root is not enough on its
+    own: a machine image that ships ``ComfyUI/`` owned by root passes the root probe
+    and then fails at unpack, with the whole download already paid for.
+    """
+    out: set[Path] = set()
+    for dep in mani.get("code_deps") or []:
+        rel = str((dep or {}).get("install_path") or "").strip("/")
+        if rel:
+            out.add(target / rel)
+    for item in plan.asset_items:
+        out.add(item.dest.parent)
+    return sorted(out)
+
+
+def your_own_material_still_missing(
+    manifest: dict, target: Path, env: Mapping[str, str] | None = None
+) -> list[str]:
+    """The user's own input files this workflow needs that are not on this machine.
+
+    A nest **lists** the user's own material and deliberately never carries it (the
+    format says so in as many words). Nothing used to tell the person that, so the
+    first run after a rebuild stopped looking for a file they still had at home, with
+    every byte verified and nothing here explaining the gap.
+
+    Looked for **under the landing root of each entry**, not under the target. Every
+    other reader of ``files[]`` already resolves the root; this one did not, so an
+    entry landing in a model cache was called missing while it sat right there, and
+    the sentence sent the user to a folder it was never going to be in.
+    """
+    out = []
+    for f in manifest.get("files") or []:
+        if f.get("kind") != "input_asset":
+            continue
+        rel = f.get("path")
+        if not (isinstance(rel, str) and rel):
+            continue
+        root = resolve_file_root(str(f.get("root") or "env"), Path(target), env)
+        if not (root / rel).exists():
+            out.append(f"{root}/{rel}")
+    return sorted(set(out))
+
+
+def toolchain_landing_spots(env: Mapping[str, str], uv_path: str | None) -> list[str]:
+    """uv itself, the Pythons it downloads, its package cache -- in that order.
+
+    None of the three is part of a nest, and all three are shared with every other
+    rebuild on the machine. Read from uv's own variables rather than the usual
+    defaults, or the closing line names a place nothing was written to.
+    """
+    home = env.get("HOME") or str(Path.home())
+    data = env.get("XDG_DATA_HOME") or f"{home}/.local/share"
+    cache = env.get("XDG_CACHE_HOME") or f"{home}/.cache"
+    return [
+        uv_path or f"{home}/.local/bin/uv",
+        env.get("UV_PYTHON_INSTALL_DIR") or f"{data}/uv/python",
+        env.get("UV_CACHE_DIR") or f"{cache}/uv",
+    ]
+
+
+def toolchain_landing_line(
+    target: Path | str,
+    env: Mapping[str, str] | None = None,
+    uv_path: str | None = None,
+) -> str:
+    """Closing words: which files are yours, and where the toolchain went instead.
+
+    Without it, "done, everything is under <target>" reads as the whole story of
+    what a rebuild put on the machine -- and the gigabytes uv left elsewhere are
+    found later, by whoever runs out of disk.
+    """
+    env = os.environ if env is None else env
+    if uv_path is None:
+        found = uv_executable()
+        uv_path = found if found != "uv" else None
+    uv, pythons, cache = toolchain_landing_spots(env, uv_path)
+    return (
+        f"What is yours is under {target}. The toolchain is not part of this nest "
+        f"and is shared with every other rebuild on this machine: uv {uv}, "
+        f"the Pythons uv downloads {pythons}, uv's package cache {cache}."
+    )
+
+
+#: The closing line's two cache roots, in the order the escape hatch names them.
+_CACHE_LANDING_WORDS = (("hf_hub", "model-cache file(s)"), ("hf_home", "settings file(s)"))
+
+
+def cache_landing_line(
+    manifest: dict, target: Path | str, env: Mapping[str, str] | None = None
+) -> str:
+    """Closing words: everything is under the target -- except the files that are not.
+
+    A nest may name the two model-cache folders, and those land wherever this machine
+    keeps them. Saying "everything is under <target>" then sends someone to a directory
+    their files were never in, and to the wrong one to clear when the disk fills up.
+    The escape hatch names them one by one; this leg only said the short sentence.
+    """
+    landed = []
+    for root, noun in _CACHE_LANDING_WORDS:
+        n = sum(1 for f in (manifest.get("files") or []) if (f.get("root") or "env") == root)
+        if n:
+            landed.append(f"{n} {noun} in {resolve_file_root(root, Path(target), env)}")
+    if not landed:
+        return f"Everything is under {target}"
+    return f"Everything is under {target}, apart from " + ", ".join(landed)
 
 
 def _land_recipe(
@@ -309,6 +473,55 @@ def _free_port() -> int:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
+
+
+def _recipe_shaped_files(target: Path) -> list[Path]:
+    """Files in the rebuilt folder that look like a ComfyUI workflow.
+
+    Only used to word the message honestly -- **never to pick one and run it**.
+    The format spec forbids inventing a recipe path for a pre-2.6 nest, and that
+    still holds: guessing wrong would report a false failure.
+    """
+    out: list[Path] = []
+    for p in sorted(target.glob("*.json")):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        # A workflow is a mapping of node ids to nodes, each with a class_type.
+        if isinstance(d, dict) and d and all(
+            isinstance(v, dict) and "class_type" in v for v in d.values()
+        ):
+            out.append(p)
+    return out
+
+
+def _name_a_few(paths: list[Path], limit: int = 3) -> str:
+    names = [p.name for p in paths[:limit]]
+    more = len(paths) - len(names)
+    joined = ", ".join(names) + (f" and {more} more" if more > 0 else "")
+    return f"`{joined}`" if len(names) == 1 else f"One of `{joined}`"
+
+
+def _archive_emptiness_is_expected(dep: dict, manifest: dict) -> bool:
+    """Whether this code folder's archive is empty for a legitimate reason.
+
+    An empty archive has two causes and only one of them is a fault. The fault
+    is a folder that was a symlink at pack time: the link is stored, not the
+    tree. The innocent one is a folder whose files all travel as declared
+    entries in ``files[]`` and are therefore excluded from the archive -- the
+    default layout for fine-tuning nests. Conflating the two once failed a
+    restore that was fine and told the user to replace a symlink that did not
+    exist. Compared on a path boundary so ``train`` cannot claim
+    ``training-data/``.
+    """
+    rel = str((dep or {}).get("install_path") or "").strip("/")
+    if not rel:
+        return False
+    return any(
+        str((f or {}).get("path") or "").strip("/").startswith(rel + "/")
+        for f in ((manifest or {}).get("files") or [])
+    )
 
 def _tail(path: Path, n_chars: int = 600) -> str:
     try:
@@ -442,6 +655,10 @@ class RestorePlan:
     #: not installing that one library -- it is booting this image, which brings all of
     #: them. Recorded since v2.0 and, until 2026-08-12, never once read on this side.
     base_image_ref: str | None = None
+    #: The nest's own `runtime.native_libs` (from 2.9 it may carry `packages` and
+    #: `packages_from`). A missing-library message prefers the package names the
+    #: packing machine measured over the small built-in table.
+    native_libs: dict | None = None
     #: v2.8 `runtime.contested_modules`: for each folder several packages write,
     #: which one the working run's copy came from and that file's fingerprint as
     #: installed. Read after the dependency install; absent = older nest, no-op.
@@ -596,6 +813,7 @@ class RestorePlan:
             app_dir=app_dir,
             entrypoint=entrypoint if isinstance(entrypoint, dict) else None,
             base_image_ref=(manifest.get("base_image") or {}).get("ref") or None,
+            native_libs=(manifest.get("runtime") or {}).get("native_libs") or None,
             contested_modules=[
                 e for e in ((manifest.get("runtime") or {}).get("contested_modules") or [])
                 if isinstance(e, dict)
@@ -622,6 +840,11 @@ class LaunchHandle:
     #: environment isn't broken, the recipe just never worked -- so the smoke
     #: step skips it and says why.
     unverified_note: str | None = None
+    #: The rebuilt folder. Carried here rather than on the launcher for the same
+    #: reason `recipe_path` is: other launchers are injected and changing their
+    #: call shape breaks them silently. Absent = do not look around (say the plain
+    #: "no recipe" line); it must never become a guess.
+    target: Path | None = None
 
 
 @dataclass
@@ -864,13 +1087,28 @@ class ComfyUILauncher:
             )
         # Say plainly that nothing was drawn. The old wording ("the app answered
         # normally") was read as evidence of a render for weeks.
-        self.recipe_outcome = {"reran": False, "images": None,
-                               "why": "this nest carries no recipe"}
-        return (
-            f"The app answered and loaded {len(classes)} node types. "
-            f"**Nothing was rendered** — this nest carries no recipe to re-run, "
-            f"so this is a liveness check, not proof that it still produces images."
-        )
+        # And say **which** of the two reasons it is: "no recipe in here at all" and
+        # "there is one but the nest never said which file it is" are different facts,
+        # and the second one was being reported as the first (2026-08-29, on a 2.3 nest
+        # whose workflow rode along as an ordinary asset). We still refuse to guess --
+        # the format spec forbids inventing a path -- but we no longer tell the user
+        # their recipe is absent when it is sitting in the folder.
+        unnamed = _recipe_shaped_files(handle.target) if handle.target else []
+        if unnamed:
+            why = "this nest never says which file is the recipe"
+            said = (
+                f"**Nothing was rendered** — this nest never says which file is the "
+                f"recipe, so we will not guess. {_name_a_few(unnamed)} "
+                f"looks like a workflow; open it in the app yourself to re-run it."
+            )
+        else:
+            why = "this nest carries no recipe"
+            said = (
+                "**Nothing was rendered** — this nest carries no recipe to re-run, "
+                "so this is a liveness check, not proof that it still produces images."
+            )
+        self.recipe_outcome = {"reran": False, "images": None, "why": why}
+        return f"The app answered and loaded {len(classes)} node types. {said}"
 
     def _rerun_recipe(self, handle: LaunchHandle) -> str:
         """Submit the packed recipe and require an output. Raises on anything else.
@@ -1067,6 +1305,11 @@ class RestoreReport:
     #: working run used -- `match` (first try), `reinstalled` (forced the winner
     #: to write last, then it matched) or `mismatch` (still differs; warn-only).
     contested_modules: dict = field(default_factory=dict)
+    #: What `compare_fingerprint` said about this machine vs the nest's
+    #: recorded one -- the same verdict `renest doctor` prints. None = the
+    #: nest records no fingerprint (older nests), so there was nothing to
+    #: compare and **no warning is invented**.
+    fingerprint_verdict: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -1091,6 +1334,7 @@ class RestoreReport:
             "contested_module_gaps": self.contested_module_gaps,
             "recipe": self.recipe,
             "contested_modules": self.contested_modules,
+            "fingerprint_verdict": self.fingerprint_verdict,
         }
 
 
@@ -1117,6 +1361,15 @@ def _extract_strip1(archive: Path, dest: Path) -> int:
             if rel.is_absolute() or ".." in rel.parts:
                 raise ValueError(f"This archive tries to write outside the target directory: {m.name}")
             m.name = str(rel)
+            if m.islnk():
+                # A hard link names another member, so strip-1 has to apply to that
+                # name too — `tar --strip-components=1` does. Without it tarfile looks
+                # up the un-stripped name and raises KeyError, so a nest holding two
+                # hard-linked files failed the whole rebuild here, while the escape
+                # hatch unpacked the same archive fine.
+                link_parts = Path(m.linkname).parts
+                if len(link_parts) >= 2:
+                    m.linkname = str(Path(*link_parts[1:]))
             try:
                 tf.extract(m, dest, filter="data")
             except TypeError:  # < 3.11.4 has no filter arg
@@ -1598,6 +1851,13 @@ _unsafe_dest = unsafe_relpath
 _bad_root_entry = bad_root_entry
 
 
+def _plain_dep_name(value: object) -> bool:
+    """A code folder's name is used as a file name (``<name>.tar.gz``), so it may
+    not carry a path: the format leaves it free text, and ``../../x`` writes the
+    archive outside the folder the user gave us. Both legs check this."""
+    return isinstance(value, str) and bool(value) and not set(value) & {"/", "\\"} and value != ".."
+
+
 #: The loader's words when a shared library is not on this machine. Both spellings
 #: are real: Python's importer says the first, the dynamic linker the second.
 _SO_MISSING = re.compile(
@@ -1620,6 +1880,13 @@ _SO_PACKAGE = {
     "libsndfile.so.1": "libsndfile1",
     "libgomp.so.1": "libgomp1",
 }
+
+
+#: Libraries the host's GPU driver owns. A container is handed the host's copies at
+#: start-up, so they live in no image and in no package inside it, and no image can
+#: bring them. `libcudart` is deliberately not matched: that one arrives inside the
+#: packages a nest installs, so it is not the machine's to provide.
+_DRIVER_OWNED = re.compile(r"^(libcuda\.so|libnvidia-)")
 
 
 #: How much of a log to read when looking for the loader's complaint. The report's own
@@ -1687,45 +1954,180 @@ def every_missing_library(hit: list[str], precheck: dict | None) -> list[str]:
     return out
 
 
-def missing_library_advice(libs: str | list[str], base_image: str | None = None) -> str:
+def missing_library_advice(libs: str | list[str], base_image: str | None = None,
+                           recorded: dict | None = None, *, restored: bool = True) -> str:
     """What is missing, and the ways out — surest one first.
 
     One command for the whole set, not one per library: the machine that found this was
     short of eight, and eight round trips is not a fix. When the nest recorded the image
     it was packed on, that goes first — it brings every one of them at once.
+
+    ``restored=False`` when this is said at S0, before anything has been downloaded:
+    the two clauses about files matching and about re-running to carry on are true
+    after a rebuild and false before one, and a refusal at S0 gets neither.
     """
     if isinstance(libs, str):
         libs = [libs]
     named = ", ".join(f"**{lib}**" for lib in libs)
+    # **What the packing machine measured wins over the built-in table** (format 2.9).
+    # The table can only ever hold names someone thought to add, and a package name is
+    # distribution- and release-specific -- `libicudata.so.75` is `libicu75` on Ubuntu
+    # 24.04 and `libicu70` on 22.04. The nest carries what the machine that actually ran
+    # the app answered, so prefer it and say which distribution it came from.
+    measured = dict((recorded or {}).get("packages") or {})
+    where_from = (recorded or {}).get("packages_from")
+    seen_there = set((recorded or {}).get("names") or ())
+
+    def _lookup(unknown: list[str]) -> str:
+        # Three sources, three different answers, **and they are sorted per library**.
+        # "Your package manager will know" is disproved for two of them, and a mixed
+        # set used to hand that sentence to the whole list. Measured 2026-08-30 on one
+        # real nest: 23 libraries recorded, 16 with no package -- 14 that came with the
+        # pack image (libicu*.so.75 on an ubuntu 22.04 pack, a release with no such
+        # package) and 2 the GPU driver owns. Only libraries the pack never measured
+        # can still honestly be sent to a package manager.
+        driver = [u for u in unknown if _DRIVER_OWNED.match(u)]
+        from_image = [u for u in unknown
+                      if u not in driver and where_from and u in seen_there]
+        plain = [u for u in unknown if u not in driver and u not in from_image]
+        parts: list[str] = []
+        if driver:
+            is_are = "is" if len(driver) == 1 else "are"
+            it = "it" if len(driver) == 1 else "them"
+            parts.append(
+                f"{', '.join(driver)} {is_are} part of this machine's own GPU driver, "
+                f"not of a nest or an image, so no package here provides {it}. Install "
+                f"or repair that driver; in a container, start the container with GPU "
+                f"access so the host's copies are handed in.")
+        if from_image:
+            it = "it" if len(from_image) == 1 else "them"
+            copies = "its copy" if len(from_image) == 1 else "their copies"
+            parts.append(
+                f"We cannot tell you which package provides {', '.join(from_image)}: "
+                f"the machine this was packed on could not name a package for {it} "
+                f"either, so {copies} came with the image it runs rather than from an "
+                f"{where_from} package. Installing a same-named package here gives a "
+                f"different build, not the same copy — the image is where to get {it}.")
+        if plain:
+            parts.append("Your machine's own package manager will know which package "
+                         f"provides {', '.join(plain)}.")
+        return " ".join(parts)
+
     pkgs: list[str] = []
     for lib in libs:
-        pkg = _SO_PACKAGE.get(lib.lower())
+        pkg = measured.get(lib) or _SO_PACKAGE.get(lib.lower())
         if pkg and pkg not in pkgs:
             pkgs.append(pkg)
+    # An image cannot carry a driver library, so it must not be offered as the thing
+    # that brings "these": on a machine with no GPU driver, booting it changes nothing.
+    driver_libs = [lib for lib in libs if _DRIVER_OWNED.match(lib)]
+    carries = "the others" if driver_libs else "these"
     surest = (
         f"**Surest fix:** boot a machine from the image this nest was packed on — "
-        f"`{base_image}` — which carries these and anything else the app needs. "
-        if base_image
+        f"`{base_image}` — which carries {carries} and anything else the app needs. "
+        if base_image and driver_libs != libs
         else ""
     )
     if pkgs:
         # Only the ones we recognise go in the command. Naming a package we are not sure
         # about would send someone to install the wrong thing, which is worse than the
         # honest "look this one up" below.
-        rest = [lib for lib in libs if not _SO_PACKAGE.get(lib.lower())]
-        where = (
-            f"On Debian/Ubuntu machines: `apt-get install -y {' '.join(pkgs)}`"
-            + (f" — then look up which package provides {', '.join(rest)}." if rest else ".")
-        )
+        rest = [lib for lib in libs
+                if not (measured.get(lib) or _SO_PACKAGE.get(lib.lower()))]
+        on = (f"On {where_from} (what this nest was packed on)"
+              if where_from else "On Debian/Ubuntu machines")
+        where = (f"{on}: `apt-get install -y {' '.join(pkgs)}`."
+                 + (f" {_lookup(rest)}" if rest else ""))
     else:
-        where = "Your machine's own package manager will know which package provides them."
+        where = _lookup(list(libs))
     count = "a system library" if len(libs) == 1 else f"{len(libs)} system libraries"
+    yours = ("Your nest itself is fine — every file matched and every package installed."
+             if restored else
+             "Nothing has been downloaded yet, so this is about the machine, not about "
+             "your nest.")
+    again = " Then run the same command again; it carries on from here." if restored else ""
     return (
-        f"This machine is missing {count} the app needs: {named}. Your nest itself is "
-        f"fine — every file matched and every package installed. Libraries like these "
-        f"belong to the operating system, so they do not travel inside a nest. "
-        f"{surest}{where} Then run the same command again; it carries on from here."
+        f"This machine is missing {count} the app needs: {named}. {yours} Libraries "
+        f"like these belong to the operating system, so they do not travel inside a "
+        f"nest. {surest}{where}{again}"
     )
+
+
+#: This GPU has no compiled kernels for it — the run-time twin of the pre-flight's
+#: architecture block. Both spellings are real: the driver's own words, and torch's.
+_RUNTIME_ARCH_MARKERS = (
+    "no kernel image is available",
+    "not compatible with the current pytorch installation",
+)
+
+#: One wording for "no kernels for this card", wherever it surfaces. It lived on the
+#: S5 leg alone, so a run-to-completion nest answered "what failed is the run itself"
+#: for a machine that can never run it -- the same sentence a missing library got,
+#: while one is fixed by a command and the other only by a different card.
+ARCH_UNSUPPORTED_SAY = (
+    "Your nest rebuilt correctly, but this GPU is not one the packed PyTorch build "
+    "has kernels for, so the work cannot run on it. Re-running will not change that: "
+    "use a card that build supports, or pack again on a machine like this one."
+)
+
+
+def no_kernels_for_this_gpu(text: str | None) -> bool:
+    """Did it die for want of machine code for this card? Then no install fixes it."""
+    low = (text or "").lower()
+    return any(m in low for m in _RUNTIME_ARCH_MARKERS)
+
+
+#: Ran out of GPU memory. Held apart from "a node raised" because the remedy is a
+#: bigger card or a smaller run, not the extension's issue tracker.
+_OOM_MARKERS = (
+    "cuda out of memory",
+    "outofmemoryerror",
+    "hip out of memory",
+    "cuda error: out of memory",
+)
+
+#: Our own wording when the render passed the wall-clock cap, and when the app
+#: handed back a failing step through its history endpoint.
+_TOO_SLOW_MARKER = "was still running after"
+_NODE_RAISED_MARKERS = (
+    "reported an error while running the packed recipe",
+    "execution_error",
+)
+
+
+def classify_render_failure(text: str | None) -> tuple[ErrorClass, str] | None:
+    """The packed run failed at S5 — which class is it? ``None`` = no idea, keep the catch-all.
+
+    Order is fixed and it matters: an unsupported GPU and an out-of-memory both
+    reach us *as* a node raising, so testing "a node raised" first would swallow
+    both and send the user to an extension's issue tracker instead of to a
+    different card. Missing system libraries are decided before this is called.
+    """
+    low = (text or "").lower()
+    if no_kernels_for_this_gpu(low):
+        return (ErrorClass.ARCH_UNSUPPORTED_RUNTIME, ARCH_UNSUPPORTED_SAY)
+    if any(m in low for m in _OOM_MARKERS):
+        return (
+            ErrorClass.OOM_OR_SLOW,
+            "Your nest rebuilt correctly and the app started; it then ran out of GPU memory "
+            "part-way through the packed run. This card has less to spare than the one the "
+            "nest was packed on. Use a bigger card, or lower what this run asks for.",
+        )
+    if _TOO_SLOW_MARKER in low:
+        return (
+            ErrorClass.OOM_OR_SLOW,
+            "Your nest rebuilt correctly and the app started, but the packed run passed the "
+            "time limit without finishing, so it is reported as a failure rather than left to "
+            "hang. On this machine the run is too slow to be usable.",
+        )
+    if any(m in low for m in _NODE_RAISED_MARKERS):
+        return (
+            ErrorClass.NODE_RUNTIME_ERROR,
+            "Your nest rebuilt correctly — every file matched, every package installed, the "
+            "app started — and then one step of the packed run raised. The app's own message "
+            "names that step; that is what to look at, not the nest.",
+        )
+    return None
 
 
 #: What a framework says when there is no user data. This case must be kept
@@ -1840,7 +2242,7 @@ def _validate_manifest(manifest: dict, *, narrate: Callable[..., None] | None = 
             # Newer minor of a known major: warn and continue, never reject.
             msg = (
                 f"This nest says format {fv}, and this version knows up to "
-                f"{max(SUPPORTED_FORMAT_VERSIONS)}. Same major version, so it carries "
+                f"{HIGHEST_SUPPORTED_FORMAT_VERSION}. Same major version, so it carries "
                 f"optional fields this build does not know about — those are ignored and "
                 f"the rebuild goes ahead. Upgrade Renest if you want everything it offers."
             )
@@ -1930,6 +2332,11 @@ def _validate_manifest(manifest: dict, *, narrate: Callable[..., None] | None = 
         for d in manifest.get("code_deps", [])
         if not isinstance(d, dict) or _unsafe_dest(d.get("install_path"))
     ]
+    bad += [
+        f"a code folder whose name is a path: {d.get('name')!r}"
+        for d in manifest.get("code_deps", [])
+        if isinstance(d, dict) and not _plain_dep_name(d.get("name"))
+    ]
     # Path-shaped keys in entrypoint.env: their values are confined to the
     # rebuild directory too, so whatever consumes them is protected by
     # construction.
@@ -1945,6 +2352,14 @@ def _validate_manifest(manifest: dict, *, narrate: Callable[..., None] | None = 
         ]
         if v is not None and _unsafe_dest(v)
     ]
+    # entrypoint.cwd is the directory the app is started in, and argv[0] is already
+    # held to this rule. Without it a handed-off nest picks any folder on this machine
+    # — every relative path the app writes then lands there, outside the rebuild.
+    # [SECURITY-REVIEW] The schema has always described cwd as a relative path; this
+    # is the check that makes the restore path hold it to that.
+    _cwd = (manifest.get("entrypoint") or {}).get("cwd")
+    if _cwd is not None and _unsafe_dest(_cwd):
+        bad.append(f"a working directory outside the folder being rebuilt: {_cwd!r}")
     if bad:
         raise NestFailure(
             "S1",
@@ -2022,6 +2437,11 @@ def restore(
         "transfer_bytes": 0,
         "verify_seconds": 0.0,
         "active_sources": [],
+        # Which assets S1 counted as "already here". S2 re-hashes them and may find one
+        # wrong; without this the repair is added to the downloaded tally while the file
+        # stays in the cached tally, and the closing line reports more files than the
+        # nest holds. Keyed by object identity: two entries may share one landing path.
+        "counted_as_cached": set(),
     }
     t_run = time.monotonic()
     failure: NestFailure | None = None
@@ -2121,7 +2541,9 @@ def restore(
         journal.mark_blob(it.sha256, BLOB_PENDING, it.dest)
         spec = BlobSpec(sha256=it.sha256, size_bytes=it.size_bytes, sources=it.sources)
         last: SourcesExhausted | None = None
+        rounds_run = 0
         for rnd in range(1, max(opts.retry_rounds, 1) + 1):
+            rounds_run = rnd
             try:
                 rep = resolve(spec, it.dest, client)
                 journal.mark_blob(it.sha256, BLOB_VERIFIED, it.dest)
@@ -2129,6 +2551,14 @@ def restore(
                 return "downloaded", rep
             except SourcesExhausted as e:
                 last = e
+                # A missing object or a refused signature answers the same way every
+                # time. Sleeping between identical failures spends rented-machine
+                # minutes to arrive at "retrying will not help" — so stop on the
+                # verdict we are about to print, rather than after it.
+                if ErrorClass(classify_source_failures(e.attribution)[0]) not in (
+                    RETRYABLE_ERROR_CLASSES
+                ):
+                    break
                 if rnd < opts.retry_rounds:
                     wait = round(opts.backoff_base_s * (2 ** (rnd - 1)), 3)
                     narrate(
@@ -2153,7 +2583,7 @@ def restore(
             "S1",
             ErrorClass(class_name),
             f"Gave up on {it.label} ({it.sha256[:12]}…) — {why} "
-            f"({opts.retry_rounds} attempts each)",
+            f"({rounds_run} attempt{'' if rounds_run == 1 else 's'} each)",
             detail=str(last) if last else "",
             context={"sha256": it.sha256, "attribution": attribution},
         )
@@ -2318,11 +2748,46 @@ def restore(
             return "skipped (--skip-precheck)"
         assert plan is not None
         fn = opts.precheck_fn or run_precheck
+        _per_fs = bytes_by_filesystem(plan)
+        _target_fs = str(_nearest_existing(target))
+        _target_dev = Path(_target_fs).stat().st_dev if Path(_target_fs).exists() else None
+        _on_the_target_bytes, _elsewhere = 0, {}
+        for _path, _total in _per_fs.items():
+            try:
+                _same = _target_dev is not None and Path(_path).stat().st_dev == _target_dev
+            except OSError:
+                _same = False
+            if _same:
+                _on_the_target_bytes += _total
+            else:
+                _elsewhere[_path] = _total
         runtime = mani.get("runtime", {})
+        # The speed gate must measure the path the bytes take. Probe the nest's
+        # own largest blob; doctor reads only its first few MB. None means no
+        # nest source is available, and doctor falls back to the rules probe.
+        _probe_url = None
+        try:
+            _biggest = max(
+                (it for it in plan.items if it.sources and it.size_bytes > 0),
+                key=lambda it: it.size_bytes,
+                default=None,
+            )
+            if _biggest is not None:
+                _probe_url = _biggest.sources[0].url
+        except (AttributeError, IndexError):
+            _probe_url = None
         pr: PrecheckReport = fn(
             cuda_tag=_cuda_tag(runtime.get("cuda_version", "")),
             expected_driver=runtime.get("driver_version"),
-            need_disk_gb=round(plan.total_bytes * 1.15 / 2**30 + _deps_disk_reserve_gb(mani), 2),
+            # Only what lands under the target counts here; anything landing on another
+            # disk is checked against **that** disk, below.
+            need_disk_gb=round(
+                _on_the_target_bytes * 1.15 / 2**30 + _deps_disk_reserve_gb(mani), 2),
+            other_disks=_elsewhere,
+            # Every folder this rebuild writes into, not just the root. Measured
+            # need: images ship a ComfyUI tree owned by root, the root probe passes,
+            # and unpacking dies with PERMISSION_DENIED once the download is done.
+            landing_dirs=_landing_dirs(mani, plan, target),
             # The memory check is derived from the nest's actual size — a nest
             # records no memory requirement of its own.
             nest_bytes=plan.total_bytes,
@@ -2331,6 +2796,8 @@ def restore(
             # legal for an older nest to carry no gpu block, and then this check
             # is skipped entirely.
             nest_gpu=mani.get("gpu"),
+            egress_url=_probe_url,
+            egress_bytes=sum(i.size_bytes for i in plan.items),
             # Whether the bulk files cross the internet — decides whether "slow
             # network" blocks the user or merely warns (see egress in doctor)
             bulk_from_internet=plan.bulk_comes_from_internet,
@@ -2348,6 +2815,51 @@ def restore(
             force=opts.force,
         )
         report.precheck = pr.to_dict()
+        # **Run the same fingerprint comparison `renest doctor` runs.** Until
+        # 2026-08-22 restore never called it: a nest whose critical packages did not
+        # match this machine made `doctor` exit 61 and `restore` exit 0, so any script
+        # reading the exit code filed the second one as a clean success. Same disease as
+        # the missing-library case fixed on 2026-08-19, one gate over.
+        # Calling doctor's own function (not a copy of its rules) is deliberate -- a
+        # second implementation is exactly how the two legs drifted apart in the first
+        # place.
+        _required = mani.get("fingerprint")
+        if _required:
+            # **Not `suppress(Exception)`.** Swallowing it silently would leave a check
+            # that can never fail: if collecting this machine's fingerprint ever breaks,
+            # every restore would quietly report no mismatch, which reads exactly like
+            # "this machine matches". Say so instead, and carry on -- this leg informs,
+            # it does not block (2026-07-15 ruling).
+            try:
+                _fpv = compare_fingerprint(
+                    collect_fingerprint(None),
+                    _required,
+                    (mani.get("base_image") or {}).get("ref") or None,
+                    python_obtainable=python_is_obtainable(
+                        (_required.get("python") or {}).get("version")
+                    ),
+                )
+                report.fingerprint_verdict = _fpv.to_dict()
+                if _fpv.level == LEVEL_WARNING and _fpv.summary:
+                    narrate(f"\u26a0 {_fpv.summary}", stage="S0", level="warning")
+            except Exception as exc:  # noqa: BLE001 - never let a check failure look like a pass
+                narrate(
+                    "\u26a0 Could not compare this machine against the one this nest was "
+                    f"packed on ({type(exc).__name__}), so that check said nothing this "
+                    "run — it is not a clean match, it is an unanswered question.",
+                    stage="S0", level="warning",
+                )
+        # Say the warnings out loud, here, before a single byte moves. Written into the
+        # report and nowhere else, the screen said "machine check: warn" and downloaded
+        # 7 GB -- measured 2026-08-13 on a machine short of libGL.so.1. The check runs at
+        # S0 to save someone twenty minutes and a rented machine; recording it silently
+        # throws that away. The escape hatch has always printed these.
+        # **Above the two exits below, not after them**: said last it reached only the
+        # machines that passed -- measured 2026-08-30, five machines short of the same six
+        # libraries, and the two stopped for another reason said not one word of it.
+        for _c in pr.checks:
+            if _c.level == LEVEL_WARN and _c.reason:
+                narrate(f"⚠ {_c.reason}", stage="S0", level="warning")
         if not pr.proceed:
             rejects = [c for c in pr.checks if c.level == "reject"]
             klass = (
@@ -2355,6 +2867,18 @@ def restore(
                 if rejects
                 else ErrorClass.UNKNOWN
             )
+            # Which half is the user's to act on. A card or a line is not fixable where
+            # they stand; a missing library is one command away, and that command is
+            # only ever said in the closing words -- which a refusal at S0 never reaches.
+            # Naming them in one breath would read as "this is why you were stopped".
+            _short = _libs_the_working_run_used_but_this_machine_lacks(report.precheck)
+            if _short:
+                narrate(
+                    "⚠ Not what stopped this run, and yours to fix where you stand: "
+                    + missing_library_advice(_short, plan.base_image_ref,
+                                             plan.native_libs, restored=False),
+                    stage="S0", level="warning",
+                )
             raise NestFailure(
                 "S0",
                 klass,
@@ -2366,16 +2890,6 @@ def restore(
         if pr.overall == "reject":
             narrate("⚠ Failed checks are being ignored because you passed --force — the report still records them", stage="S0", level="warning")
             return "checks failed (forced through, recorded as such)"
-        # Say the warnings out loud, here, before a single byte moves. They were
-        # written into the report and nowhere else, so the screen said "machine check:
-        # warn" and then downloaded 7 GB -- measured 2026-08-13 on a machine short of
-        # libGL.so.1: the check found it, named it, and never told the person watching.
-        # The whole reason the check runs at S0 rather than after the download is to
-        # save someone twenty minutes and a rented machine; recording it silently
-        # throws that away. The escape hatch has always printed these.
-        for _c in pr.checks:
-            if _c.level == LEVEL_WARN and _c.reason:
-                narrate(f"⚠ {_c.reason}", stage="S0", level="warning")
         return f"machine check: {pr.overall}"
 
     # -- S1 download --
@@ -2457,6 +2971,7 @@ def restore(
                         state["blobs_downloaded"] += 1
                     else:
                         state["blobs_cached"] += 1
+                        state["counted_as_cached"].add(id(it))
                     done_bytes += it.size_bytes
                     blob_done(it, status, rep, secs)
                 elapsed = max(time.monotonic() - t_assets, 1e-6)
@@ -2489,6 +3004,7 @@ def restore(
                     context={"sha256": it.sha256})
             journal.mark_blob(it.sha256, BLOB_VERIFIED, it.dest)
             state["blobs_cached"] += 1
+            state["counted_as_cached"].add(id(it))
             blob_done(it, "copied", None, time.monotonic() - t0)
         state["transfer_seconds"] = round(time.monotonic() - t_assets, 3)
         copied = f", {len(to_copy)} copied from bytes already here" if to_copy else ""
@@ -2580,6 +3096,11 @@ def restore(
                 journal.mark_blob(it.sha256, BLOB_PENDING, it.dest)
                 it.dest.unlink(missing_ok=True)
                 fetch_one(it)
+                # S1 already counted this file. Move it across instead of counting it
+                # twice — the closing line adds the two tallies up in front of the user.
+                if id(it) in state["counted_as_cached"]:
+                    state["counted_as_cached"].discard(id(it))
+                    state["blobs_cached"] -= 1
                 state["blobs_downloaded"] += 1
                 repaired += 1
                 narrate(
@@ -2636,7 +3157,12 @@ def restore(
             archive = target / ARCHIVES_REL / f"{name}.tar.gz"
             try:
                 placed = _extract_strip1(archive, install)
-                if placed == 0:
+                # An empty archive is not proof of a symlink -- see
+                # _archive_emptiness_is_expected. A folder whose files all travel
+                # as declared entries is empty here by design, and saying
+                # "replace the symlink" sends that user after something that does
+                # not exist (hit on a real machine, 2026-08-30).
+                if placed == 0 and not _archive_emptiness_is_expected(dep, mani):
                     # The symlink trap: if the code directory was itself a
                     # symlink at pack time, tar stored the link and not the tree
                     # — **sha256 goes all green** and unpacking lands nothing.
@@ -2895,12 +3421,24 @@ def restore(
             # so the emergency script can use the very same mechanism (it may not
             # add dependencies and has only environment variables to work with).
             _deps_env["UV_DEFAULT_INDEX"] = opts.package_source
-            narrate(
-                f"Installing dependencies from {opts.package_source} instead of the default. "
-                f"Every package is still checked against the fingerprint recorded in the nest, "
-                f"so wrong bytes stop the rebuild instead of quietly landing.",
-                stage="S3",
-            )
+            # **Count what nothing can check; never offer a blanket guarantee.**
+            # A measured 3 of 176 packages carried a fingerprint, and those 3 were
+            # pinned to direct addresses a source switch never touches — so any
+            # "all of them are checked" line is false exactly where it is read.
+            # This spot argued the opposite until 2026-08-30.
+            unverified = unfingerprinted_packages(lock_text)
+            said = f"Installing dependencies from {opts.package_source} instead of the default."
+            if unverified:
+                narrate(
+                    f"{said} {len(unverified)} package(s) in this nest carry no recorded "
+                    f"fingerprint, so their bytes are not compared against anything — they "
+                    f"arrive from whichever index you named. Point this only at an index you "
+                    f"trust.",
+                    stage="S3",
+                    level="warning",
+                )
+            else:
+                narrate(said, stage="S3")
         _t_deps = time.monotonic()
         r = runner([uv_executable(), "pip", "sync", str(lock_path)], env=_deps_env)
         if r.returncode != 0:
@@ -2993,7 +3531,7 @@ def restore(
                 f"{len(gaps)} system librar{'y' if len(gaps) == 1 else 'ies'} this "
                 f"machine does not have ({', '.join(gaps)}). Anything that imports "
                 f"`{mod}` will fail to load. "
-                + missing_library_advice(gaps, plan.base_image_ref),
+                + missing_library_advice(gaps, plan.base_image_ref, plan.native_libs),
                 stage="S3",
                 level="warning",
             )
@@ -3039,17 +3577,31 @@ def restore(
                 # named that exact library. The service-type branch has scanned for this
                 # all along; only this one did not, so the same machine got two different
                 # diagnoses depending on which kind of nest it was.
-                _libs = missing_system_libraries(_tail(res.log_path, _SYSLIB_SCAN_CHARS))
+                _log_tail = _tail(res.log_path, _SYSLIB_SCAN_CHARS)
+                _libs = missing_system_libraries(_log_tail)
                 if _libs:
                     raise NestFailure(
                         "S4",
                         ErrorClass.SYSLIB_MISSING,
                         missing_library_advice(
                             every_missing_library(_libs, report.precheck),
-                            plan.base_image_ref)
+                            plan.base_image_ref, plan.native_libs)
                         + f" The run's own log: {res.log_path}",
                         detail=_tail(res.log_path),
                         context={"missing_system_library": _libs[0],
+                                 "exit_code": res.exit_code},
+                    )
+                # The other cause that is not the run's fault, and it must not read like
+                # the one above: a missing library is one command away, a card with no
+                # kernels for this build is only a different machine away.
+                if no_kernels_for_this_gpu(_log_tail):
+                    raise NestFailure(
+                        "S4",
+                        ErrorClass.STARTUP_CRASH,
+                        ARCH_UNSUPPORTED_SAY
+                        + f" The run's own log: {res.log_path}",
+                        detail=_tail(res.log_path),
+                        context={"gpu_has_no_kernels": True,
                                  "exit_code": res.exit_code},
                     )
                 raise NestFailure(
@@ -3120,7 +3672,7 @@ def restore(
                     ErrorClass.SYSLIB_MISSING,
                     missing_library_advice(
                         every_missing_library(_libs, report.precheck),
-                        plan.base_image_ref)
+                        plan.base_image_ref, plan.native_libs)
                     + f" The app's own log: {_log}",
                     detail=_tail(_log) if _log.exists() else None,
                     context={"missing_system_library": _lib},
@@ -3130,6 +3682,7 @@ def restore(
         # launcher signature: other launchers are injected (the test harness has
         # one) and changing their call shape would break them silently.
         with contextlib.suppress(Exception):
+            handle_box["h"].target = plan.target
             _recipe = plan.target / RECIPE_REL
             if _recipe.is_file():
                 # Only rerun it if the nest says this recipe once produced something.
@@ -3186,10 +3739,24 @@ def restore(
                     ErrorClass.SYSLIB_MISSING,
                     missing_library_advice(
                         every_missing_library(_slibs, report.precheck),
-                        plan.base_image_ref)
+                        plan.base_image_ref, plan.native_libs)
                     + f" The app's own log: {_slog}",
                     detail=_tail(_slog) if _slog.exists() else None,
                     context={"missing_system_library": _slib},
+                ) from e
+            # Then the three named S5 causes. Without this the wrong GPU, an
+            # out-of-memory and a raising node all came back as one unnamed
+            # failure, which is the one report nobody can act on.
+            _verdict = classify_render_failure(str(e)) or classify_render_failure(
+                _tail(_slog, _SYSLIB_SCAN_CHARS) if _slog.exists() else None
+            )
+            if _verdict is not None:
+                _klass, _say = _verdict
+                _where = f" The app's own log: {_slog}" if _slog.exists() else ""
+                raise NestFailure(
+                    "S5", _klass, _say + _where,
+                    detail=_tail(_slog) if _slog.exists() else str(e),
+                    context={"render_failure": str(e)[:400]},
                 ) from e
             raise NestFailure("S5", ErrorClass.UNKNOWN, f"The test render failed: {e}") from e
 
@@ -3211,6 +3778,14 @@ def restore(
                 int(ExitCode.OK) if report.ok else int(ExitCode.S0_WARNING_UNCONFIRMED)
             )
             return report
+        # Say the landing spot out loud before a single byte is written. Someone
+        # who packed ~/Documents/ComfyUI naturally expects a rebuild to put it
+        # back there; it does not, and a nest carries no absolute path from the
+        # machine it was packed on, so it could not even if we wanted it to.
+        narrate(
+            f"Everything from this nest lands under {target} — not wherever it "
+            "lived on the machine it was packed on."
+        )
         run_stage("S0", s0_precheck)
         run_stage("S1", s1_download, start_extra={"bytes_total": plan.total_bytes})
         run_stage("S2", s2_place)
@@ -3253,8 +3828,30 @@ def restore(
         report.failure = failure.to_error_object()
     # Machine libraries the working run really loaded that this machine does not have.
     # Read here as well as in the closing words below, because it decides the exit code.
+    yours = your_own_material_still_missing(mani, target)
+    if yours:
+        narrate(
+            "This workflow uses material of your own, which a nest lists but never "
+            "carries: " + ", ".join(yours[:6])
+            + (f" (and {len(yours) - 6} more)" if len(yours) > 6 else "")
+            + ". Put each file back at the path listed above before the first run, or "
+            "the app will stop looking for it.",
+            stage="S5",
+            level="warning",
+        )
     short_libs = _libs_the_working_run_used_but_this_machine_lacks(report.precheck)
-    if failure is None and short_libs:
+    # Every other warning has to reach the exit code too, not only the missing-library
+    # one. `renest doctor` returns 61 for *any* warning (doctor.py::_verdict_exit_code);
+    # until 2026-08-22 restore returned 61 for one kind and 0 for the rest, so the same
+    # nest on the same machine answered 61 to `doctor` and 0 to `restore`.
+    # `--force` is the user saying "I have seen them, go on", which is how doctor
+    # treats it. The missing-library case above stays unconditional on purpose: it was
+    # put there on 2026-08-19 off a real machine, and quietly weakening it under
+    # --force is not part of this fix.
+    _warned = ((report.precheck or {}).get("overall") == LEVEL_WARN) or (
+        (report.fingerprint_verdict or {}).get("level") == LEVEL_WARNING
+    )
+    if failure is None and (short_libs or (_warned and not opts.force)):
         # **Say it in the exit code too, not only in words.** Measured 2026-08-19 on a
         # machine short of libGL.so.1: this tool named the library, printed the fix --
         # and returned 0, so any script reading the exit code filed it as a clean success.
@@ -3262,7 +3859,12 @@ def restore(
         # *finished, but this machine is missing something and we could not confirm it
         # does not matter.* Still a warning, never a refusal (2026-07-15 ruling: this leg
         # informs, it does not block) -- the work ran to the end, nothing was withheld.
-        report.exit_code = int(ExitCode.S0_WARNING_UNCONFIRMED)
+        #
+
+        # 61 is only the short-libraries case; any other warning answers 67 (narrowed
+        # back 2026-08-29). `doctor` keys off the same field, so both legs agree.
+        report.exit_code = int(ExitCode.S0_WARNING_UNCONFIRMED if short_libs
+                               else ExitCode.S0_WARNING_OTHER)
 
     with contextlib.suppress(OSError):
         evidence.mkdir(parents=True, exist_ok=True)
@@ -3279,6 +3881,8 @@ def restore(
             f"✅ Done: {report.blobs_downloaded} files downloaded, {report.blobs_cached} already here. "
             f"Took {report.metrics['total_seconds']}s. Logs and evidence: {evidence}"
         )
+        narrate(cache_landing_line(mani, target))
+        narrate(toolchain_landing_line(target))
         if report.redactions:
             narrate(
                 f"One thing still needs you: {len(report.redactions)} place(s) in this nest "
@@ -3301,7 +3905,7 @@ def restore(
                 f"operating system and no nest can carry them. Until they are here, parts of this "
                 f"environment load silently as nothing: it will start and answer, and your own "
                 f"workflow will be the thing that fails. "
-                + missing_library_advice(_short, plan.base_image_ref),
+                + missing_library_advice(_short, plan.base_image_ref, plan.native_libs),
                 level="warn",
             )
     else:

@@ -16,6 +16,7 @@ Exit codes (restore protocol, S0 range): 0 = match/compatible;
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import platform
@@ -23,8 +24,10 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from urllib.parse import unquote
 
 from .config import (
     ConfigError,
@@ -37,11 +40,12 @@ from .errors import ErrorClass, ExitCode
 from .events import EventEmitter
 from .fingerprint import Fingerprint, collect, collect_wheel_env
 from .rules import DOCTOR_RULES, FINGERPRINT_MATRIX, load_rules
-from .syslibs import missing_native_libs
+from .syslibs import machine_libs_checkable, missing_native_libs
 from .uvbin import uv_executable
 
 __all__ = [
     "LEVEL_PASS",
+    "LEVEL_UNKNOWN",
     "LEVEL_WARN",
     "LEVEL_REJECT",
     "CUDA_DRIVER_FLOOR",
@@ -60,6 +64,9 @@ __all__ = [
     "declared_cuda_tag",
     "TORCH_FAMILY",
     "check_lock_cuda_vs_driver",
+    "check_lock_torch_floors",
+    "lock_versions",
+    "SILENT_TORCH_FLOORS",
     "lock_cuda_majors",
     "check_disk",
     "run_precheck",
@@ -76,6 +83,11 @@ __all__ = [
 LEVEL_PASS = "pass"
 LEVEL_WARN = "warn"
 LEVEL_REJECT = "reject"
+#: We looked and could not find out. **Not a pass** -- a green tick that means
+#: "I could not read it" is the same failure this project keeps paying for:
+#: an empty result that looks like a passing one. It stays non-blocking
+#: (see `Precheck.overall`): unknown must never turn into a refusal.
+LEVEL_UNKNOWN = "unknown"
 
 # The real source of these thresholds is data/doctor-rules.json (a built-in
 # factory baseline, overridable from the user's config directory, see rules.py).
@@ -107,6 +119,14 @@ REQUIRED_CPU_FLAGS: tuple[str, ...] = ("avx2",)
 #: are notes, never a verdict -- unfit *for what*, when nothing was named?
 _NEST_FREE_CHECKS: frozenset[str] = frozenset({"cpu_flags", "local_disk", "ram", "egress"})
 
+#: The ``--lock`` checks. They read the lockfile the caller named plus this
+#: machine's driver and need nothing from a nest, so unlike the checks above
+#: they do name their subject: the file just handed over. They therefore run,
+#: and set the exit code, with no nest given.
+_LOCK_CHECKS: frozenset[str] = frozenset(
+    {"lock_cuda_family", "lock_cuda_vs_driver", "lock_sources", "lock_torch_floors"}
+)
+
 #: Names of the Intel/AMD chip family — every spelling ``platform.machine()``
 #: uses for it across systems.
 #:
@@ -137,12 +157,26 @@ X86_ARCH_NAMES: frozenset[str] = frozenset(
     {"x86_64", "amd64", "x86", "i386", "i486", "i586", "i686"}
 )
 
-EGRESS_REJECT_MBPS = 20.0  # same threshold as the harness 30s fast-fail gate
+#: A slow link costs **time, not fidelity** — every byte still arrives and still
+#: verifies. So this floor is now only for links that cannot finish at all, and
+#: everything above it is a heads-up carrying the numbers the user needs to
+#: decide: how big the nest is, how fast this machine measured, how long that is.
+#: (2026-09-01, founder: refusing a rebuild over speed is not ours to decide.
+#: It was 20.0, which turned a 12.9 Mbps home line — files already local — into
+#: a refusal, and a machine that really ran at 130 Mbps into another one.)
+EGRESS_REJECT_MBPS = 2.0
 EGRESS_WARN_MBPS = 100.0
 
-#: The probe used to measure download speed. **It is a link to one specific
-#: release**, so the day that release is deleted the speed check **fails
-#: silently** — an unmeasurable link is simply skipped, and nobody notices.
+#: How much of a nest blob the probe reads. 32 MB is ~13 s at the 20 Mbps floor
+#: and a second or two on a fast link: enough to tell them apart, small enough
+#: that the check never pulls a whole model.
+EGRESS_PROBE_BYTES = 32 * 1024 * 1024
+
+#: Fallback probe, used only when there is no nest to measure against; restoring
+#: a nest probes one of its own blobs instead. Read twice on real machines: this
+#: probe said 7.5 Mbps where storage delivered 130.5 Mbps, and the floor below
+#: turned that into a refusal. **It is a link to one specific release**, so the
+#: day that release is deleted the speed check **fails silently**.
 #: That is why the source of truth lives in the rules data (``egress.probe_url``
 #: in the doctor rules, and ``egress_probe`` in the world rules); the value here
 #: is only the factory fallback for when that data cannot be read.
@@ -233,6 +267,8 @@ class PrecheckReport:
             return "reject"
         if LEVEL_WARN in levels:
             return "warn"
+        # LEVEL_UNKNOWN lands here on purpose: "we could not find out" must not
+        # block a rebuild. It changes the tick the user sees, nothing else.
         return "ok"
 
     @property
@@ -370,6 +406,21 @@ def check_cpu_flags(
             "failing safe and calling it unfit.",
             reading,
         )
+    # **Never say a CPU lacks something when no feature list was seen at all.**
+    # Without this the "missing avx2" line went out on any output that simply had
+    # no flags line in it -- a claim about the machine we had no evidence for, and
+    # a user who checks and finds avx2 right there stops believing the next report.
+    # The verdict stays unfit either way (reading it wrong the other direction
+    # costs a whole download); only the sentence changes to what we actually know.
+    if "flags" not in tokens:
+        return CheckResult(
+            "cpu_flags",
+            LEVEL_REJECT,
+            "Could not find this machine's CPU feature list in what it reported, so "
+            "whether it has the instructions torch needs is unknown -- failing safe and "
+            "calling it unfit rather than guessing.",
+            reading,
+        )
     missing = [f for f in required if f not in tokens]
     reading["missing"] = missing
     if missing:
@@ -416,7 +467,10 @@ def split_arch_list(arch_list: list[str] | None) -> tuple[list[int], list[int]]:
     """
     binaries: list[int] = []
     ptx: list[int] = []
-    for tag in arch_list or []:
+    # A hand-written nest can put anything in this slot. Anything that is not a list
+    # reads as "nothing recorded" — a pre-flight that tracebacks on a nest tells the
+    # user less than one that stays quiet, and this runs before a machine is rented.
+    for tag in arch_list if isinstance(arch_list, (list, tuple)) else []:
         s = str(tag).strip().lower()
         n = _arch_num(s)
         if n is None:
@@ -482,11 +536,30 @@ def check_gpu_arch(
             "gpu_arch", LEVEL_PASS,
             f"This GPU (sm_{have}) is one this nest's torch was built for. Good match.",
             reading)
+    low_binary = min(binaries) if binaries else None
+    reading["min_binary_arch"] = low_binary
+    # **Older than every target has no code to run at all.** Finished GPU code runs on
+    # newer cards, never on older ones, and the half-finished form cannot fill the gap
+    # downwards either. Judging this by the *highest* target alone called a 2016 card a
+    # good match for a build that starts at sm_80 -- the escape hatch, which compares
+    # against the lowest, had it right, and the two legs now agree.
+    if low_binary is not None and have < low_binary:
+        return CheckResult(
+            "gpu_arch", LEVEL_REJECT,
+            f"This GPU (sm_{have}) is older than the lowest one this nest's torch was built "
+            f"for (sm_{low_binary}){' (packed on ' + captured_name + ')' if captured_name else ''}. "
+            f"There are no kernels here this card can run, and the forward-compatible form "
+            f"cannot fill that gap downwards — every file will match byte for byte and the app "
+            f"will still fail with 'no kernel image is available'. Rent a card at sm_{low_binary} "
+            f"or newer, or pack a fresh nest on this one. --force goes ahead anyway.",
+            reading)
     if top_binary is not None and have < top_binary:
         return CheckResult(
             "gpu_arch", LEVEL_PASS,
-            f"This GPU (sm_{have}) is not a prebuilt target but sits below the highest one "
-            f"(sm_{top_binary}), so it should run. Your first image may be slower.",
+            f"This GPU (sm_{have}) is not a prebuilt target but sits between the lowest and the "
+            f"highest one (sm_{low_binary}–sm_{top_binary}), so it should run. Your first image "
+            f"may be slower. That covers this nest's torch — a compiled extension can be built "
+            f"for a narrower set, and this nest records only torch's.",
             reading)
 
     # Within one GPU generation, **a newer card runs the older finished machine
@@ -530,24 +603,42 @@ def check_gpu_arch(
         reading)
 
 
+def _how_long(total_bytes: int, mbps: float) -> str:
+    """"1.2 GB at 8 Mbps" as a wall-clock the reader can act on."""
+    if total_bytes <= 0 or mbps <= 0:
+        return ""
+    minutes = (total_bytes * 8) / (mbps * 1e6) / 60
+    size = f"{total_bytes / 1e9:.1f} GB"
+    if minutes < 90:
+        return f" This nest is {size}; at this speed the download is about {minutes:.0f} min."
+    return f" This nest is {size}; at this speed the download is about {minutes / 60:.1f} h."
+
+
 def check_egress(
     mbps: float,
     reject_below: float = EGRESS_REJECT_MBPS,
     warn_below: float = EGRESS_WARN_MBPS,
+    total_bytes: int = 0,
 ) -> CheckResult:
-    """Host egress health. Input = measured Mbps."""
+    """Host egress health. Input = measured Mbps.
+
+    A slow link costs time, not fidelity: the bytes still arrive and still
+    verify. So this reports and estimates rather than refusing, and the floor
+    below is only for links that cannot realistically finish.
+    """
     reading = {
         "mbps": round(mbps, 1),
         "reject_below": reject_below,
         "warn_below": warn_below,
+        "nest_bytes": total_bytes,
     }
+    eta = _how_long(total_bytes, mbps)
     if mbps < reject_below:
         return CheckResult(
             "egress",
             LEVEL_REJECT,
             f"This machine downloads at {mbps:.1f} Mbps, under the "
-            f"{reject_below:.0f} Mbps floor. A machine that boots isn't always a "
-            f"machine that works — stop here and rent another one.",
+            f"{reject_below:.0f} Mbps floor — too slow to finish a rebuild.{eta}",
             reading,
         )
     if mbps < warn_below:
@@ -555,8 +646,8 @@ def check_egress(
             "egress",
             LEVEL_WARN,
             f"This machine downloads at {mbps:.1f} Mbps, on the slow side "
-            f"(under {warn_below:.0f}). Big model files will take a while, and "
-            f"the nest stays marked unverified.",
+            f"(under {warn_below:.0f}).{eta} Nothing is lost to a slow link — "
+            f"every byte still arrives and is checked — it just takes longer.",
             reading,
         )
     return CheckResult(
@@ -841,6 +932,112 @@ def check_lock_sources(lock_text: str) -> CheckResult:
         reading)
 
 
+#: Packages that need a minimum torch version and declare no requirement for it,
+#: so nothing warns while installing and the crash lands at import. Facts about
+#: upstream, so the real table is ``silent_torch_floors`` in the doctor rules;
+#: this is only the fallback for when that data cannot be read.
+SILENT_TORCH_FLOORS: dict[str, str] = {"comfy-kitchen": "2.8"}
+
+#: The optional ``[extras]`` group has to be tolerated, or a package requested
+#: with extras is simply not seen and the check reports "pass" having read nothing.
+_PINNED_REQ = re.compile(r"^([A-Za-z0-9._-]+)(?:\[[^\]]*\])?\s*==\s*([^\s;#]+)")
+_URL_REQ = re.compile(r"^([A-Za-z0-9._-]+)(?:\[[^\]]*\])?\s*@\s*(https?://\S+)")
+
+
+def _norm_pkg(name: str) -> str:
+    """Fold a distribution name the way package indexes do."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _release_tuple(version: str | None) -> tuple[int, ...]:
+    """The leading numeric part of a version, as integers for comparing."""
+    m = re.match(r"\d+(?:\.\d+)*", (version or "").strip())
+    return tuple(int(x) for x in m.group(0).split(".")) if m else ()
+
+
+def _below(have: str | None, floor: str) -> bool:
+    a, b = _release_tuple(have), _release_tuple(floor)
+    if not a or not b:
+        return False
+    width = max(len(a), len(b))
+    return a + (0,) * (width - len(a)) < b + (0,) * (width - len(b))
+
+
+def lock_versions(lock_text: str) -> dict[str, str]:
+    """``{package name: version}`` for every pinned line in a lockfile.
+
+    Both spellings a lock uses are recognised: ``name==1.2.3`` (a trailing
+    ``+cuNNN`` is dropped) and ``name @ https://.../name-1.2.3-...whl``, where
+    the version sits inside the wheel filename.
+    """
+    out: dict[str, str] = {}
+    for raw in lock_text.splitlines():
+        line = raw.strip().lstrip("-").strip().strip("\"'")
+        if not line or line.startswith("#"):
+            continue
+        pinned = _PINNED_REQ.match(line)
+        if pinned:
+            out[_norm_pkg(pinned.group(1))] = pinned.group(2).split("+", 1)[0]
+            continue
+        url = _URL_REQ.match(line)
+        if url:
+            parts = url.group(2).split("?", 1)[0].rsplit("/", 1)[-1].split("-")
+            if len(parts) >= 2 and parts[1][:1].isdigit():
+                out[_norm_pkg(url.group(1))] = unquote(parts[1]).split("+", 1)[0]
+    return out
+
+
+def _torch_floors() -> dict[str, str]:
+    """The floors table from the rules data, or the factory one if it has none.
+
+    An override that carries the section but empties it means "upstream fixed
+    this", and must not be overruled by the factory table.
+    """
+    try:
+        rules = load_rules(DOCTOR_RULES)
+        if "silent_torch_floors" not in rules:
+            return dict(SILENT_TORCH_FLOORS)
+        packages = (rules["silent_torch_floors"] or {}).get("packages") or {}
+        return {
+            _norm_pkg(name): str(spec["min_torch"])
+            for name, spec in packages.items()
+            if isinstance(spec, dict) and spec.get("min_torch")
+        }
+    except Exception:  # noqa: BLE001
+        return dict(SILENT_TORCH_FLOORS)
+
+
+def check_lock_torch_floors(lock_text: str, floors: dict[str, str] | None = None) -> CheckResult:
+    """Does the lock pin a package that needs a newer torch than the lock pins?
+
+    Such a package declares no torch requirement, so the resolver sees no
+    conflict and the install finishes clean; the application then fails to start
+    with an error about a type annotation that never names torch.
+
+    Warning level, like the source check above: the point is to say so while
+    saying so is still free, before a machine is rented. What the floors are is
+    data; what we do about a hit is not.
+    """
+    floors = _torch_floors() if floors is None else floors
+    versions = lock_versions(lock_text)
+    have = versions.get("torch")
+    hits = {p: f for p, f in floors.items() if p in versions and _below(have, f)}
+    reading = {"torch": have, "floors_checked": sorted(floors), "below_floor": hits}
+    if not hits:
+        return CheckResult(
+            "lock_torch_floors", LEVEL_PASS,
+            "Nothing in this lockfile needs a newer torch than the lockfile pins", reading)
+    detail = "; ".join(f"{p} needs torch {f} or newer" for p, f in sorted(hits.items()))
+    return CheckResult(
+        "lock_torch_floors", LEVEL_WARN,
+        f"This lockfile pins torch {have}, and {detail}. Nothing warns you while it installs "
+        f"— these packages declare no torch requirement, so the resolver sees no conflict — "
+        f"and the application then fails to start with an error about a type annotation that "
+        f"never mentions torch. Install torch from an index that carries a new enough build "
+        f"and lock again; better to know that now than after renting a machine.",
+        reading)
+
+
 def check_lock_cuda_vs_driver(lock_text: str, driver_cuda_version: str) -> CheckResult:
     """The CUDA major the lock needs vs the one this machine's driver supports.
 
@@ -908,7 +1105,7 @@ def check_ram(total_bytes: int, nest_bytes: int) -> CheckResult:
     }
     if not total_bytes or nest_bytes <= 0:
         return CheckResult(
-            "ram", LEVEL_PASS,
+            "ram", LEVEL_UNKNOWN,
             "Couldn't read this machine's memory (or this nest declares no size) — "
             "nothing to compare",
             reading)
@@ -1040,7 +1237,7 @@ def check_local_disk(path: str | os.PathLike[str],
     reading: dict[str, object] = {"fstype": fstype or "unknown",
                                   "source": source or "unknown"}
     if not fstype:
-        return CheckResult("local_disk", LEVEL_PASS,
+        return CheckResult("local_disk", LEVEL_UNKNOWN,
                            "Cannot tell what kind of disk this is here — not checking it",
                            reading)
     if fstype.split(".")[0] not in _NETWORK_FS:
@@ -1092,7 +1289,19 @@ def check_uv() -> CheckResult:
     )
 
 
-def check_writable(path: str | os.PathLike[str]) -> CheckResult:
+def _nearest_existing_dir(path: str | os.PathLike[str]) -> Path:
+    """The deepest part of ``path`` that exists as a directory today."""
+    p = Path(os.fspath(path))
+    for candidate in (p, *p.parents):
+        if candidate.is_dir():
+            return candidate
+    return p
+
+
+def check_writable(
+    path: str | os.PathLike[str],
+    landing_dirs: Iterable[str | os.PathLike[str]] = (),
+) -> CheckResult:
     """Can we really write here? **Answered by writing, not by asking.**
 
     ``df`` lies on a quota-backed network mount. Measured 2026-08-10 on a rented pod whose
@@ -1104,13 +1313,14 @@ def check_writable(path: str | os.PathLike[str]) -> CheckResult:
 
     A small probe is the only thing that answers the real question, and it also catches
     read-only mounts and permission trouble, which arithmetic never would.
+
+    ``landing_dirs`` are the other folders this rebuild writes into (the app folder,
+    extensions, model folders). Probing only the root passes on an image whose
+    ``ComfyUI/models`` is owned by another user, and the rebuild then discovers it at
+    unpack time -- after every byte has already been downloaded.
     """
     reading: dict[str, object] = {"probe_mb": _WRITE_PROBE_BYTES // 2**20}
-    target = Path(os.fspath(path))
-    for candidate in (target, *target.parents):
-        if candidate.is_dir():
-            target = candidate
-            break
+    target = _nearest_existing_dir(path)
     probe = target / f".renest-write-probe-{os.getpid()}"
     try:
         with probe.open("wb") as fh:
@@ -1132,8 +1342,36 @@ def check_writable(path: str | os.PathLike[str]) -> CheckResult:
             probe.unlink()
         except OSError:
             pass
+    # Room is answered; what is left is who owns each folder. An empty file is enough
+    # for that, and it keeps this loop cheap however many folders a nest lands in.
+    seen = {target}
+    for spot in landing_dirs:
+        here = _nearest_existing_dir(spot)
+        if here in seen:
+            continue
+        seen.add(here)
+        tag = here / f".renest-perm-probe-{os.getpid()}"
+        try:
+            tag.touch()
+        except OSError as exc:
+            reading["blocked_dir"] = str(here)
+            return CheckResult(
+                "writable",
+                LEVEL_REJECT,
+                f"{here} already exists and this user cannot write into it "
+                f"({exc.strerror or exc}). The rebuild puts files there, so it would stop "
+                f"partway -- after the download. Machine images differ in who owns what: "
+                f"take ownership of that folder, or rebuild into a different target.",
+                reading,
+            )
+        finally:
+            with contextlib.suppress(OSError):
+                tag.unlink()
+    reading["dirs_probed"] = len(seen)
     return CheckResult("writable", LEVEL_PASS,
-                       f"Wrote and removed a {reading['probe_mb']} MiB probe in {target}",
+                       f"Wrote and removed a {reading['probe_mb']} MiB probe in {target}"
+                       + (f", and checked {len(seen) - 1} more folder(s) it lands in"
+                          if len(seen) > 1 else ""),
                        reading)
 
 
@@ -1176,10 +1414,16 @@ def collect_cpu_flags() -> str:
         return ""
 
 
-def collect_egress_mbps(url: str = EGRESS_PROBE_URL, max_time: int = 30) -> float:
+def collect_egress_mbps(
+    url: str = EGRESS_PROBE_URL, max_time: int = 30, range_bytes: int | None = None
+) -> float:
     """curl a known URL to measure Mbps. ``-L`` is mandatory (GitHub release is
     a 302). curl timeout (exit 28) still emits ``-w`` speed, so we parse stdout
-    rather than the exit code — a slow pipe should read as truly slow, not 0."""
+    rather than the exit code — a slow pipe should read as truly slow, not 0.
+
+    ``range_bytes`` asks for only the first N bytes, which is what lets the probe
+    point at one of the nest's own blobs instead of a third-party download.
+    """
     try:
         r = subprocess.run(  # noqa: S603
             [
@@ -1191,6 +1435,7 @@ def collect_egress_mbps(url: str = EGRESS_PROBE_URL, max_time: int = 30) -> floa
                 "%{speed_download}",
                 "--max-time",
                 str(max_time),
+                *(["-r", f"0-{range_bytes - 1}"] if range_bytes else []),
                 url,
             ],
             capture_output=True,
@@ -1265,15 +1510,18 @@ def check_observed_vram(nest_gpu: dict | None, local_bytes: int | None = None) -
     use = ((nest_gpu or {}).get("observed_use") or {})
     used, samples = use.get("max_used_bytes"), use.get("samples")
     if not isinstance(used, int) or used <= 0:
-        # **Say which of the two it is.** The old wording ("this nest carries no reading")
-        # reads as though this one nest were old or unusual, while *no* nest carries the
-        # figure: nothing in the tool writes it yet, so this check has never once fired.
-        # A report line that looks like a passed check, on a check that cannot run, is
-        # worse than no line at all -- people read it as "the card was sized up".
+        # **Say why there is nothing to compare, not just that there is nothing.** A
+        # report line that looks like a passed check, on a check that could not run, is
+        # worse than no line at all -- it reads as "the card was sized up". The reading
+        # is taken inside the application while a run finishes, so a nest packed without
+        # the panel installed carries none, and saying so is what makes it fixable.
         return CheckResult("observed_vram", "skip",
-                           "Renest does not yet measure how much video memory a working "
-                           "run uses, so no nest carries that figure and this check cannot "
-                           "run. Nothing here has sized this card up against the job.",
+                           "This nest carries no reading of how much video memory its "
+                           "working run used, so nothing here has sized this card up "
+                           "against the job. That reading is taken while a run finishes "
+                           "with the Renest panel installed in ComfyUI; a nest packed "
+                           "without it has none. No reading does not mean the run needs "
+                           "little.",
                            {"never_measured": True})
     have = local_bytes if local_bytes is not None else _local_vram_bytes()
     every = use.get("sample_interval_s")
@@ -1298,6 +1546,17 @@ def check_observed_vram(nest_gpu: dict | None, local_bytes: int | None = None) -
                        f"using {seen}.", reading)
 
 
+def _binary_runs_here(sm_list: list[int], cap: int) -> bool:
+    """Can card generation ``cap`` run a binary built for these targets?
+
+    Within one generation, code built for an earlier step runs on a later card;
+    across generations it does not. Measured 2026-08-08: a card reporting sm_121
+    ran a build whose highest target was sm_120 and which never listed sm_121.
+    Plain membership called that card unsupported.
+    """
+    return any(t <= cap and t // 10 == cap // 10 for t in sm_list)
+
+
 def check_extension_archs(nest_gpu: dict | None, current_compute_cap: str) -> CheckResult:
     """Which GPU generations the nest's **compiled extensions** were built for.
 
@@ -1305,11 +1564,21 @@ def check_extension_archs(nest_gpu: dict | None, current_compute_cap: str) -> Ch
     **only ever a warning** where that one can block: PyTorch not covering this card
     means nothing runs, while one extension not covering it means that extension's nodes
     are missing -- the app still starts, and the user may not even use them.
+
+    **Judged per package and within a generation**, both on the format specification's
+    own instruction. Read the naive way -- one verdict per binary, exact match only --
+    it warned about environments that work: one quantisation library ships seven probed
+    binaries and on an sm_120 card three of them list it while four do not, and an
+    sm_89 card is absent from nearly every build list yet runs the sm_86 code in them.
     """
-    g = nest_gpu or {}
+    # Every slot read here is hand-writable, so anything that is not the expected
+    # shape reads as "nothing recorded" rather than raising: this runs before a
+    # machine is rented, and a traceback tells the user less than silence does.
+    g = nest_gpu if isinstance(nest_gpu, dict) else {}
+    lists = [g.get(key) for key in ("node_native_archs", "package_native_archs")]
     entries = [(e.get("code_dep") or e.get("package") or "?", e)
-               for key in ("node_native_archs", "package_native_archs")
-               for e in (g.get(key) or []) if isinstance(e, dict)]
+               for lst in lists if isinstance(lst, list)
+               for e in lst if isinstance(e, dict)]
     if not entries:
         return CheckResult("extension_archs", "skip",
                            "This nest does not record what its compiled extensions were "
@@ -1320,22 +1589,45 @@ def check_extension_archs(nest_gpu: dict | None, current_compute_cap: str) -> Ch
         return CheckResult("extension_archs", "skip",
                            "This machine's GPU generation could not be read, so the "
                            "extensions' build targets were not compared.", {})
-    missing = []
+    builds: dict[str, list[list[int]]] = {}
     for name, e in entries:
         sms, _ptx = split_arch_list(e.get("sm_list"))
-        if sms and cap not in sms:
-            missing.append(f"{name} (built for {', '.join(str(s) for s in sorted(sms))})")
-    reading = {"this_gpu": cap, "checked": len(entries), "not_built_for_this_card": missing}
+        if sms:
+            builds.setdefault(name, []).append(sms)
+    if not builds:
+        # Nothing readable is not a positive finding. Counting unreadable entries as
+        # checked produced "All 0 compiled extension(s) were built for this card" --
+        # a pass grown out of an empty list.
+        return CheckResult("extension_archs", "skip",
+                           "None of this nest's compiled extensions records a readable "
+                           "build target, so there is nothing to compare.",
+                           {"this_gpu": cap, "checked": 0, "binaries": len(entries)})
+    missing, partial = [], []
+    for name, per_binary in sorted(builds.items()):
+        usable = [sms for sms in per_binary if _binary_runs_here(sms, cap)]
+        if not usable:
+            every = sorted({s for sms in per_binary for s in sms})
+            missing.append(f"{name} (built for {', '.join(str(s) for s in every)})")
+        elif len(usable) < len(per_binary):
+            partial.append(name)
+    reading = {"this_gpu": cap, "checked": len(builds), "binaries": len(entries),
+               "not_built_for_this_card": missing,
+               "some_builds_skip_this_card": partial}
     if not missing:
+        note = ""
+        if partial:
+            note = (f" {len(partial)} of them also carry binaries for other card "
+                    f"generations ({', '.join(partial[:4])}); a package that ships one "
+                    f"binary per CUDA version picks a matching one when it loads.")
         return CheckResult("extension_archs", "pass",
-                           f"All {len(entries)} compiled extension(s) were built for this "
-                           f"card's generation ({cap}).", reading)
+                           f"All {len(builds)} compiled extension(s) carry a build this "
+                           f"card's generation ({cap}) can run.{note}", reading)
     return CheckResult(
         "extension_archs", "warn",
-        f"{len(missing)} of {len(entries)} compiled extension(s) were not built for this "
-        f"card's generation ({cap}): {'; '.join(missing[:4])}. Those nodes will be missing "
-        f"once the app starts; everything else still works. Never a refusal — the app runs "
-        f"without them, and you may not use them.", reading)
+        f"{len(missing)} of {len(builds)} compiled extension(s) carry no build this card's "
+        f"generation ({cap}) can run: {'; '.join(missing[:4])}. What those provide will be "
+        f"unavailable once the app starts; everything else still works. Never a refusal — "
+        f"the app runs without them, and you may not need them.", reading)
 
 
 def check_system_layer(nest_runtime: dict | None, this_env: dict | None = None) -> CheckResult:
@@ -1375,8 +1667,19 @@ def check_system_layer(nest_runtime: dict | None, this_env: dict | None = None) 
 
     libs = rt.get("native_libs") or {}
     names = [n for n in (libs.get("names") or []) if isinstance(n, str)]
-    if libs.get("method") and names:
-        gone = missing_native_libs(names)
+    tag = have.get("platform_tag")
+    if libs.get("method") and names and not machine_libs_checkable(tag):
+        # Saying "checked 28, none missing" where nothing was looked at is the same
+        # false reassurance from the other side -- and it made the two legs contradict
+        # each other on one machine, which is how a real warning gets ignored.
+        reading["native_libs"] = {"method": libs.get("method"), "checked": 0,
+                                  "missing": [], "checked_here": False}
+        lines.append(
+            f"The {len(names)} machine library file(s) this nest names were not checked "
+            f"here: they are Linux library files and this machine is "
+            f"{tag}. Nothing is claimed either way.")
+    elif libs.get("method") and names:
+        gone = missing_native_libs(names, tag)
         reading["native_libs"] = {"method": libs.get("method"), "checked": len(names),
                                   "missing": gone}
         if gone and libs.get("method") == "loaded":
@@ -1503,6 +1806,16 @@ def run_precheck(
     #: requirement is used as an approximation.
     nest_bytes: int = 0,
     disk_path: str | os.PathLike[str] = "/",
+    #: Other filesystems this rebuild will write to, as ``{path: bytes}``. A nest's
+    #: model cache follows the machine's own settings and lands wherever those point,
+    #: which on a rented machine is routinely a different disk from the target. Checking
+    #: only the target leaves the disk that actually fills up unexamined.
+    other_disks: dict[str, int] | None = None,
+    #: The folders this rebuild writes into, beyond the target root: the app folder,
+    #: each extension, each model folder. A folder that already exists and belongs to
+    #: another user passes the root probe and stops the rebuild at unpack time instead,
+    #: which is after the download. Empty = only the root is probed.
+    landing_dirs: Iterable[str | os.PathLike[str]] | None = None,
     nest_gpu: dict | None = None,
     skip_net: bool = False,
     #: Whether the big files for this rebuild come over the internet. ``False``
@@ -1513,6 +1826,8 @@ def run_precheck(
     bulk_from_internet: bool | None = None,
     force: bool = False,
     egress_url: str | None = None,
+    #: Total bytes this rebuild will pull, so a slow link can say how long.
+    egress_bytes: int = 0,
     lock_text: str | None = None,
     #: Which chip family this nest was packed for (``fingerprint.os.machine`` in
     #: the manifest, from format 2.3 onwards). Absent = an older nest that never
@@ -1574,7 +1889,10 @@ def run_precheck(
     # One pass and one voice — see check_system_layer.
     report.checks.append(check_system_layer(nest_runtime))
     if not skip_net:
+        # Measure the path the bytes will take: callers restoring a nest pass one
+        # of its own blob URLs. Without one, fall back to the third-party probe.
         url = egress_url or str(egress_rules["probe_url"])
+        _probe_range = EGRESS_PROBE_BYTES if egress_url else None
         # **When the big files do not come over the internet, a slow link is no
         # reason to refuse.** The gate exists so nobody rents a cloud machine and
         # discovers a broken network twenty GB in; on a home machine whose files
@@ -1582,20 +1900,26 @@ def run_precheck(
         # over a 12.9 Mbps line is nonsense. Not a skip, though — the dependency
         # install still needs the network, so it downgrades to a heads-up.
         result = check_egress(
-            collect_egress_mbps(url),
+            collect_egress_mbps(url, range_bytes=_probe_range),
             reject_below=float(egress_rules["reject_below_mbps"]),
             warn_below=float(egress_rules["warn_below_mbps"]),
+            total_bytes=egress_bytes,
         )
+        # Record where the bulk comes from either way — it is a fact about this
+        # run, not a detail of one branch. (Before 2026-09-01 it was only written
+        # on the reject path, so a warn carried no trace of it.)
+        reading = dict(result.reading)
+        reading["bulk_from_internet"] = bulk_from_internet
+        result = CheckResult(result.name, result.level, result.reason, reading)
         if bulk_from_internet is False and result.level == LEVEL_REJECT:
-            reading = dict(result.reading)
-            reading["bulk_from_internet"] = False
+            # Local bulk: even a link too slow to finish a download is no reason
+            # to stop, because the download is not happening over it.
             result = CheckResult(
                 "egress",
                 LEVEL_WARN,
-                result.reason.split(" A machine that boots")[0]
-                + " — but the big files for this rebuild do not come over the internet, "
-                "so this is only a heads-up: installing dependencies will be slow, "
-                "and nothing here is a reason to stop.",
+                f"{result.reason} The big files for this rebuild do not come over "
+                "the internet, so this is only a heads-up: installing dependencies "
+                "will be slow, and nothing here is a reason to stop.",
                 reading,
             )
         report.checks.append(result)
@@ -1605,10 +1929,18 @@ def run_precheck(
         report.checks.append(check_lock_cuda_family(lock_text))
         report.checks.append(check_lock_cuda_vs_driver(lock_text, collect_driver_cuda_version()))
         report.checks.append(check_lock_sources(lock_text))
+        # A package can need a newer torch than it declares, and then nothing at
+        # install time says so — the crash waits until the application starts.
+        report.checks.append(check_lock_torch_floors(lock_text))
     report.checks.append(check_disk(collect_disk_free(disk_path), int(need_disk_gb * 2**30)))
+    for _other, _bytes in sorted((other_disks or {}).items()):
+        _r = check_disk(collect_disk_free(_other), int(_bytes))
+        _r.reading["path"] = _other
+        _r.reason = f"{_r.reason} (in {_other})"
+        report.checks.append(_r)
     # Then ask the disk the same question by writing to it: on a quota-backed network mount
     # the number above is the provider's whole pool, not your share (see check_writable).
-    report.checks.append(check_writable(disk_path))
+    report.checks.append(check_writable(disk_path, landing_dirs or ()))
     # Nothing rebuilds without uv (see check_uv) — ask before the long download,
     # not after it.
     report.checks.append(check_uv())
@@ -1666,8 +1998,38 @@ def _major(version: str | None) -> str | None:
     return m.group(1) if m else None
 
 
+def python_is_obtainable(version: str | None) -> bool | None:
+    """Can this machine get the Python a nest asks for? None = could not find out.
+
+    **The question the check has to answer is "can this machine get it", not "does
+    this machine happen to run it".** Both rebuild paths create the environment with
+    ``uv venv --python <the version the nest recorded>``, so the interpreter that
+    happens to be on PATH is never the one that runs the restored setup. Refusing on
+    that comparison turns away machines that would have worked -- measured 2026-08-21
+    on a rented machine whose own Python was 3.11 while the nest wanted 3.12.
+    """
+    pair = _major_minor(version)
+    if not pair:
+        return None
+    want = ".".join(pair)
+    uv = shutil.which("uv")
+    if uv is None:
+        return None
+    found = _run_cmd([uv, "python", "find", want])
+    if found.strip():
+        return True
+    listed = _run_cmd([uv, "python", "list"])
+    if not listed.strip():
+        return None
+    for line in listed.splitlines():
+        if f"-{want}." in line or f"-{want}-" in line:
+            return True
+    return False
+
+
 def compare_fingerprint(local: Fingerprint | dict, required: dict,
-                        base_image: str | None = None) -> FingerprintVerdict:
+                        base_image: str | None = None,
+                        python_obtainable: bool | None = None) -> FingerprintVerdict:
     """Compare this machine's fingerprint vs a nest's ``required`` fingerprint.
 
     Rules (initial, deliberately lenient — more warnings, fewer blocks):
@@ -1696,8 +2058,15 @@ def compare_fingerprint(local: Fingerprint | dict, required: dict,
     rpy = (required.get("python") or {}).get("version")
     if rpy:
         if _major_minor(lpy) != _major_minor(rpy):
-            row("python.version", lpy, rpy, LEVEL_BLOCKING)
-            bump(LEVEL_BLOCKING, ErrorClass.PYTHON_BLOCK)
+            # Blocking only when this machine genuinely cannot get that version.
+            # The rebuild fetches it; the interpreter on PATH never runs the
+            # restored setup, so comparing against it refuses machines that work.
+            if python_obtainable:
+                row("python.version", lpy, rpy, LEVEL_COMPATIBLE)
+                bump(LEVEL_COMPATIBLE)
+            else:
+                row("python.version", lpy, rpy, LEVEL_BLOCKING)
+                bump(LEVEL_BLOCKING, ErrorClass.PYTHON_BLOCK)
         elif lpy != rpy:
             row("python.version", lpy, rpy, LEVEL_COMPATIBLE)
             bump(LEVEL_COMPATIBLE)
@@ -1793,8 +2162,26 @@ def _verdict_exit_code(
         return int(ExitCode.OK) if force else code
     warn = (precheck.overall == "warn") or (fp is not None and fp.level == LEVEL_WARNING)
     if warn and not force:
-        return int(ExitCode.S0_WARNING_UNCONFIRMED)
+        # 61 means only "short the libraries the working run used"; every other warning
+        # is 67. Widened to cover both on 2026-08-23, narrowed back 08-29: one number
+        # for a serious finding and a near-universal one left nobody able to act on
+        # either. `restore` keys off the same field, so the two legs still agree.
+        return int(ExitCode.S0_WARNING_UNCONFIRMED
+                   if _short_native_libs(precheck) else ExitCode.S0_WARNING_OTHER)
     return int(ExitCode.OK)
+
+
+def _short_native_libs(precheck: PrecheckReport) -> list[str]:
+    """Libraries the packed run used that this machine does not have.
+
+    Read off the structured reading, not the sentence: wording gets rephrased, and a
+    check keyed on wording quietly stops firing that day.
+    """
+    for c in precheck.checks:
+        nl = (getattr(c, "reading", None) or {}).get("native_libs") or {}
+        if nl.get("missing") and nl.get("method") == "loaded":
+            return [str(x) for x in nl["missing"]]
+    return []
 
 
 _S0_BY_CLASS: dict[ErrorClass, ExitCode] = {
@@ -1967,6 +2354,9 @@ def doctor(
     _local: Fingerprint | None = None,
     _precheck: PrecheckReport | None = None,
     _gpu_name: str | None = None,
+    #: Tests pin this so they never depend on which Pythons the machine running
+    #: them happens to have; None means ask uv, which is what a real run does.
+    _python_obtainable: bool | None = None,
     _creds: Credentials | None = None,
 ) -> DoctorResult:
     """Run the pre-check. Without ``manifest`` just collect + print this
@@ -1988,21 +2378,35 @@ def doctor(
         # that provably cannot install our wheels: it got a clean bill of health.
         # A check that answers "fine" on an unusable machine is worse than absent.
         precheck = _precheck if _precheck is not None else (
-            run_precheck(skip_net=skip_net, force=force) if with_host_checks else None
+            run_precheck(skip_net=skip_net, force=force, lock_text=lock_text)
+            if with_host_checks else None
+        )
+        # "Is my lockfile self-consistent, and can this driver carry it" is a
+        # question about the file just named, not about a nest -- and it went
+        # unanswered here: --lock without a nest used to check nothing and exit 0.
+        lock_only = PrecheckReport(
+            checks=[c for c in (precheck.checks if precheck else []) if c.name in _LOCK_CHECKS],
+            forced=force,
         )
         if precheck is not None:
             precheck = PrecheckReport(
-                checks=[c for c in precheck.checks if c.name in _NEST_FREE_CHECKS],
+                checks=[c for c in precheck.checks
+                        if c.name in _NEST_FREE_CHECKS or c.name in _LOCK_CHECKS],
                 forced=precheck.forced,
             )
+        # Machine findings stay notes; the lockfile is the only subject that was
+        # named here, so it is the only one allowed to set the exit code.
+        code = _verdict_exit_code(lock_only, None, force=force)
         parts = ["checked this machine, nothing to compare against (no nest given)"]
+        if lock_only.checks:
+            parts.append(f"lockfile check {lock_only.overall}")
         if precheck is not None and precheck.checks:
             parts.append("machine notes above — give me a nest and I can give a verdict")
         summary = "Verdict: " + "; ".join(parts)
         if emitter is not None:
-            emitter.log(summary, stage="S0")
+            emitter.log(summary, stage="S0", level="warning" if code != 0 else "info")
         return DoctorResult(
-            int(ExitCode.OK), local_d, None,
+            code, local_d, None,
             precheck.to_dict() if (precheck is not None and precheck.checks) else None,
             summary, storage=storage,
         )
@@ -2011,7 +2415,12 @@ def doctor(
     fp_verdict: FingerprintVerdict | None = None
     if required:
         fp_verdict = compare_fingerprint(
-            local, required, (manifest.get("base_image") or {}).get("ref") or None)
+            local, required, (manifest.get("base_image") or {}).get("ref") or None,
+            python_obtainable=(
+                _python_obtainable if _python_obtainable is not None
+                else python_is_obtainable((required.get("python") or {}).get("version"))
+            ),
+        )
     elif require_fingerprint:
         summary = (
             "This nest doesn't say what machine it was packed on, and the check was "
@@ -2059,6 +2468,18 @@ def doctor(
         # "we have never seen this card" out in the open
         parts.append(
             f"we haven't tested {coverage['gpu']}, so this verdict errs on the cautious side"
+        )
+    if not force and code in (int(ExitCode.S0_WARNING_UNCONFIRMED),
+                              int(ExitCode.S0_WARNING_OTHER)):
+        # A warning is the most common non-zero verdict and was the only one that
+        # never said what to do about it: the wording reads as advice while the exit
+        # code reads as a refusal, and nothing named the way past. Both warning codes
+        # need this line -- when 61 split into 61/67 on 2026-08-29 the sentence stayed
+        # pinned to 61, so the new code said "different" and never "here is how on".
+        parts.append(
+            "nothing above is a refusal, but the difference is unconfirmed, so this "
+            "ends on a warning instead of an all-clear — pass --force to accept it "
+            "and go ahead"
         )
     if force:
         # Refusing is fine; ignoring in silence is not. Either way the user typed
@@ -2108,7 +2529,8 @@ def print_human(result: DoctorResult, stream=None) -> None:
     if mc and mc.get("checks"):
         print("Machine check (what and why):", file=stream)
         for c in mc["checks"]:
-            mark = {LEVEL_PASS: "✓", LEVEL_WARN: "⚠", LEVEL_REJECT: "✗"}.get(c["level"], "·")
+            mark = {LEVEL_PASS: "✓", LEVEL_UNKNOWN: "?",
+                    LEVEL_WARN: "⚠", LEVEL_REJECT: "✗"}.get(c["level"], "·")
             print(f"  {mark} {c['name']}: {c['reason']}", file=stream)
     _print_storage(result.storage, stream)
     print(result.summary, file=stream)
@@ -2151,17 +2573,34 @@ def storage_setup_hint(path: Path | None = None) -> str:
     Shown only under an **explicit** ``--storage``: users who only ever use the
     hosted side need no bucket of their own, so prompting them to configure one
     in the default output would be pestering.
+
+    When the file is already there the create command is **not** offered:
+    ``install -m 600 /dev/null FILE`` empties an existing file, and that file is
+    also where ``[auth] token`` lives, so the paste would silently sign the user
+    out of their account.
     """
     target = path or user_config_path()
+    if target.exists():
+        step_2 = (
+            f"2. You already have a config file at {target}. Add to it — do not recreate\n"
+            f"   it, because it may already hold your account token. Check that only you\n"
+            f"   can read it:\n"
+            f"     chmod 600 {target}\n"
+            "3. Append this to it, with your own values:\n"
+        )
+    else:
+        step_2 = (
+            f"2. Create the config file so that only you can read it, from the start:\n"
+            f"     mkdir -p {target.parent}\n"
+            f"     install -m 600 /dev/null {target}\n"
+            "3. Put this in it, with your own values:\n"
+        )
     return (
         "No bucket of your own is set up yet.\n"
         "\n"
         "1. In your storage provider's console, make a key that can only read and write\n"
         "   this one bucket. Don't use your main account key.\n"
-        f"2. Create the config file so that only you can read it, from the start:\n"
-        f"     mkdir -p {target.parent}\n"
-        f"     install -m 600 /dev/null {target}\n"
-        "3. Put this in it, with your own values:\n"
+        + step_2 +
         "\n"
         "     [storage]\n"
         '     provider   = "b2"          # b2 | r2 | aws | other\n'
@@ -2281,9 +2720,9 @@ def add_arguments(parser) -> None:
     )
     parser.add_argument(
         "--lock",
-        help="path to the lockfile this nest installs from — lets us check that its "
-        "NVIDIA packages all come from one CUDA release, and that this machine's "
-        "driver is new enough for them",
+        help="path to a lockfile — checks that its NVIDIA packages all come from one "
+        "CUDA release, and that this machine's driver is new enough for them. Works "
+        "with or without a nest",
     )
     parser.add_argument(
         "--skip-net",
@@ -2302,6 +2741,17 @@ def add_arguments(parser) -> None:
 
 
 def run_from_args(args, emitter: EventEmitter) -> int:
+    # --storage answers "is my bucket set up?" and runs none of the other checks,
+    # so anything handed in for those checks would be read and then dropped.
+    if getattr(args, "storage", False) and (args.nest_ref or getattr(args, "lock", None)):
+        dropped = "a nest" if args.nest_ref else "--lock"
+        print(
+            f"✗ --storage checks your bucket and nothing else, so {dropped} would be "
+            f"ignored. Run the two separately: renest doctor --storage, then "
+            f"renest doctor with what you want checked.",
+            file=sys.stderr,
+        )
+        return int(ExitCode.USAGE)
     manifest = None
     if args.nest_ref:
         try:
@@ -2317,6 +2767,17 @@ def run_from_args(args, emitter: EventEmitter) -> int:
             lock_text = Path(args.lock).read_text(encoding="utf-8", errors="replace")
         except OSError as e:
             print(f"✗ Can't read that lockfile: {e}", file=sys.stderr)
+            return int(ExitCode.USAGE)
+        # A file that pins nothing makes every lock check tick with nothing behind
+        # it -- four green lines for a file that is not a lockfile at all.
+        from .syslibs import lock_requirements
+
+        if not lock_requirements(lock_text):
+            print(
+                f"✗ {args.lock} pins no packages, so there is nothing to check in it. "
+                f"Point --lock at the requirements.lock that came with the nest.",
+                file=sys.stderr,
+            )
             return int(ExitCode.USAGE)
     if getattr(args, "storage", False):
         # Read-only check-up of the storage side, kept separate from the machine

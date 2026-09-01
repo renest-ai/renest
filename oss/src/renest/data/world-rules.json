@@ -1,6 +1,7 @@
 {
   "schema": "ai.renest.rules.world",
   "schema_version": "1",
+  "updated": "2026-08-08",
   "issued_at": null,
   "provenance": "Factory baseline. **This file holds what the outside world currently looks like** -- the facts that go stale when something upstream changes. They used to be hard-coded, so correcting a single character required a new release; kept here, one update fixes them. The issue date is stamped by the signing tool, never written by hand: a hand-written date lies the moment someone edits the content and forgets it, which would turn \"speak up when stale\" into speaking falsely.",
   "boundary_note": "**What does not belong in this file**: (1) anything that would relax the safety semantics of a restore (the path-traversal check, the launch-argument allowlist) -- those are format contract, not world knowledge, and letting them be changed remotely hands the gate to the network; (2) licence texts -- those are bytes that travel with a nest and should be content-addressed, not a mutable world file; (3) the escape hatch never reads anything here.",

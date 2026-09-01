@@ -48,7 +48,7 @@
 The table is **shared in full**, but the right to produce a given code is
 layered:
 
-- The blocking and pre-flight codes **60 / 61 / 62 / 63 / 64 / 66 are produced by
+- The blocking and pre-flight codes **60 / 61 / 62 / 63 / 64 / 66 / 67 are produced by
   the agent only** (`renest doctor`, `renest restore`). The escape hatch has no
   graded pre-flight and produces none of them.
 - The escape hatch's S0 does disk arithmetic only, and **the one S0 code it may
@@ -86,7 +86,8 @@ what it means. Retryable means the failure is worth retrying unchanged
 | code | stage | error_class | retryable | producer | meaning |
 |---|---|---|---|---|---|
 | 60 | S0 | UNKNOWN | no | agent | Unclassified pre-flight failure |
-| 61 | S0 | WARNING_UNCONFIRMED | no | agent | The health check warned and the user neither confirmed nor forced |
+| 61 | S0 | WARNING_UNCONFIRMED | no | agent | This machine is short library files the working run used, and the user neither confirmed nor forced. Not a failure: the rebuild finished and every file matched |
+| 67 | S0 | WARNING_OTHER | no | agent | The health check warned about something other than missing libraries (most often: some packages here are a different version than on the packing machine), and the user neither confirmed nor forced. Split out of 61 on 2026-08-29 so one number means one thing |
 | 62 | S0 | PYTHON_BLOCK | no | agent | Python major version blocks the rebuild |
 | 63 | S0 | CUDA_BLOCK | no | agent | CUDA major version blocks the rebuild |
 | 64 | S0 | ARCH_UNSUPPORTED | no | agent | Target GPU generation is outside what this build of PyTorch was compiled for |
@@ -208,7 +209,7 @@ RESTORE_NOTICE stage=S0 class=ARCH_UNSUPPORTED detail="..."
 
 Structure of the `error` field in `renest --json` output and in local job status
 (`type` and `ts` are added by the emitter; the implementation is
-`BagFailure.to_error_object` in `errors.py`):
+`NestFailure.to_error_object` in `errors.py`):
 
 ```json
 {"type":"error","ts":"…","stage":"S3","error_class":"TORCH_CUDA_CONFLICT",

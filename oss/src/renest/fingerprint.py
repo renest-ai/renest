@@ -53,6 +53,8 @@ CRITICAL_PACKAGES: tuple[str, ...] = (
     "numpy",
     "transformers",
     "diffusers",
+    "huggingface-hub",
+    "kornia",
 )
 
 #: Subject-profiling keys the fingerprint must NEVER emit or read.

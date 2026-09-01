@@ -24,7 +24,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable
 
-from .uplink import UPLINK_CONTRACT_VERSION, machine_facts, scrub_event
+from .uplink import USER_AGENT, UPLINK_CONTRACT_VERSION, machine_facts, scrub_event
 
 _FLUSH_AT = 20  # events per batch
 _TIMEOUT_S = 3.0  # per-batch timeout; short, because reporting is a side channel
@@ -73,7 +73,7 @@ def make_report_sink(
         ).encode()
         req = urllib.request.Request(
             endpoint, data=payload, method="POST",
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
         )
         try:
             with urllib.request.urlopen(req, timeout=_TIMEOUT_S):

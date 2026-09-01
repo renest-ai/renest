@@ -214,6 +214,12 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter | None = None)
             file=sys.stderr,
         )
         return int(ExitCode.CONFIG_OR_CREDENTIAL)
+    # Say the key-file exposure warnings here too. `pack`, `export` and `doctor`
+    # all print them; this command was the one that did not -- and it is the most
+    # key-focused of the four, so a user who only ever runs `presign` never heard
+    # that their key file sits in a git repo or a synced folder.
+    for warning in creds.exposure_warnings:
+        print(f"⚠ {warning}", file=sys.stderr)
     # Signing links on a rented machine turns the point of this command inside out.
     # We say so, but we do not block it.
     if creds.on_pod:

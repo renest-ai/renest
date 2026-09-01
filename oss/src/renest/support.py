@@ -58,6 +58,17 @@ _KEYISH_ASSIGN = re.compile(
     r"\b([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)[A-Z0-9_]*)"
     r"(\s*[=:]\s*)(\S+)"
 )
+#: The same names when they are not shouted. Environment variables are upper case, but
+#: config files, JSON dumps and ``~/.aws/credentials`` are not -- and the one key this
+#: CLI is allowed to keep on disk is written ``[storage] secret_key``. All of those
+#: walked straight through the rule above. The credential word has to be a whole
+#: ``_``/``-`` separated part here, so ``tokenizer`` and ``monkey`` keep their values,
+#: and an already-marked value is skipped so nothing gets marked twice.
+_KEYISH_ASSIGN_ANYCASE = re.compile(
+    r"\b((?:[a-z0-9]+[_-])*(?:key|token|secret|password|passwd|credential)"
+    r"(?:[_-][a-z0-9]+)*)(\s*[\"']?\s*[=:]\s*[\"']?)(?!\[removed)([^\s\"',}]+)",
+    re.IGNORECASE,
+)
 
 
 def redact(text: str, *, home: str | None = None) -> str:
@@ -73,6 +84,7 @@ def redact(text: str, *, home: str | None = None) -> str:
     out = _SIG_PARAMS.sub(r"\1[removed: a signed-link signature]", out)
     out = _BEARER.sub(r"\1[removed: a token]", out)
     out = _KEYISH_ASSIGN.sub(r"\1\2[removed: looks like a credential]", out)
+    out = _KEYISH_ASSIGN_ANYCASE.sub(r"\1\2[removed: looks like a credential]", out)
     if home is None:
         home = str(Path.home())
     if home and home not in ("/", ""):

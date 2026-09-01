@@ -120,13 +120,19 @@ class BlobSpec:
 
     @classmethod
     def from_manifest_file(cls, entry: dict) -> BlobSpec:
+        """One ``files[]`` entry -> the blob to fetch and where from.
+
+        ``sources`` sits beside ``blob``, not inside it. Read from inside, this
+        returned a chain of length zero for every manifest that validates — the
+        entry forbids unknown keys, so ``blob.sources`` cannot legally exist.
+        """
         blob = entry["blob"]
         return cls(
             sha256=blob["sha256"],
             size_bytes=int(blob["size_bytes"]),
             sources=[
                 Source(url=s["url"], kind=s["kind"], note=s.get("note", ""))
-                for s in blob.get("sources", [])
+                for s in (entry.get("sources") or [])
             ],
         )
 
@@ -154,7 +160,7 @@ class ResolveReport:
     sha256: str
     winner_host: str
     winner_kind: str
-    mode: str  # range8 / single
+    mode: str  # range<N> (N = RANGE_WORKERS, so "range8" by default) / single
     transfer_seconds: float
     verify_seconds: float
     mbps: float
@@ -196,6 +202,19 @@ def classify_source_failures(attribution: list[dict]) -> tuple[str, str]:
     if not attribution:
         return "NETWORK_INTERRUPTED", "every source failed"
 
+    # A source of an unsupported kind was never contacted, so it says nothing about
+    # the network. It used to count as one: carrying no status, it read as "the
+    # connection never happened", and a single magnet link next to a plain 404 was
+    # enough to turn the whole verdict retryable.
+    attempted = [a for a in attribution if a.get("kind") not in UNSUPPORTED_KINDS]
+    if not attempted:
+        return (
+            "UNKNOWN",
+            "none of the addresses listed for this file are ones this tool can fetch — "
+            "they need a peer-to-peer client, which this tool does not have. Retrying "
+            "will not help; ask whoever packed it for a plain download address",
+        )
+
     def status_of(entry: dict) -> int | None:
         status = entry.get("status")
         if isinstance(status, int):
@@ -209,7 +228,7 @@ def classify_source_failures(attribution: list[dict]) -> tuple[str, str]:
                 return int(digits)
         return None
 
-    statuses = [status_of(a) for a in attribution]
+    statuses = [status_of(a) for a in attempted]
     # Transient = the connection never happened (no status code at all) / an
     # explicit retry signal / any 5xx. One of them is enough to conservatively
     # call the whole run retryable.
@@ -304,11 +323,27 @@ class _Progress:
         )
 
 
-def _download_single(client: httpx.Client, src: Source, dest: Path, prog: _Progress) -> None:
+def _download_single(
+    client: httpx.Client, src: Source, dest: Path, prog: _Progress, limit: int
+) -> None:
+    """Stream one source into ``dest``, stopping the moment it sends more than the
+    manifest says this blob holds.
+
+    Without the stop, a source that streams without end (a misrouted proxy, a log
+    file where a model should be) fills the disk and is only judged afterwards, by
+    which time the rebuild has no room left to carry on.
+    """
     with client.stream("GET", src.url, timeout=DOWNLOAD_TIMEOUT_S) as r:
         r.raise_for_status()
+        landed = 0
         with dest.open("wb") as f:
             for chunk in r.iter_bytes(chunk_size=1 << 20):
+                landed += len(chunk)
+                if landed > limit:
+                    raise ValueError(
+                        f"Source kept sending past {limit} bytes, the size this nest "
+                        f"records for the file — these are not the bytes we asked for"
+                    )
                 f.write(chunk)
                 prog.add(len(chunk))
 
@@ -422,12 +457,19 @@ def resolve(
                 emitter, stage=stage, total=blob.size_bytes, host=src.host, started=started
             )
             try:
-                if p.ranges_ok and p.size and p.size >= SINGLE_STREAM_MAX:
-                    mode = "range8"
-                    _download_range8(client, src, dest, p.size, prog)
+                # The manifest, never the source, says how big this blob is. A source
+                # claiming a different size is already serving something else, so it
+                # gets the single stream, which stops at the declared size instead of
+                # writing out whatever length that source asked us to reserve.
+                if p.ranges_ok and p.size == blob.size_bytes and p.size >= SINGLE_STREAM_MAX:
+                    # Name the real segment count, not a fixed "range8": a
+                    # concurrency comparison changes RANGE_WORKERS, and a label
+                    # that never moves makes every run of the sweep look alike.
+                    mode = f"range{RANGE_WORKERS}"
+                    _download_range8(client, src, dest, blob.size_bytes, prog)
                 else:
                     mode = "single"
-                    _download_single(client, src, dest, prog)
+                    _download_single(client, src, dest, prog, blob.size_bytes)
                 t_xfer = time.monotonic() - started
 
                 landed = dest.stat().st_size

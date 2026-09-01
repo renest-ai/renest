@@ -25,6 +25,7 @@ from pathlib import Path
 __all__ = [
     "DOCTOR_RULES",
     "FINGERPRINT_MATRIX",
+    "KNOWN_COMPONENTS",
     "SOURCE_PLAYBOOK",
     "TRUSTED_HOSTS",
     "active_copy",
@@ -34,6 +35,10 @@ __all__ = [
 
 DOCTOR_RULES = "doctor-rules.json"
 FINGERPRINT_MATRIX = "fingerprint-matrix.json"
+#: Shared parts (a text encoder, a VAE) traced back to the repository that publishes
+#: them, so that a stranger's re-upload does not get to answer for their licence. Data,
+#: not code, so a file judged wrongly can be corrected for everyone without a release.
+KNOWN_COMPONENTS = "known-components.json"
 SOURCE_PLAYBOOK = "source-playbook.json"
 TRUSTED_HOSTS = "trusted-hosts.json"
 #: Facts that go stale when upstream moves (package index addresses, image
@@ -47,6 +52,7 @@ _DATA_DIR = Path(__file__).resolve().parent / "data"
 _REGISTRY: dict[str, tuple[str, str]] = {
     DOCTOR_RULES: ("ai.renest.rules.doctor", "1"),
     FINGERPRINT_MATRIX: ("ai.renest.rules.fingerprint", "1"),
+    KNOWN_COMPONENTS: ("ai.renest.rules.known-components", "1"),
     SOURCE_PLAYBOOK: ("ai.renest.rules.sources", "1"),
     TRUSTED_HOSTS: ("ai.renest.rules.trusted-hosts", "1"),
     WORLD_RULES: ("ai.renest.rules.world", "1"),
@@ -106,6 +112,16 @@ def _validate(name: str, data: dict) -> str | None:
                     and isinstance(r.get("replace_host"), str)
                     and isinstance(r.get("regions"), list)):
                 return "a host_rewrites entry is missing match_host/replace_host/regions"
+    elif name == KNOWN_COMPONENTS:
+        entries = data.get("components")
+        if not isinstance(entries, list):
+            return "components is missing"
+        for e in entries:
+            if not isinstance(e, dict):
+                return "a components entry is not an object"
+            for key in ("sha256", "origin_url", "spdx"):
+                if not (isinstance(e.get(key), str) and e[key].strip()):
+                    return f"a components entry is missing {key}"
     elif name == TRUSTED_HOSTS:
         hosts = data.get("hosts")
         if not (isinstance(hosts, list) and hosts and all(isinstance(x, str) and x for x in hosts)):
