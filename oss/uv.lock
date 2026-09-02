@@ -692,7 +692,7 @@ wheels = [
 
 [[package]]
 name = "renest"
-version = "0.1.8"
+version = "0.1.10"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -715,9 +715,9 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cryptography", specifier = ">=42" },
+    { name = "cryptography", specifier = ">=41.0.7" },
     { name = "httpx", specifier = ">=0.27" },
-    { name = "jsonschema", specifier = ">=4.21" },
+    { name = "jsonschema", specifier = ">=4.10.3" },
     { name = "platformdirs", specifier = ">=4.10.0" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "uv", specifier = ">=0.4" },

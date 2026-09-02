@@ -1844,11 +1844,14 @@ def _build_manifest(
             n_pkgs = len(frozen.splitlines()) - LOCK_FROM_INSTALLED_HEADER.count("\n")
             series = interpreter_python_series(env_dir_of(sp))
             warnings.append(
-                f"This environment has no lock file and its Python could not be run here, so "
-                f"the dependency list was worked out from the {n_pkgs} packages installed in "
-                f"{sp.name}, by reading their own metadata. Versions are what is installed; "
-                f"package hashes and original index URLs were not recorded, and anything "
-                f"installed from a source folder cannot be expressed this way and is missing."
+                f"This environment has no lock file and its Python was not found, or could "
+                f"not be run here, so the dependency list was worked out from the {n_pkgs} "
+                f"packages installed in {sp.name}, by reading their own metadata. Versions "
+                f"are what is installed; package hashes and original index URLs were not "
+                f"recorded, and anything installed from a source folder cannot be expressed "
+                f"this way and is missing. **If that interpreter does run on this machine, "
+                f"point --env-python at it and pack again** -- asking it directly carries "
+                f"everything this route drops."
                 + (f" That Python is {series}.x — the exact third number isn't written "
                    f"anywhere in this layout, so the version field is left empty rather "
                    f"than half-filled." if series else "")

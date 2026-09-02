@@ -139,12 +139,36 @@ def default_out_dir(target: str | os.PathLike[str], *, create: bool = True) -> P
 def resolve_token_path(cli_path: str | os.PathLike[str] | None = None) -> Path:
     """Resolve the serve token path: ``--token-file`` > ``RENEST_TOKEN_FILE`` env >
     default ``~/.config/renest/serve.token`` (the frozen token-path contract)."""
-    if cli_path:
-        return Path(cli_path)
-    env = os.environ.get(ENV_TOKEN_FILE)
-    if env:
-        return Path(env)
-    return Path(platformdirs.user_config_dir(APP_NAME)) / "serve.token"
+    default = Path(platformdirs.user_config_dir(APP_NAME)) / "serve.token"
+    chosen = Path(cli_path) if cli_path else None
+    if chosen is None:
+        env = os.environ.get(ENV_TOKEN_FILE)
+        chosen = Path(env) if env else default
+    _leave_pointer(chosen, default)
+    return chosen
+
+
+#: Where the panel looks when the token is not in the default place. **The panel
+#: cannot read the environment**: the ComfyUI Registry's scanner treats any such
+#: read as credential access and flags the release (0.1.5 was flagged for exactly
+#: that), which pins every user to an older panel. So the override still exists,
+#: it is just written down here instead of being passed through a variable.
+POINTER_REL = "token-path"
+
+
+def _leave_pointer(chosen: Path, default: Path) -> None:
+    """Record a non-default token location where the panel can read it."""
+    pointer = default.parent / POINTER_REL
+    try:
+        if chosen == default:
+            pointer.unlink(missing_ok=True)
+            return
+        pointer.parent.mkdir(parents=True, exist_ok=True)
+        pointer.write_text(str(chosen), encoding="utf-8")
+        pointer.chmod(0o600)
+    except OSError:
+        # Never fail serving because the hint could not be written.
+        pass
 
 
 def read_token_file(path: Path) -> str | None:

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "renest"
-version = "0.1.8"
+version = "0.1.10"
 readme = "README.md"
 description = "Renest agent CLI: pack a working GPU setup — an image workflow or a fine-tuning run — into an open-format nest and restore it byte-identical anywhere."
 requires-python = ">=3.11"
@@ -20,10 +20,26 @@ license = "LicenseRef-Renest-Source-Available"
 # puts it in the wheel's dist-info (test: tests/consistency/test_directional_isolation.py).
 license-files = ["LICENSE-CLI", "NOTICE"]
 dependencies = [
+    # Every floor below is the **lowest version measured to work**, not whatever was
+    # current when the line was written. A floor above what an environment already has
+    # forces an upgrade there, and `pip install renest` often lands in the very
+    # environment being captured. **No upper bounds, ever** -- an upper bound gives us
+    # the power to downgrade somebody's working environment, and a downgrade breaks
+    # things that were fine. Guarded by test_dependency_floors_are_justified.
     "platformdirs>=4.10.0",
     "httpx>=0.27",
-    "jsonschema>=4.21",
-    "cryptography>=42",
+    # Only `Draft202012Validator`. Measured 2026-09-02 against this repo's own
+    # manifest schema: builds and rejects bad data on 4.10.3 (the version a real
+    # ComfyUI machine had), 4.4.0 and 4.0.0. Floor set at the measured version that
+    # a real environment actually carries; lower buys nothing observed.
+    "jsonschema>=4.10.3",
+    # Only ed25519 signature verification (`Ed25519PublicKey.verify`), for the rules
+    # package. Measured 2026-09-02: verifies a good signature and rejects a tampered
+    # one on 41.0.7, 39.0.2 and 36.0.2. Was `>=42`, which forced an upgrade on a real
+    # ComfyUI machine sitting at 41.0.7. **Not lowered further on purpose**: this is a
+    # security library, no measured environment sits below 41, and each step down is
+    # surface for no observed gain.
+    "cryptography>=41.0.7",
     # Needed to read a fine-tuning framework's training YAML (the whole recipe
     # lives in that one file), and to read the extra model paths file on the
     # image-generation side. Found on real hardware 2026-07-26: it used to be a

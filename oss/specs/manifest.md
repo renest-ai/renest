@@ -545,8 +545,24 @@ fail or fabricate. From 2.3, in order:
 |---|---|---|
 | ① | A lockfile exists | Archive it as-is |
 | ② | No lockfile, but **the interpreter that runs this environment can be found and can be run here** | **Ask it for the installed package list** (reading a fact, not guessing); archive that and state the source in the report |
-| ③ | The interpreter is there but **cannot be run on this machine** (an all-in-one bundle built for another operating system) | **Read the installed packages' own metadata off disk**; archive that, and state in the report both where it came from and what it cannot carry -- no package hashes, no original index URLs, and anything installed from a source folder cannot be expressed this way at all |
+| ③ | The interpreter was **not found, or cannot be run on this machine** (an all-in-one bundle built for another operating system) | **Read the installed packages' own metadata off disk**; archive that, and state in the report both where it came from and what it cannot carry -- no package hashes, no original index URLs, and anything installed from a source folder cannot be expressed this way at all |
 | ④ | Not even that | **Leave the field empty and warn.** Do not invent |
+
+**② and ③ both leave one line out: the tool that packed this** `[2.9]`. A user whose
+shell has the environment active types `pip install renest` — their instinct is "back up
+this ComfyUI", not "give the tool its own home" — so the tool lands *inside the very
+environment being packed*. Measured on a real ComfyUI environment: without this, the
+lock carried `renest==0.1.8`. **A nest describes the environment that ran the workflow,
+not that environment plus us.**
+
+**Only the line naming the tool itself. Everything it pulled in stays.** `pyyaml` and
+`cryptography` are used by the app too, and a package list alone cannot tell "only here
+because of the tool" from "the app needs it". Dropping one the app needed leaves a nest
+that rebuilds and then cannot run — worse than carrying an extra line.
+
+**① is unaffected**: that tier archives the user's own lockfile as-is, and we do not
+edit a user's file. So **which tier a lock came from decides whether the tool appears in
+it** — stated here so nobody comparing two nests reads the difference as a fault.
 
 Cases ② and ③ both produce a list rather than a file that ever sat on disk, so
 both leave `lockfile_path` out rather than name a path that never existed.

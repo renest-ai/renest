@@ -31,6 +31,7 @@ __all__ = [
     "find_env_python",
     "find_launchers",
     "find_site_packages",
+    "drop_ourselves",
     "freeze_environment",
     "freeze_from_installed",
     "installed_dist_infos",
@@ -67,7 +68,10 @@ def canonical_name(name: str) -> str:
 #: glance where this list came from.
 LOCK_FROM_ENV_HEADER = (
     "# Read from the Python environment that ran this workflow — there was no lock\n"
-    "# file to pack. Versions are pinned exactly as they were installed; package\n"
+    "# file to pack. Versions are pinned exactly as they were installed, with one\n"
+    "# line left out: the tool that made this nest. A nest describes the environment\n"
+    "# that ran the workflow, not that environment plus us; packages it pulled in are\n"
+    "# kept, because the app may need them too. Other than that, package\n"
     "# hashes and original index URLs were not recorded, so a restore installs these\n"
     "# versions from the public index.\n"
 )
@@ -176,12 +180,20 @@ def find_env_python(candidates: list[Path]) -> Path | None:
 
 def venv_python_candidates(*roots: Path) -> list[Path]:
     """The usual virtualenv locations: the standard install puts ``.venv`` at the
-    environment root, while the desktop build puts it under the data dir."""
+    environment root, while the desktop build puts it under the data dir.
+
+    ``venv/Scripts/python.exe`` was missing until 2026-09-02: ``.venv`` was listed for
+    both operating systems, ``venv`` only for POSIX. A Windows environment built with
+    the second name therefore fell to the metadata-reading tier even though its
+    interpreter sits right there and runs -- and that tier drops the origin of anything
+    installed from a source folder.
+    """
     out: list[Path] = []
     for r in roots:
         if r is None:
             continue
-        for rel in (".venv/bin/python", ".venv/Scripts/python.exe", "venv/bin/python"):
+        for rel in (".venv/bin/python", ".venv/Scripts/python.exe",
+                    "venv/bin/python", "venv/Scripts/python.exe"):
             out.append(r / rel)
     return out
 
@@ -226,6 +238,29 @@ def _pip_freeze(python_exe: str | Path) -> str | None:
     return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else None
 
 
+#: Our own distribution name. ``pip install renest`` with a shell that has the
+#: environment active lands us *inside the very environment being captured* —
+#: measured 2026-09-02 on a real one, we came out in its lock as ``renest==0.1.8``.
+#: A nest describes the environment that ran the workflow, not that plus us.
+
+#: **Only the line naming us**: the packages we pulled in stay. ``pyyaml`` and
+#: ``cryptography`` are used by the app too, and a freeze cannot tell "only here
+#: because of us" from "the app needs it" — dropping one it needed gives a nest
+#: that rebuilds and then cannot run, worse than carrying an extra line.
+_OUR_DIST = "renest"
+
+
+def drop_ourselves(body: str) -> str:
+    """Take the line that names *this tool* out of a freeze. Everything else stays."""
+    keep = []
+    for line in body.splitlines():
+        head = re.split(r"[=<>!~\[ @]", line.strip(), maxsplit=1)[0]
+        if head.replace("_", "-").lower() == _OUR_DIST:
+            continue
+        keep.append(line)
+    return "\n".join(keep)
+
+
 def freeze_environment(python_exe: str | Path) -> str | None:
     """Ask the interpreter which packages it has and at which versions. Returns
     ``None`` when it cannot be read — we report that honestly rather than invent a
@@ -243,10 +278,10 @@ def freeze_environment(python_exe: str | Path) -> str | None:
     """
     body = _uv_freeze(python_exe)
     if body:
-        return LOCK_FROM_ENV_HEADER + body + "\n"
+        return LOCK_FROM_ENV_HEADER + drop_ourselves(body) + "\n"
     body = _pip_freeze(python_exe)
     if body:
-        return LOCK_FROM_ENV_HEADER + body + "\n"
+        return LOCK_FROM_ENV_HEADER + drop_ourselves(body) + "\n"
     try:
         out = subprocess.run(
             [str(python_exe), "-c", _FREEZE_SNIPPET],
@@ -259,7 +294,7 @@ def freeze_environment(python_exe: str | Path) -> str | None:
     body = out.stdout.strip()
     if not body:
         return None
-    return LOCK_FROM_ENV_HEADER + body + "\n"
+    return LOCK_FROM_ENV_HEADER + drop_ourselves(body) + "\n"
 
 
 # -------------------------------------------------- reading it without running it --
@@ -273,8 +308,10 @@ def freeze_environment(python_exe: str | Path) -> str | None:
 LOCK_FROM_INSTALLED_HEADER = (
     "# Worked out from the packages installed in this environment, by reading their\n"
     "# own metadata files — there was no lock file, and this environment's Python\n"
-    "# could not be run on the packing machine. Versions are what is installed;\n"
-    "# package hashes and original index URLs were not recorded. Packages installed\n"
+    "# could not be found, or could not be run here. Versions are what is installed,\n"
+    "# with one line left out: the tool that made this nest (packages it pulled in\n"
+    "# are kept, because the app may need them too).\n"
+    "# Package hashes and original index URLs were not recorded. Packages installed\n"
     "# from a source folder cannot be expressed this way and are missing here.\n"
 )
 
@@ -359,7 +396,7 @@ def freeze_from_installed(site_packages: Path) -> str | None:
     if not found:
         return None
     body = "\n".join(f"{n}=={v}" for n, v in sorted(found.items(), key=lambda kv: kv[0].lower()))
-    return LOCK_FROM_INSTALLED_HEADER + body + "\n"
+    return LOCK_FROM_INSTALLED_HEADER + drop_ourselves(body) + "\n"
 
 
 #: Start scripts a shared bundle puts beside the application. Only the top two levels
@@ -382,6 +419,10 @@ def find_launchers(env_root: Path) -> list[Path]:
            and p.stat().st_size <= _LAUNCHER_MAX_BYTES]
     return out
 
+
+#: A launcher that calls the interpreter straight, no variable in between:
+#: ``.\python_embeded\python.exe -s main.py``, ``"%~dp0venv/bin/python" main.py``.
+_DIRECT_CALL = re.compile(r'["\']?((?:[^\s"\';|&]*[\\/])?python(?:\d[\d.]*)?(?:\.exe)?)["\']?(?=\s|$)')
 
 def launcher_interpreter_dir(script: Path) -> Path | None:
     """The interpreter folder a start script points at, if it names one that exists.
@@ -408,6 +449,19 @@ def launcher_interpreter_dir(script: Path) -> Path | None:
         if resolved is None:
             continue
         cand = resolved if resolved.is_dir() else resolved.parent
+        if interpreter_kernel(cand):
+            return cand
+    # Launchers that call the interpreter straight, with no variable in between --
+    # ``.\python_embeded\python.exe -s main.py`` is the common shape, and reading only
+    # assignments missed it entirely (measured 2026-09-02 with this repo's own code:
+    # the assignment form resolved, the direct call returned None). Wrong guesses cost
+    # nothing here: a candidate is only accepted when the folder really does hold an
+    # interpreter, same check as above.
+    for m in _DIRECT_CALL.finditer(text):
+        resolved = _expand(m.group(1), values, here)
+        if resolved is None:
+            continue
+        cand = resolved.parent if resolved.suffix or not resolved.is_dir() else resolved
         if interpreter_kernel(cand):
             return cand
     return None
