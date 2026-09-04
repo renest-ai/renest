@@ -1264,6 +1264,14 @@ class RestoreReport:
     ok: bool = False
     nest_id: str = ""
     exit_code: int = int(ExitCode.OK)
+    #: Set when the rebuild succeeded (exit_code stays OK) but this machine is not identical
+    #: to the one the nest was packed on. The warning goes here, **never into the exit code**
+    #: -- a success that returns non-zero gets read as a failure by every script, CI and user
+    #: that follows the Unix convention. Values: "" = no warning; "missing_libs" = missing a
+    #: system library the packed run actually loaded; "other" = any other health-check warning
+    #: (package versions differ, slow link -- near-universal and usually harmless on a rented
+    #: machine). Read this field, not the exit code, to tell whether the environment is complete.
+    environment_warning: str = ""
     stages: list[StageResult] = field(default_factory=list)
     failure: dict | None = None  # error object (no type/ts)
     precheck: dict | None = None
@@ -1316,6 +1324,7 @@ class RestoreReport:
             "ok": self.ok,
             "nest_id": self.nest_id,
             "exit_code": self.exit_code,
+            "environment_warning": self.environment_warning,
             "stages": [asdict(s) for s in self.stages],
             "failure": self.failure,
             "precheck": self.precheck,
@@ -3852,19 +3861,27 @@ def restore(
         (report.fingerprint_verdict or {}).get("level") == LEVEL_WARNING
     )
     if failure is None and (short_libs or (_warned and not opts.force)):
-        # **Say it in the exit code too, not only in words.** Measured 2026-08-19 on a
-        # machine short of libGL.so.1: this tool named the library, printed the fix --
-        # and returned 0, so any script reading the exit code filed it as a clean success.
-        # 61 is **not** "failed": the rebuild finished and every file is fine. It means
-        # *finished, but this machine is missing something and we could not confirm it
-        # does not matter.* Still a warning, never a refusal (2026-07-15 ruling: this leg
-        # informs, it does not block) -- the work ran to the end, nothing was withheld.
-        #
-
-        # 61 is only the short-libraries case; any other warning answers 67 (narrowed
-        # back 2026-08-29). `doctor` keys off the same field, so both legs agree.
-        report.exit_code = int(ExitCode.S0_WARNING_UNCONFIRMED if short_libs
-                               else ExitCode.S0_WARNING_OTHER)
+        # The rebuild finished and every file is fine -- this is a **success**, so the
+        # exit code stays 0 (set above). The machine just is not identical to the one this
+        # was packed on, so we say so **in words and in a report field**, never in the
+        # exit code: a success that returns non-zero gets read as a failure by every
+        # script, CI and user that follows the Unix convention -- a warning belongs in the
+        # output, not on the success/failure switch. This leg informs, it never refuses:
+        # the work ran to the end, nothing was withheld. `renest doctor` still returns
+        # non-zero for the same warning on purpose -- doctor is a diagnostic ("is this
+        # machine OK?"), restore is an action ("did the rebuild succeed?"); they answer
+        # different questions.
+        report.environment_warning = "missing_libs" if short_libs else "other"
+        narrate(
+            "Rebuilt successfully, but this machine isn't identical to the one this nest "
+            "was packed on"
+            + (" (it's missing a system library the packed run used)" if short_libs
+               else " (some versions differ — normal on a rented machine)")
+            + " — the files are all correct; a render here may differ slightly from the "
+            "original. This is a success, not a failure.",
+            stage="S5",
+            level="warning",
+        )
 
     with contextlib.suppress(OSError):
         evidence.mkdir(parents=True, exist_ok=True)
