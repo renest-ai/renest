@@ -248,6 +248,13 @@ def _capture_kohya(rec: dict, root: Path, hub_root: Path, hf_home: Path) -> tupl
     # Declaring them in redactions is not enough on its own: the folder holding the config
     # is archived whole further down, and it is usually the folder holding these too.
     user_data: list[str] = []
+    # A relative path on the command line resolves against the directory the run
+    # started in — `entrypoint.cwd` in the record — not against the directory pack
+    # happens to run from. Resolving against the pack process's own cwd silently
+    # dropped a base model that a real run named relative to its cwd: pack still
+    # reported success while the nest was missing the file. Anchor every argv path
+    # here (fall back to the environment root when the record has no cwd).
+    cwd_anchor = Path(str(rec["cwd"])).resolve() if rec.get("cwd") else root
     # ---- The user's images: kohya's other form names them on the command line ----
     # `--dataset_config` hides them in a TOML and each key there gets a redaction. The plain
     # `--train_data_dir` form got none, so a rebuild ran against a folder that is not there
@@ -256,7 +263,7 @@ def _capture_kohya(rec: dict, root: Path, hub_root: Path, hf_home: Path) -> tupl
         val, idx = _flag_at(argv, flag)
         if val is None or idx is None:
             continue
-        user_data.append(str(_abs_from(val, root)))
+        user_data.append(str(_abs_from(val, cwd_anchor)))
         redactions.append({
             "locator": {"argv_index": idx},
             "role": "dataset",
@@ -272,7 +279,7 @@ def _capture_kohya(rec: dict, root: Path, hub_root: Path, hf_home: Path) -> tupl
         if val is None or idx is None:
             continue
         if flag != "--output_name":
-            user_data.append(str(_abs_from(val, root)))
+            user_data.append(str(_abs_from(val, cwd_anchor)))
         redactions.append({
             "locator": {"argv_index": idx},
             "role": role,
@@ -284,7 +291,7 @@ def _capture_kohya(rec: dict, root: Path, hub_root: Path, hf_home: Path) -> tupl
     # ---- Base model: both homes occur in practice, so pick the root by where it lives ----
     base_model = _flag(argv, "--pretrained_model_name_or_path")
     if base_model:
-        bp = Path(base_model)
+        bp = _abs_from(base_model, cwd_anchor)
         rel = _rel_to(bp, root)
         hub_rel = _rel_to(bp, hub_root)
         if rel:
@@ -317,7 +324,8 @@ def _capture_kohya(rec: dict, root: Path, hub_root: Path, hf_home: Path) -> tupl
     # ---- Dataset config: the file itself is packed, the dataset it **points at** is not ----
     ds_cfg = _flag(argv, "--dataset_config")
     if ds_cfg:
-        rel = _rel_to(Path(ds_cfg), root)
+        ds_path = _abs_from(ds_cfg, cwd_anchor)
+        rel = _rel_to(ds_path, root)
         if rel:
             config_files.append(rel)
             files.append({
@@ -325,8 +333,8 @@ def _capture_kohya(rec: dict, root: Path, hub_root: Path, hf_home: Path) -> tupl
                 "license": {"shareable": True, "serving_scope": "private", "tag": "permissive",
                             "note": "Your training recipe — treated as yours."},
             })
-            for key, value in _toml_image_dirs(Path(ds_cfg)):
-                user_data.append(str(_abs_from(value, Path(ds_cfg).parent)))
+            for key, value in _toml_image_dirs(ds_path):
+                user_data.append(str(_abs_from(value, ds_path.parent)))
                 redactions.append({
                     "locator": {"file": rel, "key": key},
                     "role": "dataset",
@@ -354,7 +362,7 @@ def _capture_kohya(rec: dict, root: Path, hub_root: Path, hf_home: Path) -> tupl
     expect = None
     out_dir, out_name = _flag(argv, "--output_dir"), _flag(argv, "--output_name")
     if out_dir and out_name:
-        rel_out = _rel_to(Path(out_dir), root)
+        rel_out = _rel_to(_abs_from(out_dir, cwd_anchor), root)
         if rel_out:
             ext = (_flag(argv, "--save_model_as") or "safetensors").lstrip(".")
             expect = f"{rel_out}/{out_name}.{ext}"
@@ -422,6 +430,15 @@ def _capture_llamafactory(rec: dict, root: Path, hub_root: Path, hf_home: Path) 
     redactions: list[dict] = []
     config_files: list[str] = []
     user_data: list[str] = []   # never archived — see _keep_user_data_out
+    # A relative path on the command line resolves against the directory the run
+    # started in — `entrypoint.cwd` in the record — not against the directory pack
+    # happens to run from (same #9 fault the kohya side had). LLaMA-Factory keeps
+    # its whole recipe in one YAML named on argv, so resolving that name against the
+    # pack process's own cwd made the config land "outside the folder being packed"
+    # and dropped it from files[] without a word — the rebuild then had no recipe at
+    # all. Anchor the argv path here (fall back to the environment root when the
+    # record has no cwd).
+    cwd_anchor = Path(str(rec["cwd"])).resolve() if rec.get("cwd") else root
 
     # The whole recipe is in that YAML file (argv is minimal here)
     yaml_arg = next((a for a in argv[1:] if a.endswith((".yaml", ".yml"))), None)
@@ -432,7 +449,7 @@ def _capture_llamafactory(rec: dict, root: Path, hub_root: Path, hf_home: Path) 
         )
         return {"files": files, "redactions": redactions, "config_files": config_files}, {"gaps": gaps}
 
-    ypath = Path(yaml_arg)
+    ypath = _abs_from(yaml_arg, cwd_anchor)
     # **Its own name, never reused below.** The redaction locators point at *this* file, and
     # a shared `rel` got overwritten by the base-model branch — sending whoever rebuilds to
     # edit `output_dir` inside a model directory that has no such key.

@@ -58,6 +58,9 @@ __all__ = [
     "check_driver",
     "check_cpu_flags",
     "check_egress",
+    "check_proxy",
+    "proxy_env_present",
+    "index_reachable",
     "check_lock_cuda_family",
     "lock_cuda_tags",
     "check_torch_runtime_cuda",
@@ -117,7 +120,7 @@ REQUIRED_CPU_FLAGS: tuple[str, ...] = ("avx2",)
 #: That is this repository's most expensive class of bug (2026-08-08, five in one
 #: day): **"I don't recognise this, so it must be broken."** Without a nest these
 #: are notes, never a verdict -- unfit *for what*, when nothing was named?
-_NEST_FREE_CHECKS: frozenset[str] = frozenset({"cpu_flags", "local_disk", "ram", "egress"})
+_NEST_FREE_CHECKS: frozenset[str] = frozenset({"cpu_flags", "local_disk", "ram", "egress", "proxy"})
 
 #: The ``--lock`` checks. They read the lockfile the caller named plus this
 #: machine's driver and need nothing from a nest, so unlike the checks above
@@ -183,6 +186,24 @@ EGRESS_PROBE_BYTES = 32 * 1024 * 1024
 EGRESS_PROBE_URL = (
     "https://github.com/peak/s5cmd/releases/download/v2.2.2/s5cmd_2.2.2_Linux-64bit.tar.gz"
 )
+
+#: The proxy variables uv and curl actually read. uv goes through reqwest, which
+#: honours the standard trio (upper and lower case) and, crucially, does NOT read
+#: the operating system's own proxy setting (macOS System Settings / Windows
+#: Internet Options). That is the trap behind the field report: the browser works
+#: because the OS proxy carries it, the user never thinks to export anything, and
+#: ``uv tool install`` / the install-script ``curl`` then hang with no timeout and
+#: no word. Measured 2026-09-05: with these pointed at an unreachable proxy, uv
+#: retries past 30 s before it errors; curl returns nothing. Same variables for
+#: both tools, so probing with curl answers the question uv would answer.
+PROXY_ENV_VARS: tuple[str, ...] = (
+    "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
+)
+
+#: A cheap "can I reach the Python package index" target: the JSON metadata for a
+#: package that always exists. A few KB, and a plain GET so any HTTP answer counts
+#: as "the network works", while a dead proxy yields no answer at all.
+PYPI_REACH_URL = "https://pypi.org/pypi/uv/json"
 
 #: Which CUDA release to assume when the dependency list carries no CUDA tag.
 #: **Assuming the oldest one is the conservative choice** — it demands the
@@ -1125,14 +1146,16 @@ def check_ram(total_bytes: int, nest_bytes: int) -> CheckResult:
         reading)
 
 
-def collect_total_ram() -> int:
-    """This machine's system memory in bytes. Returns 0 when unreadable — **no
-    guessing**.
+def _read_memory_ceiling() -> tuple[int, str] | None:
+    """``(bytes, source)`` for how much system memory this environment may use,
+    or ``None`` when it cannot be read — **no guessing**.
+
+    ``source`` is ``"cgroup"`` (a container memory cap — what this container can
+    actually use) or ``"meminfo"`` (the machine's physical total, no cap seen).
 
     Inside a container, ``/proc/meminfo`` reports the **host's** memory while
     the container itself may be capped far lower. So read the cgroup limit first
-    (that is what this container can actually use) and only fall back to
-    meminfo.
+    and only fall back to meminfo.
     """
     for p in ("/sys/fs/cgroup/memory.max",                    # cgroup v2
               "/sys/fs/cgroup/memory/memory.limit_in_bytes"):  # cgroup v1
@@ -1145,14 +1168,98 @@ def collect_total_ram() -> int:
             # cgroup v1 fills in an astronomical number to mean "no limit";
             # don't read that as the machine really having that much memory
             if 0 < v < (1 << 50):
-                return v
+                return v, "cgroup"
     try:
         for line in Path("/proc/meminfo").read_text().splitlines():
             if line.startswith("MemTotal:"):
-                return int(line.split()[1]) * 1024
+                return int(line.split()[1]) * 1024, "meminfo"
     except (OSError, ValueError, IndexError):
         pass
-    return 0
+    return None
+
+
+def collect_total_ram() -> int:
+    """This machine's system memory in bytes. Returns 0 when unreadable — **no
+    guessing**. See :func:`_read_memory_ceiling` for how the number is found.
+    """
+    got = _read_memory_ceiling()
+    return got[0] if got else 0
+
+
+def collect_system_memory() -> dict | None:
+    """The packing environment's system-memory ceiling, shaped for the manifest's
+    ``runtime.system_memory`` block (format 2.10), or ``None`` when it cannot be
+    read (not Linux, or a container that will not report it).
+
+    The same read as :func:`collect_total_ram`, kept beside it on purpose so the
+    figure written into a nest and the figure a rebuild measures come from one
+    code path. **Absent means not measured — never that the run needs little.**
+    """
+    got = _read_memory_ceiling()
+    if not got:
+        return None
+    ceiling, source = got
+    return {"ceiling_bytes": ceiling, "source": source}
+
+
+def check_memory_ceiling(nest_runtime: dict | None,
+                         local_bytes: int | None = None) -> CheckResult:
+    """The packing machine's system-memory ceiling against this machine's.
+
+    **Advisory in every branch, never a refusal.** The nest records how much
+    system memory the machine that packed it *could use* (`runtime.system_memory`,
+    format 2.10) — the cgroup cap of a container, or the physical total. That is
+    an **upper bound on what the successful run could have needed, not a measured
+    requirement**: the nest keeps no memory counter of its own. So the comparison
+    is the conservative one — a machine whose own ceiling is **below** the packing
+    machine's cannot rule out that the run needed more than it has, and warns; a
+    machine at or above it had at least as much headroom, and is silent.
+
+    This is the second half of the "every byte restored, still not usable" class
+    the machine-library check (`check_system_layer`) opened: a nest packed where
+    memory was plentiful can restore byte for byte into a memory-capped pod and
+    then be killed the moment it loads the models, for running out of memory.
+    """
+    rt = nest_runtime if isinstance(nest_runtime, dict) else {}
+    block = rt.get("system_memory")
+    src = block.get("ceiling_bytes") if isinstance(block, dict) else None
+    if not isinstance(src, int) or src <= 0:
+        # Say why there is nothing to compare, not just that there is nothing —
+        # a green line on a check that could not run reads as "the memory was
+        # sized up". A nest packed off Linux, or in a container that would not
+        # report its cap, carries no figure. Absent is not "needs little".
+        return CheckResult(
+            "memory_ceiling", "skip",
+            "This nest does not record how much system memory the machine that "
+            "packed it could use, so nothing here has sized this machine's memory "
+            "against the job. Nests packed before format 2.10, or off Linux, carry "
+            "no figure. No figure does not mean the run needs little.",
+            {"never_measured": True})
+    have = local_bytes if local_bytes is not None else collect_total_ram()
+    reading = {"packed_ceiling_gib": round(src / 2**30, 1),
+               "this_ceiling_gib": round(have / 2**30, 1) if have else None,
+               "source": block.get("source") if isinstance(block, dict) else None}
+    if not have:
+        return CheckResult(
+            "memory_ceiling", "skip",
+            f"The machine that packed this nest could use up to {src / 2**30:.1f} "
+            f"GiB of system memory. This machine's memory ceiling could not be "
+            f"read, so no comparison was made.", reading)
+    if have < src:
+        return CheckResult(
+            "memory_ceiling", "warn",
+            f"The machine that packed this nest could use up to {src / 2**30:.1f} "
+            f"GiB of system memory; this machine is capped at {have / 2**30:.1f} "
+            f"GiB. The packed run may have needed more than fits here, and loading "
+            f"the models can then be killed for running out of memory (OOM) even "
+            f"though every file restored correctly. It may still work — the figure "
+            f"is what the packing machine had, not what the run was measured to use "
+            f"— but a machine with more memory is the safe choice. Never refused on "
+            f"this count alone.", reading)
+    return CheckResult(
+        "memory_ceiling", "pass",
+        f"This machine can use {have / 2**30:.1f} GiB of system memory, at least as "
+        f"much as the {src / 2**30:.1f} GiB the packing machine had.", reading)
 
 
 def check_disk(free_bytes: int, required_bytes: int) -> CheckResult:
@@ -1449,6 +1556,72 @@ def collect_egress_mbps(
         return float(out.splitlines()[-1]) * 8 / 1e6  # bytes/s -> Mbps
     except (ValueError, IndexError):
         return 0.0
+
+
+def proxy_env_present(env: dict[str, str] | None = None) -> list[str]:
+    """Which proxy variables this shell actually sets (non-empty), in the order
+    uv/curl would resolve them. Empty list = no proxy configured in the
+    environment, so there is nothing for the proxy check to say."""
+    src = os.environ if env is None else env
+    return [v for v in PROXY_ENV_VARS if (src.get(v) or "").strip()]
+
+
+def index_reachable(url: str = PYPI_REACH_URL, max_time: int = 8) -> bool | None:
+    """Does the Python package index answer from here — through whatever proxy the
+    environment sets, exactly as uv and the install script will?
+
+    ``True`` it answered, ``False`` it did not (timeout, refusal, a proxy that
+    cannot tunnel), ``None`` we could not even ask (no curl). ``-f`` makes curl's
+    exit code the whole verdict: 0 only on a 2xx, non-zero on every network or
+    proxy failure. The outer ``timeout`` is a backstop in case ``--max-time`` is
+    ever ignored, so this can never become the hang it is meant to diagnose.
+    """
+    if shutil.which("curl") is None:
+        return None
+    try:
+        r = subprocess.run(  # noqa: S603
+            ["curl", "-fsS", "-o", os.devnull, "-w", "%{http_code}",
+             "--max-time", str(max_time), url],
+            capture_output=True, text=True, timeout=max_time + 5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
+
+
+def check_proxy(present: list[str], reachable: bool | None,
+                url: str = PYPI_REACH_URL) -> CheckResult:
+    """Verdict on a proxy that is set but may not actually carry the install.
+
+    Only ever called when ``present`` is non-empty, so it never invents a warning
+    on a machine that has no proxy at all. It never rejects either: a proxy the
+    package index does not answer through is a warning with the fix in it, not a
+    refusal — the machine itself may be perfectly able to rebuild.
+    """
+    names = ", ".join(present)
+    reading = {"proxy_env": present, "index_reachable": reachable, "probe_url": url}
+    if reachable is None:
+        return CheckResult(
+            "proxy", LEVEL_UNKNOWN,
+            f"A proxy is set in this shell ({names}), but curl is not here to test "
+            "whether the package index answers through it.",
+            reading,
+        )
+    if reachable:
+        return CheckResult(
+            "proxy", LEVEL_PASS,
+            f"A proxy is set ({names}) and the Python package index answers through it.",
+            reading,
+        )
+    return CheckResult(
+        "proxy", LEVEL_WARN,
+        f"A proxy is set in this shell ({names}), but the Python package index did not "
+        "answer through it. uv and curl read the proxy only from these variables, never "
+        "from the operating system's proxy setting, so a wrong value here makes the very "
+        "first step — installing renest, or the install script — hang with no error. "
+        "Fix the proxy address, or unset those variables if this network needs none.",
+        reading,
+    )
 
 
 def collect_gpu_compute_cap() -> str:
@@ -1944,6 +2117,17 @@ def run_precheck(
     # Nothing rebuilds without uv (see check_uv) — ask before the long download,
     # not after it.
     report.checks.append(check_uv())
+    # Behind a proxy that this shell exports but points somewhere uv/curl cannot
+    # reach, the very first install step hangs with no timeout and no message.
+    # Only when proxy variables are actually set do we spend one short request
+    # finding out whether the package index answers through them — no proxy set,
+    # no probe, so this stays silent and costs nothing for the common case. It is
+    # deliberately outside the ``skip_net`` gate: unlike the egress speed test
+    # (which pulls 32 MB), this is a few-KB reachability probe, and it is exactly
+    # the install-time hang doctor exists to catch before the machine is rented.
+    _proxy = proxy_env_present()
+    if _proxy:
+        report.checks.append(check_proxy(_proxy, index_reachable()))
     # A network drive warns, never blocks: it works, it is just much slower -- and cloud
     # providers drop people into such a directory by default, so they land there unaware.
     report.checks.append(check_local_disk(disk_path))
@@ -1952,6 +2136,13 @@ def run_precheck(
     # If it is going to be stopped, it has to be stopped before the run starts.
     report.checks.append(
         check_ram(collect_total_ram(), int(nest_bytes or need_disk_gb * 2**30)))
+    # Memory, the other half: check_ram asks "is there enough for a nest this
+    # size", derived from the nest's bytes. This asks a different question the
+    # nest can now answer directly — the packing machine's own memory ceiling
+    # (runtime.system_memory, format 2.10). A nest packed where memory was
+    # plentiful can restore byte for byte into a memory-capped pod and be killed
+    # the instant it loads. Advisory only; see check_memory_ceiling.
+    report.checks.append(check_memory_ceiling(nest_runtime))
     return report
 
 

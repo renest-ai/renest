@@ -115,13 +115,13 @@ __all__ = [
     "restore",
 ]
 
-FORMAT_VERSION = "2.9"
+FORMAT_VERSION = "2.10"
 # 2.0 made `code_deps[].role` mandatory and dropped 1.3, so that the consumer
-# side need not sniff /custom_nodes/ paths forever. 2.1 through 2.8 only added
+# side need not sniff /custom_nodes/ paths forever. 2.1 through 2.10 only added
 # fields or relaxed required ones, so **every 2.x package still reads** —
 # nothing here may tighten without a version bump.
 SUPPORTED_FORMAT_VERSIONS = ("2.0", "2.1", "2.2", "2.3", "2.4", "2.5", "2.6", "2.7", "2.8",
-                             "2.9")
+                             "2.9", "2.10")
 
 
 def _highest_version(versions: tuple[str, ...]) -> str:
@@ -1318,6 +1318,14 @@ class RestoreReport:
     #: nest records no fingerprint (older nests), so there was nothing to
     #: compare and **no warning is invented**.
     fingerprint_verdict: dict | None = None
+    #: Set only by ``--check-only``: the plain-language conclusion of the
+    #: reachability check — ``self_contained`` / ``total`` / ``reachable`` /
+    #: ``blocked`` (paths still out of reach) / ``ok`` / ``summary``. None on a
+    #: normal rebuild. Without it a ``--check-only`` run returned an all-zero
+    #: report and no verdict at all: nothing ran, so every count was 0, and the
+    #: one thing the reader came for — "can I fetch what this nest doesn't carry?"
+    #: — was never stated in words.
+    check_only: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -1344,6 +1352,7 @@ class RestoreReport:
             "recipe": self.recipe,
             "contested_modules": self.contested_modules,
             "fingerprint_verdict": self.fingerprint_verdict,
+            "check_only": self.check_only,
         }
 
 
@@ -3779,13 +3788,50 @@ def restore(
             # twenty minutes and only then finding a few files unreachable.
             # **No GPU needed, runs on a laptop**, so it must return before any
             # rebuild action happens.
-            if not report.gated:
-                narrate("Everything in this nest travels with it — nothing to fetch "
-                        "from anywhere else.", stage="S1")
-            report.ok = all(g["reach"] == "free" for g in report.gated)
+            #
+            # It has to *say* the answer, in one plain sentence. Until 2026-09-05
+            # this returned an all-zero report (nothing ran, so every stage count
+            # was 0) and, when the nest had unreachable files, narrated no verdict
+            # at all — the reader got a wall of zeros and exit 0, and the single
+            # question they ran the command to answer went unstated.
+            gated = report.gated
+            blocked = [g for g in gated if g.get("reach") != "free"]
+            report.ok = not blocked
             report.exit_code = (
                 int(ExitCode.OK) if report.ok else int(ExitCode.S0_WARNING_UNCONFIRMED)
             )
+            if not gated:
+                summary = (
+                    "Check only: this nest is self-contained — every file travels with "
+                    "it, nothing has to be fetched from anywhere else. This needs no GPU; "
+                    "go ahead and rebuild on the machine you mean to use."
+                )
+            elif not blocked:
+                summary = (
+                    f"Check only: {len(gated)} file(s) do not travel with this nest, and "
+                    "every one of them can be fetched on this machine. You are clear to "
+                    "rebuild — no GPU was needed for this check."
+                )
+            else:
+                names = ", ".join(g["path"] for g in blocked[:6]) + (
+                    f" (and {len(blocked) - 6} more)" if len(blocked) > 6 else ""
+                )
+                summary = (
+                    f"Check only: {len(blocked)} of {len(gated)} file(s) that do not "
+                    f"travel with this nest cannot be fetched on this machine yet: {names}. "
+                    "Sort those out before you rent anything — accept the hand-off, sign in, "
+                    "or put your own source credentials in place — then rebuild. See the "
+                    "lines above for what each one needs. No GPU was needed for this check."
+                )
+            report.check_only = {
+                "self_contained": not gated,
+                "total": len(gated),
+                "reachable": len(gated) - len(blocked),
+                "blocked": [g["path"] for g in blocked],
+                "ok": report.ok,
+                "summary": summary,
+            }
+            narrate(summary, stage="S1", level="info" if report.ok else "warning")
             return report
         # Say the landing spot out loud before a single byte is written. Someone
         # who packed ~/Documents/ComfyUI naturally expects a rebuild to put it

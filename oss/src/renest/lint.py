@@ -340,6 +340,23 @@ def lint(
                  "calls `mesa-libGL`, so a reader pasting it blind sends the user to a "
                  "package manager that has never heard of it.")
 
+    # Format 2.10: the packing machine's system-memory ceiling. The schema holds
+    # the shape (an object, ceiling_bytes an integer >= 1, source an enum); the one
+    # thing it cannot say is "this number is too small to be real". A ceiling under
+    # 1 GiB is almost certainly a misread -- no machine that ran one of these
+    # workloads had that little -- and a bogus figure would warn against every
+    # machine on every rebuild. Absent is honest ("not measured"); a tiny figure is
+    # not, so it earns a warning here rather than silence.
+    _sm = (m.get("runtime") or {}).get("system_memory") or {}
+    _ceil = _sm.get("ceiling_bytes")
+    if isinstance(_ceil, int) and 0 < _ceil < (1 << 30):
+        warn("system-memory-implausibly-small",
+             f"runtime.system_memory.ceiling_bytes is {_ceil} bytes (under 1 GiB), which "
+             "is almost certainly a misread rather than the real memory ceiling of a "
+             "machine that ran this workload. A rebuild would warn against it on every "
+             "machine. Re-measure, or omit the block -- absent reads as 'not measured', "
+             "which is honest; a tiny figure reads as a real ceiling, which is not.")
+
     # Format 2.8: contested modules. The schema holds the shape (the fingerprint
     # must be 64 lower-case hex characters, the method one of two words); this is
     # the one relation the schema cannot say. The winner is what a restore

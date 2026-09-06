@@ -2,10 +2,10 @@
 # =============================================================================
 # Renest restore.sh — the escape hatch
 #
-# Nest formats this copy reads: 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9  (and, with a warning,
+# Nest formats this copy reads: 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10  (and, with a warning,
 #   any later 2.x — a higher minor version only ever adds optional fields, and
 #   refusing one would turn a nest whose bytes restore perfectly into a brick).
-#   Written for format 2.9, 2026-08-30. Keep this line: from format 2.3 on a
+#   Written for format 2.10, 2026-09-05. Keep this line: from format 2.3 on a
 #   copy of this script travels inside every nest at .renest/escape/restore.sh,
 #   and this comment is how you tell which copy you are holding — there is no
 #   version field anywhere else.
@@ -320,10 +320,16 @@ FV=$(jq -r '.format_version' "$MANIFEST")
 # recorded file's hash and, if it differs, reinstalls that one package so it writes
 # last (section 5b). Still different → it says so and carries on. Every 2.0–2.7 nest
 # restores unchanged: the field is absent there, and absent means "do nothing".
+# 2.10 (2026-09-05) adds one optional field this script does not use:
+# runtime.system_memory, how much system memory the machine that packed the nest
+# could use. The agent side reads it before a rebuild to warn when this machine's
+# memory ceiling is lower (loading may be killed for running out of memory); this
+# script only gets the bytes back and does not start the application, so there is
+# nothing here to act on. Every 2.0–2.9 nest restores unchanged.
 case "$FV" in
-  2.0|2.1|2.2|2.3|2.4|2.5|2.6|2.7|2.8|2.9) ;;
+  2.0|2.1|2.2|2.3|2.4|2.5|2.6|2.7|2.8|2.9|2.10) ;;
   2.*)
-    warn "This nest says format $FV; this script knows up to 2.9. Same major version, so it only adds optional fields this script does not use — carrying on. A newer Renest will make full use of them." ;;
+    warn "This nest says format $FV; this script knows up to 2.10. Same major version, so it only adds optional fields this script does not use — carrying on. A newer Renest will make full use of them." ;;
   *)
     # Same three facts the agent side gives, in the same order: how old this nest is,
     # that there is no upgrade path and why, and that the files themselves are fine.
@@ -331,7 +337,7 @@ case "$FV" in
     # is not (the manifest still lists every one of them, with fingerprints).
     _WHEN=$(jq -r '.created_at // empty' "$MANIFEST" 2>/dev/null | cut -c1-10)
     _NFILES=$(jq -r '(.files // []) | length' "$MANIFEST" 2>/dev/null)
-    die FORMAT-VERSION "Unrecognised nest format version: $FV — this script reads format 2.x (knows 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8 and 2.9).${_WHEN:+ This nest was packed on ${_WHEN}.} Nests in the older 1.x format cannot be read here, and **there is no upgrade path**: format 2.0 made it compulsory to say which parts of a nest are the application and which are your own code, and nobody can work that out after the fact.${_NFILES:+ **Your files are not lost** — this nest still lists all ${_NFILES} of them with their fingerprints, so they can be fetched one by one even though the environment cannot be rebuilt automatically.} If you still have the environment, pack it again with a current Renest." ;;
+    die FORMAT-VERSION "Unrecognised nest format version: $FV — this script reads format 2.x (knows 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9 and 2.10).${_WHEN:+ This nest was packed on ${_WHEN}.} Nests in the older 1.x format cannot be read here, and **there is no upgrade path**: format 2.0 made it compulsory to say which parts of a nest are the application and which are your own code, and nobody can work that out after the fact.${_NFILES:+ **Your files are not lost** — this nest still lists all ${_NFILES} of them with their fingerprints, so they can be fetched one by one even though the environment cannot be rebuilt automatically.} If you still have the environment, pack it again with a current Renest." ;;
 esac
 
 # ---- Where the files may land ------------------------------------------------

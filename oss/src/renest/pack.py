@@ -41,10 +41,12 @@ from .capture import _parse_extra_model_paths, capture
 from .envlock import (
     LOCK_FROM_ENV_HEADER,
     LOCK_FROM_INSTALLED_HEADER,
+    conda_owned_evidence,
     env_dir_of,
     find_env_python,
     find_launchers,
     find_site_packages,
+    is_conda_build_url,
     distro_owned_packages,
     freeze_environment,
     is_system_interpreter,
@@ -1397,6 +1399,27 @@ def _foreign_env_kernel(root: Path, env_python: str | None) -> str | None:
     return kernel if kernel and kernel != here else None
 
 
+def _utc_now() -> datetime.datetime:
+    """The wall clock as an aware UTC datetime.
+
+    A single seam for "now", so the instant a nest stamps as its creation time can
+    be reasoned about against the files pack writes while assembling it.
+    """
+    return datetime.datetime.now(datetime.UTC)
+
+
+def _created_at_ts(created_at: str) -> float | None:
+    """A manifest ``created_at`` parsed back to a POSIX timestamp (None if unreadable).
+
+    Mirrors how the upload-time tamper guard reads the same field, so the two agree
+    on what "the moment this nest was created" means.
+    """
+    try:
+        return datetime.datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
 def _build_manifest(
     root: Path,
     spec: dict,
@@ -1427,9 +1450,9 @@ def _build_manifest(
     # from "hung".
     tracker = _ProgressTracker(emitter, root, spec) if (emitter and not dry_run) else None
     manifest: dict = {
-        "format_version": "2.9",
+        "format_version": "2.10",
         "id": nest_id,
-        "created_at": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "created_at": _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "runtime": spec["runtime"],
         "code_deps": [],
         "python_lock": {"tool": "uv"},
@@ -1524,12 +1547,23 @@ def _build_manifest(
         # on every nest ever packed — the collector sat in doctor.py all along, just
         # never called from here. Imported inside the function: doctor pulls in the
         # rules layer, and packing should not pay for that on every import.
-        from .doctor import collect_driver_version
+        from .doctor import collect_driver_version, collect_system_memory
 
         _drv = collect_driver_version()
         if _drv:
             rt = dict(manifest.get("runtime") or {})
             rt.setdefault("driver_version", _drv)
+            manifest["runtime"] = rt
+        # How much system memory this machine could use (format 2.10): the cgroup
+        # cap of a container, or the physical total. It is the second half of the
+        # "restores byte for byte, still not usable" story the machine-library
+        # list opened — a nest packed where memory was plentiful can restore into
+        # a memory-capped pod and be killed the instant it loads the models.
+        # Read nothing → write nothing: absence must never read as "needs little".
+        _sysmem = collect_system_memory()
+        if _sysmem:
+            rt = dict(manifest.get("runtime") or {})
+            rt.setdefault("system_memory", _sysmem)
             manifest["runtime"] = rt
         # Which operating-system libraries this run needed the machine to provide
         # (format 2.6). They cannot be packed, so a machine missing one restores every
@@ -1895,6 +1929,28 @@ def _build_manifest(
                 "inside one — that list is installable anywhere. Packing continues: the "
                 "archive is still a faithful record of this machine."
             )
+        # A conda-built environment is the same dead end from a different source, so it
+        # gets the same treatment as the OS-package case above: warn now, at PACK time
+        # and near the cause, instead of letting a restore blow up far from it. renest
+        # rebuilds with uv/PyPI; conda-only packages (conda/libmambapy/mkl-service and
+        # friends) have no wheel on any index, and a conda build-tree URL
+        # (file:///croot/...) names a path that exists on no machine. Said here with the
+        # one fix that works — not the un-followable "--trust-host file://" the URL audit
+        # below would otherwise suggest for each such line.
+        conda_ev = conda_owned_evidence(lock_text)
+        if conda_ev:
+            names = ", ".join(ln.split(" @ ")[0].split("==")[0].strip() for ln in conda_ev[:6])
+            more = f" and {len(conda_ev) - 6} more" if len(conda_ev) > 6 else ""
+            warnings.append(
+                f"This looks like a conda-built environment ({names}{more}). renest rebuilds "
+                "with uv/PyPI and cannot reproduce conda-only packages: they have no wheel on "
+                "any package index, and a conda build path (file:///croot/...) exists on no "
+                "other machine — so a restore would stop on the first of them, after the model "
+                "files have already been downloaded and paid for. Build this environment in a "
+                "virtual environment (`uv venv`, then reinstall what it needs) and pack again. "
+                "Packing continues: the code and models in this archive are still a faithful "
+                "record of this machine."
+            )
         pinned: list[tuple[str, str]] = []
         if pin_wheels and not dry_run:
             # Explicit pinning (--pin-wheels): the one step in pack that touches
@@ -2000,6 +2056,11 @@ def _build_manifest(
         if cuda_mix.level != LEVEL_PASS:
             warnings.append(cuda_mix.reason)
         unknown_src = audit_lock_urls(lock_text_for_audit)
+        # A conda build-tree URL is not a host anyone can trust in — it names conda's own
+        # build farm. The conda warning above already gave the only fix that works, so drop
+        # these here rather than tell the user to `--trust-host file://` once per line.
+        if conda_ev:
+            unknown_src = [u for u in unknown_src if not is_conda_build_url(u)]
         if unknown_src:
             warnings.append(
                 f"{len(unknown_src)} dependency source(s) we don't recognize: "
@@ -2026,6 +2087,20 @@ def _build_manifest(
         # moved the file somewhere the framework does not look.
         if lock_orig_rel and not unsafe_relpath(lock_orig_rel):
             manifest["python_lock"]["lockfile_path"] = lock_orig_rel
+        # A lock pack generated or rewrote this round lives in the work directory,
+        # not in the environment, and was written *after* the manifest's created_at.
+        # It is then hard-linked into the blob tree, so the upload-time tamper guard
+        # — which refuses a blob whose still-shared file was written after the nest
+        # was created — would flag our own freshly written lock and upload nothing
+        # (any environment with no lock file would then always fail). That is not an
+        # external change: we wrote the file as part of creating this nest, so pin
+        # its timestamp back to the nest's creation time. Only the lock pack authored
+        # here (the one in `work`) is touched; a user's own lock, packed as-is, keeps
+        # its own mtime so a genuine mid-write is still caught.
+        if not dry_run and lock_src.parent == work:
+            made_ts = _created_at_ts(manifest["created_at"])
+            if made_ts is not None:
+                os.utime(lock_src, (made_ts, made_ts))
         if dry_run:
             h, size = _sha256_stream(lock_src)
             manifest["python_lock"]["lockfile"] = {"sha256": h, "size_bytes": size}

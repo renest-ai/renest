@@ -26,8 +26,10 @@ __all__ = [
     "LOCK_FROM_INSTALLED_HEADER",
     "LOCK_FROM_ENV_HEADER",
     "canonical_name",
+    "conda_owned_evidence",
     "distro_owned_packages",
     "env_dir_of",
+    "is_conda_build_url",
     "find_env_python",
     "find_launchers",
     "find_site_packages",
@@ -130,6 +132,58 @@ def distro_owned_packages(lock_text: str) -> list[str]:
         if name in DISTRO_ONLY_PACKAGES or any(
             ("+" + local).startswith(m) for m in DISTRO_LOCAL_MARKERS if local
         ):
+            hits.append(line)
+    return hits
+
+
+#: Packages that only a conda channel ships: conda's own machinery, and Intel's MKL
+#: shims. None install from PyPI, so a lock naming any of them cannot be rebuilt with
+#: uv/pip on another machine — the same dead end as DISTRO_ONLY_PACKAGES, from a
+#: different source. Stored canonicalised so ``mkl_fft`` and ``mkl-fft`` compare equal.
+CONDA_ONLY_PACKAGES = frozenset(
+    canonical_name(n)
+    for n in (
+        "conda", "conda-build", "conda-libmamba-solver", "conda-content-trust",
+        "conda-package-handling", "conda-package-streaming", "libmambapy", "menuinst",
+        "mkl-service", "mkl_fft", "mkl_random", "anaconda-anon-usage",
+    )
+)
+
+#: A dependency URL pointing into conda's own build tree — what pip/uv record for a
+#: package that conda built and installed (``croot`` is Anaconda's build root; a local
+#: ``conda-bld`` is conda-build's). No machine but the build farm has these paths, and
+#: they name no host a user could ever ``--trust-host`` into.
+_CONDA_BUILD_URL = re.compile(r"file://\S*/(?:croot|conda-bld)/", re.IGNORECASE)
+
+
+def is_conda_build_url(url: str) -> bool:
+    """True when ``url`` points into conda's own build tree (see ``_CONDA_BUILD_URL``)."""
+    return bool(_CONDA_BUILD_URL.search(url))
+
+
+def conda_owned_evidence(lock_text: str) -> list[str]:
+    """Lines proving this lock came from a conda-built environment, which renest cannot
+    reproduce: it rebuilds with uv/PyPI, and conda-only packages have no wheel on any
+    index. Two tells, either is enough — a dependency pinned to a conda build-tree URL
+    (``file:///croot/...``), or a package only a conda channel ships. Returns the
+    offending lines (empty = no conda evidence).
+
+    Kept separate from ``distro_owned_packages`` and from vendor ``+cuNNN`` builds:
+    each of those has its own, different fix; this one's only fix is 'rebuild it in a
+    virtual environment and pack again'.
+    """
+    hits: list[str] = []
+    for raw in lock_text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or line.startswith(("-r ", "-c ", "--")):
+            continue
+        if _CONDA_BUILD_URL.search(line):
+            hits.append(line)
+            continue
+        stem = re.sub(r"^-e\s+", "", line)
+        # Take the distribution name off the front, before any version or URL marker.
+        stem = re.split(r"\s+@\s+|===|==|>=|<=|~=|!=|<|>|@", stem, maxsplit=1)[0]
+        if canonical_name(stem.split("[", 1)[0]) in CONDA_ONLY_PACKAGES:
             hits.append(line)
     return hits
 

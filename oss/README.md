@@ -23,9 +23,14 @@ It does not try to make unfamiliar things work. It reproduces what already did.
 ## Install
 
 ```
-uv tool install renest
+uv tool install --upgrade renest
 renest --version
 ```
+
+`--upgrade` matters if you have installed `renest` before: plain
+`uv tool install renest` treats an existing install as done and leaves the old
+version in place, so re-running it looks like an upgrade but is not. `--upgrade`
+moves an old install to the latest and is a harmless no-op on a fresh machine.
 
 Python 3.11 or newer. No `uv` on this machine yet?
 
@@ -34,6 +39,10 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 # Windows:  powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 # only have pip?  pip install uv
 ```
+
+On a proxy network, `uv` and `curl` read the proxy only from the environment,
+not from the OS/system proxy settings — so `export HTTPS_PROXY=http://host:port`
+(and `ALL_PROXY`) first, or the very first install step hangs with no error.
 
 That last one is safe even inside the environment you are about to capture: `uv`
 is a single binary with no dependencies of its own, so installing it moves

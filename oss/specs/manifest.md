@@ -1,4 +1,4 @@
-# manifest v2.9 · Nest manifest specification
+# manifest v2.10 · Nest manifest specification
 
 <!-- Version tripwire: the line "current version **x.y**" below is parsed by
      oss/tests/consistency/test_format_version_pinned.py and must agree with
@@ -6,11 +6,11 @@
      top line of the change log. This is the fifth place the version appears --
      the prose is not allowed to drift from the other four. -->
 
-> Status: **current version 2.9** (2026-08-30). Any field change is a format
+> Status: **current version 2.10** (2026-09-05). Any field change is a format
 > change: bump the version and update `manifest.schema.json`, `restore.sh` and
 > `renest lint` in the same change.
 >
-> **Readable versions**: `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9`, plus **any future minor
+> **Readable versions**: `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` / `2.10`, plus **any future minor
 > version of the same major** (a reader meeting a newer minor number warns and
 > continues; it does not reject the nest -- see §2).
 > **1.x is refused outright** (a one-time clean break taken while there were no
@@ -23,7 +23,8 @@
 > required to optional), 2.4 in §14 and 2.5 in §15 (machine facts that differ
 > from machine to machine), 2.6 in §12 (four things packing knew and threw away),
 > 2.7 in §13 (`files[].kind` became an open string), 2.8 in §16 (which copy of a
-> module the working run used when several packages write the same folder).
+> module the working run used when several packages write the same folder),
+> 2.10 in §17 (how much system memory the packing machine could use).
 > **Every 2.x nest still reads**: no version after 2.0 tightened anything.
 >
 > This document is the **frozen description** of the format: written field by
@@ -69,7 +70,7 @@ have restored perfectly into a brick.
 
 | Field | Required | Type | One line |
 |---|---|---|---|
-| `format_version` | ✔ | enum `2.0` … `2.9` | Format version (the schema enum is the only source of truth) |
+| `format_version` | ✔ | enum `2.0` … `2.10` | Format version (the schema enum is the only source of truth) |
 | `id` | ✔ | string (ULID) | Nest identifier, 26-character Crockford base32 |
 | `created_at` | ✔ | date-time | When it was packed |
 | `name` | | string ≤120 | Human-chosen name |
@@ -112,7 +113,7 @@ of truth.
 
 ## 2. Identity and metadata
 
-### `format_version` — enum `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` `[schema]`
+### `format_version` — enum `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` / `2.10` `[schema]`
 
 **The `enum` in the schema is the only source of truth.** Everywhere else,
 including this document, is a restatement. Changing the version means changing
@@ -222,6 +223,7 @@ Bare-metal and container-less packing: see §9. Since 2.3 that case has an answe
 | `libc_version` / `platform_tag` | | **Added in 2.4**: what decides whether a pre-built wheel installs here |
 | `native_libs` | | **Added in 2.6**: which operating-system libraries the working run needed the machine to provide |
 | `contested_modules` | | **Added in 2.8**: for every folder several installed packages write into, which package the working run's copy came from |
+| `system_memory` | | **Added in 2.10**: how much system memory the machine that packed the nest could use, so a rebuild onto a lower ceiling can warn before it loads |
 
 `gpu_model` is explicitly marked as not a rebuild constraint -- rebuilding on a
 different card is legitimate.
@@ -313,6 +315,30 @@ package the lock installs; `candidates` has at least two entries (one package
 is not a contest); when the survivor cannot be identified, write **no entry**
 rather than a guess. `renest lint` refuses a winner outside its candidates and,
 when it can read the lock, a candidate the lock does not install.
+
+**`system_memory` (2.10) -- the second half of "every byte restored, still not
+usable".** The machine-library list (`native_libs`) covers one way a byte-perfect
+rebuild can still fail to run; this covers the next one. A nest packed where
+memory was plentiful can restore byte for byte into a memory-capped pod and then
+be **killed the instant it loads the models, for running out of memory (OOM)** --
+the files are all correct, the machine simply cannot hold them. Shape:
+`{ "ceiling_bytes": <int>, "source": "cgroup" | "meminfo" }`.
+
+`ceiling_bytes` is the system-memory ceiling the packing environment actually had:
+the cgroup memory limit when a container set one (what a capped pod could use),
+otherwise the machine's physical total (`MemTotal`). `source` records which of the
+two it was and is optional -- a `cgroup` cap is a hard wall the run lived inside,
+while `meminfo` is only how much the host happened to have.
+
+**It is an upper bound on what the run could have needed, not a measured
+requirement** -- the nest keeps no memory counter of its own. So a reader compares
+it the conservative way, exactly as it does `gpu.observed_use`: a machine whose own
+memory ceiling is **below** this figure cannot rule out that the run needed more
+than it has, and **warns**; a machine at or above it had at least as much headroom,
+and stays silent. **A shortfall may only ever warn, never turn a machine away**: it
+is a floor that is too generous by design. **Absent means not measured, not "needs
+little"** -- a nest packed off Linux, or in a container that would not report its
+cap, carries no figure, and that is the normal case there.
 
 ### 3.2 `gpu` (optional) — what the packing machine's cards were `[schema]` `[measured]`
 
@@ -407,10 +433,11 @@ so a nest packed on an x86 machine **simply will not install** on an ARM one.
 The correct strength for a consumer of this field is therefore a **hard stop**,
 not "a note you may click past".
 
-**This version only records the fact; the hard stop belongs to the pre-flight
-check and is not built yet.** The record takes no part in deciding success or
-failure, and at present **neither direction is blocked**. If it cannot be
-probed, omit the field (§1.1).
+**This version only records the fact; the hard stop is built and lives in the
+agent's pre-flight check (doctor's `chip_family` check)**: a recorded family
+that differs from this machine's is refused, **in both directions**. The record
+itself takes no part in deciding success or failure -- blocking belongs to the
+pre-flight layer. If it cannot be probed, omit the field (§1.1).
 
 **Boundary of this block**: it **does not record the host application's commit**
 (`code_deps[].commit` already pins it, and recording it twice creates two
@@ -1514,3 +1541,30 @@ unless the nest pins it.
 | No refusal on a mismatch | The statement is declared-level (read off installed files, not off the working run), and declared-level statements may only warn -- the same line `native_libs` draws |
 | The list of contested families is not in the format | Which packages collide is world knowledge that changes without the format changing; it ships with the tool's rules today (`cv2` first) and can move to the signed rules bundle without a version bump |
 | No per-file list, one file per module | The compiled module is what decides behaviour; the rest of the folder follows it |
+
+## 17. What 2.10 changed (2026-09-05)
+
+**One optional field, purely additive**: `runtime.system_memory` (§3). Every
+2.0-2.9 nest reads unchanged; a nest without the field behaves exactly as before
+on both restore paths.
+
+| # | Change | Breaks compatibility? | Why |
+|---|---|---|---|
+| ① | `runtime.system_memory` -- how much system memory the machine that packed the nest could use (`ceiling_bytes`, plus an optional `source` of `cgroup` / `meminfo`) | No (additive, optional) | The second half of the "every byte restored, still not usable" class `native_libs` opened: a nest packed where memory was plentiful can restore byte for byte into a memory-capped pod and be killed the instant it loads the models, for running out of memory |
+
+**Why the format carries it.** Until now nothing in a nest recorded the packing
+machine's system-memory ceiling, so a rebuild had nothing to compare its own
+ceiling against. The pre-flight already reads the target machine's memory ceiling
+the same way for the size-based memory check (cgroup limit first, then `MemTotal`);
+2.10 records the packing side of the same reading so the two can be compared. The
+figure is an **upper bound on what the run could have needed, not a measured
+requirement**, so the check reads a shortfall the conservative way and **only ever
+warns** -- the same discipline `gpu.observed_use` draws.
+
+### Explicitly not done (2.10)
+
+| Not done | Why |
+|---|---|
+| No refusal on a shortfall | The figure is what the packing machine had, not what the run was measured to use; a machine below it *may* still work (frameworks trade speed for memory). A wrong stop before the download costs more than a wrong warning -- the same line `gpu.observed_use` and `native_libs.method: "declared"` draw |
+| No "measured peak memory" figure | The application keeps no system-memory counter this pipeline can read at pack time, unlike video memory (which the panel samples while a run is alive). Recording the ceiling the run had is honest about being a bound; inventing a peak would not be |
+| `source` left optional | The reading always knows which path produced the number, but a third-party writer may not; making it required would push such a writer toward a guess, and a wrong `source` is worse than an absent one |
