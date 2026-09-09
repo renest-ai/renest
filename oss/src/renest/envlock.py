@@ -17,19 +17,30 @@ hashes and no original index, so private indexes and vendor builds (torch's
 from __future__ import annotations
 
 
+import json
 import re
 import subprocess
 from pathlib import Path
+from .roots import ENV_ROOT_TOKEN
 from .uvbin import uv_executable
 
 __all__ = [
     "LOCK_FROM_INSTALLED_HEADER",
     "LOCK_FROM_ENV_HEADER",
+    "COMPILE_REQUIRED_PACKAGES",
+    "COMPILE_REQUIRED_VERDICT",
     "canonical_name",
+    "compile_required_evidence",
     "conda_owned_evidence",
     "distro_owned_packages",
     "env_dir_of",
+    "env_python_matches_run_record",
+    "image_build_evidence",
     "is_conda_build_url",
+    "local_label_family",
+    "local_path_evidence",
+    "local_version_sources",
+    "vendor_only_locals",
     "find_env_python",
     "find_launchers",
     "find_site_packages",
@@ -156,6 +167,163 @@ CONDA_ONLY_PACKAGES = frozenset(
 _CONDA_BUILD_URL = re.compile(r"file://\S*/(?:croot|conda-bld)/", re.IGNORECASE)
 
 
+#: The distribution name at the head of a ``Requires-Dist:`` line, before any
+#: extras, version specifier or environment marker.
+_REQ_NAME = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
+
+
+def requires_of(dist_info: Path) -> set[str]:
+    """Canonical names a distribution declares in ``Requires-Dist`` (its METADATA
+    header block), read off disk. Markers and extras are deliberately not evaluated:
+    an over-wide answer only ever shrinks what the callers below act on."""
+    names: set[str] = set()
+    try:
+        with (dist_info / "METADATA").open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if not line.strip():
+                    break               # headers end at the first blank line
+                if line.lower().startswith("requires-dist:"):
+                    m = _REQ_NAME.match(line.split(":", 1)[1])
+                    if m:
+                        names.add(canonical_name(m.group(1)))
+    except OSError:
+        pass
+    return names
+
+
+#: The package manager whose own machinery must never be mistaken for the app's
+#: dependencies. Only conda for now: it is the one that installs itself *into* the
+#: environment it manages, so a freeze of that environment lists the manager as if
+#: it were part of the work.
+_PACKAGE_MANAGER = "conda"
+
+
+def package_manager_closure(site_packages: Path) -> set[str]:
+    """Canonical names of the package manager's **own** installation — the manager
+    plus everything it, transitively, declares it needs — as installed here.
+    Empty when the manager is not installed in this environment.
+
+    **Why this is a reading and not a judgement.** It answers one question off
+    disk — *which distributions make up conda itself?* — by walking conda's own
+    ``Requires-Dist`` headers. It never asks the second question, the one we are
+    not allowed to guess: *does the app need this?* A package the app installed
+    stays, even when conda installed it, because nothing here looks at the app.
+
+    Measured on a real fine-tune run (``pytorch/pytorch:2.4.0-cuda12.1``): the
+    packed environment *was* conda's base environment, so its 121-line lock carried
+    ``libmambapy``, ``menuinst``, ``boltons``, ``pycosat`` and ``ruamel.yaml`` --
+    conda's own parts, on no package index. A restore stopped on the first of them
+    after 2.1 GB had been downloaded and paid for.
+    """
+    installed = installed_dist_infos(site_packages)
+    if _PACKAGE_MANAGER not in installed:
+        return set()
+    closure = {_PACKAGE_MANAGER}
+    frontier = [_PACKAGE_MANAGER]
+    while frontier:
+        for req in requires_of(installed[frontier.pop()]):
+            if req in installed and req not in closure:
+                closure.add(req)
+                frontier.append(req)
+    return closure
+
+
+def unreinstallable_manager_parts(site_packages: Path) -> set[str]:
+    """The package manager's own parts **that no index can give back** — the only
+    names it is safe to take out of a lock. Two independent readings, intersected:
+
+    * :func:`package_manager_closure` — a structural fact off conda's own METADATA:
+      is this distribution part of conda itself?
+    * :data:`CONDA_ONLY_PACKAGES` — a maintained list of names no package index
+      carries.
+
+    **Each covers the other's weakness, which is the whole point.** The list alone
+    could name something an app legitimately depends on (drop it and the rebuild
+    fails silently, missing a package); the closure alone sweeps in ordinary PyPI
+    packages conda happens to require (``requests`` is in conda's closure, and every
+    index has it — taking it out would be the same silent breakage). Intersected,
+    a name has to be *both* conda's own machinery *and* absent from every index
+    before it is touched, so over-dropping needs two independent readings to be
+    wrong at once.
+
+    The failure that remains is the harmless direction: a conda-only package the
+    list has never heard of stays in the lock, and the rebuild fails on it exactly
+    as it does today, with the same pack-time warning saying so. Under-dropping
+    costs a warning; over-dropping costs a silent missing package.
+    """
+    return package_manager_closure(site_packages) & CONDA_ONLY_PACKAGES
+
+
+def dists_built_from_a_directory(site_packages: Path) -> dict[str, str]:
+    """Installed distributions that came from a **folder on the packing machine**,
+    mapped to that folder. Read off each one's ``direct_url.json`` (PEP 610), which
+    the installer wrote at install time.
+
+    Why it matters: ``pip install -e .`` — the last line of kohya_ss's own
+    requirements.txt, and the standard way its README says to install it — records
+    the repository as an ordinary distribution. In a freeze it comes out as a bare
+    ``library==0.0.0``, indistinguishable from a package anyone could download,
+    and no index has ever carried that name at that version. Measured on a real
+    fine-tune archive: line 44 of its 121-line lock, and not one of the five
+    lock-text checks in this module sees it — they read the text, and the text
+    looks ordinary. The install record is where the fact actually lives.
+
+    **Only ``dir_info`` counts** (a directory install, editable or not). A local
+    ``.whl`` file records ``archive_info`` instead, and that same wheel may well be
+    on an index at that version, so calling it un-installable would be a guess.
+    A directory install never is one.
+    """
+    out: dict[str, str] = {}
+    for name, di in installed_dist_infos(site_packages).items():
+        try:
+            info = json.loads((di / "direct_url.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(info, dict) and isinstance(info.get("dir_info"), dict):
+            out[name] = str(info.get("url") or "")
+    return out
+
+
+def lock_lines_for(lock_text: str, names: set[str]) -> list[str]:
+    """The lock's own lines for ``names`` — so a warning can quote the text the
+    reader will actually see, instead of a name they then have to go find."""
+    hits: list[str] = []
+    for raw in lock_text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or line.startswith(("-r ", "-c ", "--")):
+            continue
+        stem = re.sub(r"^-e\s+", "", line)
+        stem = re.split(r"\s+@\s+|===|==|>=|<=|~=|!=|<|>|@", stem, maxsplit=1)[0]
+        if canonical_name(stem.split("[", 1)[0]) in names:
+            hits.append(line)
+    return hits
+
+
+def split_out_package_manager(lock_text: str, owned: set[str]) -> tuple[str, list[str]]:
+    """Take the package manager's own parts out of a lock. Returns
+    ``(lock without them, the lines removed)``; ``owned`` empty means nothing moves.
+
+    The removed lines are handed back rather than swallowed so the caller can say in
+    the pack output exactly what was left out and why -- a lock that silently grew
+    shorter is the kind of change nobody can audit later.
+    """
+    if not owned:
+        return lock_text, []
+    keep, dropped = [], []
+    for raw in lock_text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or line.startswith(("-r ", "-c ", "--")):
+            keep.append(raw)
+            continue
+        stem = re.sub(r"^-e\s+", "", line)
+        stem = re.split(r"\s+@\s+|===|==|>=|<=|~=|!=|<|>|@", stem, maxsplit=1)[0]
+        if canonical_name(stem.split("[", 1)[0]) in owned:
+            dropped.append(line)
+        else:
+            keep.append(raw)
+    return "\n".join(keep) + ("\n" if lock_text.endswith("\n") else ""), dropped
+
+
 def is_conda_build_url(url: str) -> bool:
     """True when ``url`` points into conda's own build tree (see ``_CONDA_BUILD_URL``)."""
     return bool(_CONDA_BUILD_URL.search(url))
@@ -186,6 +354,212 @@ def conda_owned_evidence(lock_text: str) -> list[str]:
         if canonical_name(stem.split("[", 1)[0]) in CONDA_ONLY_PACKAGES:
             hits.append(line)
     return hits
+
+
+# --------------------------------------------------------- lock != reinstallable --
+# A dependency lock can read as a clean list of ``name==version`` and still be
+# impossible to rebuild byte-for-byte on another machine. ``conda_owned_evidence``
+# above is one family of this; three more live here. The shared pathology: pip-level
+# it looks fine, yet the pin either installs a different binary or does not install at
+# all. Each is recognised by **shape** (never by a network call, so pack stays
+# offline), and pack turns each into a warning at PACK time, next to the cause,
+# instead of letting a restore stop far from it. None of them blocks: the same line as
+# the OS-package and conda cases -- the archive is still a faithful record of this
+# machine, and packing preserves the scene rather than policing it.
+
+#: Local-version tags a vendor index still serves, so ``pack --pin-wheels`` can reach
+#: them: the CUDA / ROCm / CPU / accelerator builds PyTorch and friends publish
+#: (``torch==2.4.1+cu124``). Anything after the ``+`` that is not one of these is a
+#: build that only ever existed on the machine, or inside the image, that made it.
+_VENDOR_LOCAL_PREFIXES = ("cu", "rocm", "cpu", "xpu", "hpu", "cann", "mps", "musa")
+
+#: A local part that spells out a from-source or baked-into-the-image build: a git
+#: checkout (``2.0.1a0+gitc263bd4``), an NGC-container build (``+nv23.05``, or a bare
+#: short commit hash like ``+29c30b1``), a nightly/dev stamp. None is published anywhere
+#: a restore could fetch, and ``--pin-wheels`` cannot find it either.
+_IMAGE_BUILD_LOCAL = re.compile(r"^(?:git|nv\d|dev|nightly|[0-9a-f]{7,40})", re.IGNORECASE)
+
+
+def local_label_family(local: str) -> str:
+    """Which family a PEP 440 local-version label belongs to — because each family
+    has a **different fix**, and handing someone the wrong fix is worse than none:
+
+    * ``vendor``: a build a vendor's own index still serves (``cu124``, ``rocm6.2``) —
+      ``pack --pin-wheels`` reaches it;
+    * ``image``: a from-source or baked-into-the-image build (``gitc263bd4``,
+      ``nv23.05``) — published nowhere, ``--pin-wheels`` cannot find it, the only fix
+      is rebuilding the environment from an installable release;
+    * ``distro``: the operating system's own rebuild (``ubuntu3``) — never on any
+      index, fix is packing from a virtual environment;
+    * ``other``: a label none of the shapes above claim. Treated like ``vendor`` by
+      the pinning path, which then answers honestly when the index has nothing.
+    """
+    low = (local or "").lower()
+    if not low:
+        return "other"
+    if low.startswith(_VENDOR_LOCAL_PREFIXES):
+        return "vendor"
+    if any(("+" + low).startswith(m) for m in DISTRO_LOCAL_MARKERS):
+        return "distro"
+    if _IMAGE_BUILD_LOCAL.match(low):
+        return "image"
+    return "other"
+
+
+def vendor_only_locals(lock_text: str) -> list[str]:
+    """Lines pinning a **bare** local version that only a vendor's index can serve
+    (``torch==2.4.1+cu124`` with no download address) — the pins ``--pin-wheels``
+    exists for, and exactly the ones a rebuild against the public index can never
+    install (2026-09-06, a real 64 GB restore died on this after the downloads).
+
+    Excluded on purpose, because each is a different disease with a different fix
+    and its own warning: distro-owned lines (``+ubuntu3``: no index ever had them)
+    and image-build lines (``+gitc263bd4``: published nowhere, pinning cannot reach
+    them either). Lines already pinned to a download address carry no ``==`` and do
+    not match. Returns the offending lines (comment-stripped)."""
+    distro = set(distro_owned_packages(lock_text))
+    image = set(image_build_evidence(lock_text))
+    hits: list[str] = []
+    for raw in lock_text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or line.startswith("-") or "==" not in line:
+            continue
+        _, _, rest = line.partition("==")
+        version = re.split(r"[;\s]", rest.strip(), maxsplit=1)[0]
+        if "+" not in version:
+            continue
+        if line in distro or line in image:
+            continue
+        hits.append(line)
+    return hits
+
+
+def image_build_evidence(lock_text: str) -> list[str]:
+    """Lines pinning a package to a local build that only existed on the packing
+    machine or inside its image -- the torch-ecosystem case where
+    ``torch==2.1.0a0+gitc263bd4`` reads as a normal pin and installs nowhere. Kept apart
+    from the vendor ``+cuNNN`` builds, which ``--pin-wheels`` can still reach (those
+    carry a prefix in ``_VENDOR_LOCAL_PREFIXES`` and are handled by the existing
+    vendor-build path); these it cannot -- the only fixes are to rebuild the environment
+    in a venv from an installable release, or to pin a direct wheel URL by hand. Returns
+    the offending lines (empty = none)."""
+    hits: list[str] = []
+    for raw in lock_text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or line.startswith("-") or "==" not in line:
+            continue
+        _, _, rest = line.partition("==")
+        version = re.split(r"[;\s]", rest.strip(), maxsplit=1)[0]
+        if "+" not in version:
+            continue
+        local = version.split("+", 1)[1].lower()
+        if not local or local.startswith(_VENDOR_LOCAL_PREFIXES):
+            continue
+        if _IMAGE_BUILD_LOCAL.match(local):
+            hits.append(line)
+    return hits
+
+
+#: A ``file://`` URL anywhere in a lock line. ``file:///abs/...`` (empty host) is a path
+#: on the packing machine; ``file://host/...`` is another machine outright. Either way
+#: nothing at that address travels inside the nest, so a restore cannot reach it.
+_FILE_URL = re.compile(r"file://\S+", re.IGNORECASE)
+#: A version-control install (``git+https://...@<commit>``): it pins a commit and fetches
+#: from a host the URL audit already checks, so it IS reproducible and is left alone here.
+_VCS_INSTALL = re.compile(r"\b(?:git|hg|bzr|svn)\+", re.IGNORECASE)
+
+
+def local_path_evidence(lock_text: str) -> list[str]:
+    """Lines installing from a path on the packing machine that does not travel inside
+    the nest: an editable install of a folder outside the environment root
+    (``-e /opt/mylib``), or a wheel/sdist pinned by a ``file://`` URL. The environment
+    root's own editable install is excluded -- it is tokenised (``ENV_ROOT_TOKEN``) and
+    swapped back on restore, so it does travel. VCS installs and conda build trees are
+    excluded too: the first is reproducible, the second has its own recognizer with its
+    own fix. **Feed the tokenised lock text** so the environment-root marker is present.
+    Returns the offending lines (empty = none)."""
+    hits: list[str] = []
+    for raw in lock_text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or ENV_ROOT_TOKEN in line:
+            continue
+        if _VCS_INSTALL.search(line) or is_conda_build_url(line):
+            continue
+        if _FILE_URL.search(line):
+            hits.append(line)
+            continue
+        m = re.match(r"^-e\s+(\S+)", line)
+        if m:
+            target = m.group(1)
+            if target.startswith(("/", "~")) or re.match(r"^[A-Za-z]:[\\/]", target):
+                hits.append(line)
+    return hits
+
+
+#: The verdict a nest states, at pack time, for a package that must be rebuilt from
+#: source on the machine that restores it. **This exact wording is the pre-registered
+#: predicate a real-machine flash-attn run asserts against**, so it is a named constant,
+#: never retyped -- a test imports it rather than copying the sentence.
+COMPILE_REQUIRED_VERDICT = (
+    "this package must be recompiled on the restore machine; the byte-for-byte "
+    "guarantee does not cover it — use a venv + the official wheel"
+)
+
+#: Packages built from source against the exact torch / CUDA / GPU-architecture triple
+#: of whatever machine installs them. A ``name==version`` line reads as installable and
+#: then either finds no matching wheel and compiles for tens of minutes, or installs a
+#: wheel built for another architecture that imports and dies at the first kernel launch.
+#: renest cannot carry the built artifact byte-for-byte across a machine change, so it
+#: says so at pack time. Deliberately a small, high-confidence set -- no unrelated PyPI
+#: package shares these names; extend it the way ``CONDA_ONLY_PACKAGES`` is extended.
+COMPILE_REQUIRED_PACKAGES = frozenset(
+    canonical_name(n) for n in ("flash-attn", "mamba-ssm", "causal-conv1d")
+)
+
+
+def compile_required_evidence(lock_text: str) -> list[str]:
+    """Lines naming a package that has to be recompiled on the restore machine (see
+    ``COMPILE_REQUIRED_PACKAGES``). The nest is not expected to install these back; the
+    verdict (``COMPILE_REQUIRED_VERDICT``) names the one route that works. Returns the
+    offending lines (empty = none)."""
+    hits: list[str] = []
+    for raw in lock_text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or line.startswith(("-r ", "-c ", "--")):
+            continue
+        stem = re.sub(r"^-e\s+", "", line)
+        stem = re.split(r"\s+@\s+|===|==|>=|<=|~=|!=|<|>|@", stem, maxsplit=1)[0]
+        if canonical_name(stem.split("[", 1)[0]) in COMPILE_REQUIRED_PACKAGES:
+            hits.append(line)
+    return hits
+
+
+def env_python_matches_run_record(
+    python_exe: str | Path, run_record: dict | None
+) -> str | None:
+    """A diagnostic, never a block: when the run record names the environment a working
+    run used (``env.VIRTUAL_ENV``) and it is **not** the interpreter the dependency list
+    was just read from, say so. The classic cause is a Jupyter kernel whose packages
+    differ from the shell's -- the run happens in the kernel, the pack reads the shell.
+    Returns a note, or ``None`` when they agree or the record cannot answer (unknown is
+    never reported as a mismatch -- reporting it would misfire on every ordinary pack)."""
+    ve = ((run_record or {}).get("env") or {}).get("VIRTUAL_ENV")
+    if not ve:
+        return None
+    try:
+        used = Path(str(python_exe)).resolve()
+        recorded = Path(str(ve)).resolve()
+    except (OSError, ValueError, RuntimeError):
+        return None
+    # The frozen interpreter sitting inside the recorded venv -> they agree.
+    if used == recorded or str(used).startswith(str(recorded) + "/"):
+        return None
+    return (
+        f"the dependency list was read from {python_exe}, but this run recorded it ran "
+        f"under {ve}. If those are two different environments (a Jupyter kernel and the "
+        f"shell around it are the usual case), what you are capturing may not be the "
+        f"environment that ran the workflow — point --env-python at the one the run used."
+    )
 
 
 def is_system_interpreter(python_exe: str | Path) -> bool | None:
@@ -438,6 +812,117 @@ def installed_dist_infos(site_packages: Path) -> dict[str, Path]:
         if pair:
             found.setdefault(canonical_name(pair[0]), d)
     return found
+
+
+#: Config files that can name the index an environment installs from, relative to the
+#: environment root. Read in this order; the first that names one wins. Deliberately
+#: short: these are the two files our own restore path and the two installers we
+#: support actually write, not every place a setting could conceivably live.
+_INDEX_CONFIG_FILES = ("pip.conf", "pip.ini", "uv.toml", ".uv.toml")
+
+#: `index-url = https://...` / `index_url: https://...` / `url = "https://..."`, in
+#: either installer's spelling. Only https is picked up -- a plain-http index is not
+#: recorded (see the schema: recording one would read as a recommendation).
+_INDEX_URL_LINE = re.compile(
+    r"""^[^\S\n]*(?:index[-_]url|default[-_]index|url)[^\S\n]*[:=][^\S\n]*["']?(https://[^\s"'#]+)""",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _index_from_direct_url(dist_info: Path) -> str | None:
+    """The index a package was installed from, out of its own ``direct_url.json``
+    (PEP 610) -- what the installer wrote down at the time, not a guess.
+
+    Only a plain archive URL counts. A `vcs_info` entry names a repository rather than
+    an index, and a `dir_info` entry names a folder on the packing machine that exists
+    nowhere else; neither answers "which index serves this package", so both are
+    passed over rather than recorded as an answer to a different question.
+    """
+    try:
+        info = json.loads((dist_info / "direct_url.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(info, dict) or info.get("vcs_info") or info.get("dir_info"):
+        return None
+    url = info.get("url")
+    if not isinstance(url, str) or not url.startswith("https://"):
+        return None
+    # Strip back to the index root the wheel hangs off: the full wheel address is the
+    # *pinned* answer and belongs in the lock line itself, not here. `.../whl/cu128/
+    # torch-2.11.0%2Bcu128-cp311-...whl` -> `.../whl/cu128`.
+    base = url.split("#", 1)[0].split("?", 1)[0]
+    if not base.lower().endswith((".whl", ".tar.gz", ".zip")):
+        return None
+    trimmed = base.rsplit("/", 1)[0]
+    # Some indexes serve `/<index>/<name>/<file>.whl` (PEP 503 simple layout); drop a
+    # last segment that is just the package's own name so both layouts land on the
+    # same index root.
+    parent, _, last = trimmed.rpartition("/")
+    pair = _name_and_version(dist_info)
+    if parent.startswith("https://") and pair and canonical_name(last) == canonical_name(pair[0]):
+        trimmed = parent
+    return trimmed or None
+
+
+def _index_from_config(*roots: Path) -> str | None:
+    """The index configured for this environment, read off its own config files."""
+    for r in roots:
+        if r is None or not Path(r).is_dir():
+            continue
+        for name in _INDEX_CONFIG_FILES:
+            p = Path(r) / name
+            if not p.is_file():
+                continue
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            m = _INDEX_URL_LINE.search(text)
+            if m:
+                return m.group(1).rstrip("/") or None
+    return None
+
+
+def local_version_sources(
+    lock_text: str, site_packages: Path | None, *config_roots: Path
+) -> dict[str, dict[str, str]]:
+    """``{package: {"index_url": ..., "source": ...}}`` for every lock line still
+    pinning a bare vendor-only local version (format 2.11).
+
+    **Only the lines nothing else has already answered.** A line pinned to a direct
+    wheel URL carries its address and its hash inside the lock and is the authoritative
+    record; it has no entry here, so the two can never disagree about one package. What
+    is left is the honest half: `torch==2.11.0+cu128`, a name and a version that no
+    public index serves and, until this field, no address anywhere in the nest.
+
+    **Read, never inferred.** Two routes, in order of strength: the package's own
+    ``direct_url.json`` (``direct_url``, what the installer recorded at the time), then
+    the index this environment is configured to use (``index_config``, weaker -- it says
+    where packages came from in general, not where this one did). **There is deliberately
+    no third route that works the address back from the ``+cu128`` suffix.** That mapping
+    is a table someone would have to keep up to date against a vendor's URL layout, it
+    is right until the vendor moves a path, and it would be indistinguishable in the
+    manifest from something actually measured. When neither route answers, the package
+    is left out -- a nest that says nothing is repairable, one that says something wrong
+    sends the person repairing it to the wrong place.
+    """
+    bare = vendor_only_locals(lock_text)
+    if not bare:
+        return {}
+    names = [ln.split("==", 1)[0].strip() for ln in bare]
+    dist_infos = installed_dist_infos(site_packages) if site_packages else {}
+    configured = _index_from_config(*config_roots) if config_roots else None
+    out: dict[str, dict[str, str]] = {}
+    for name in names:
+        if not name:
+            continue
+        di = dist_infos.get(canonical_name(name))
+        url = _index_from_direct_url(di) if di is not None else None
+        if url:
+            out[name] = {"index_url": url, "source": "direct_url"}
+        elif configured:
+            out[name] = {"index_url": configured, "source": "index_config"}
+    return dict(sorted(out.items(), key=lambda kv: kv[0].lower()))
 
 
 def freeze_from_installed(site_packages: Path) -> str | None:

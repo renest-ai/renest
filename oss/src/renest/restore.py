@@ -115,13 +115,13 @@ __all__ = [
     "restore",
 ]
 
-FORMAT_VERSION = "2.10"
+FORMAT_VERSION = "2.11"
 # 2.0 made `code_deps[].role` mandatory and dropped 1.3, so that the consumer
-# side need not sniff /custom_nodes/ paths forever. 2.1 through 2.10 only added
+# side need not sniff /custom_nodes/ paths forever. 2.1 through 2.11 only added
 # fields or relaxed required ones, so **every 2.x package still reads** —
 # nothing here may tighten without a version bump.
 SUPPORTED_FORMAT_VERSIONS = ("2.0", "2.1", "2.2", "2.3", "2.4", "2.5", "2.6", "2.7", "2.8",
-                             "2.9", "2.10")
+                             "2.9", "2.10", "2.11")
 
 
 def _highest_version(versions: tuple[str, ...]) -> str:
@@ -501,6 +501,55 @@ def _name_a_few(paths: list[Path], limit: int = 3) -> str:
     more = len(paths) - len(names)
     joined = ", ".join(names) + (f" and {more} more" if more > 0 else "")
     return f"`{joined}`" if len(names) == 1 else f"One of `{joined}`"
+
+
+#: Friendly nouns for ComfyUI's output keys. ComfyUI's ``/history`` reports each
+#: output node's products under a key named for the medium: ``SaveImage`` writes
+#: ``images``, the video nodes (``VHS_VideoCombine`` and the native ones) write
+#: ``gifs``/``videos``, ``SaveAudio`` writes ``audio``. An output we do not have a
+#: word for is reported as a generic "output" — never dropped.
+_PRODUCT_NOUNS = {"images": "image", "gifs": "video", "videos": "video",
+                  "audio": "audio file"}
+
+
+def count_recipe_products(outputs: Mapping[str, Any]) -> dict[str, int]:
+    """How many files a completed recipe wrote, broken down by ComfyUI output key.
+
+    The run gate must accept **whatever the recipe declared it makes**, not PNGs
+    alone: video has been a first-class product since format 2.7 and audio since
+    the MiniMax H3 ruling, yet this gate once counted only the ``images`` key and
+    so failed a legitimate video- or audio-only workflow that finished with zero
+    images. Here every product is a small dict carrying a ``filename`` under some
+    output key, so a workflow ending in a video or audio node is measured by what
+    it actually produced.
+
+    A dead environment still fails: a run that saved nothing returns an empty
+    mapping, and the caller raises. A text-only output (e.g. a preview-text node,
+    whose value is a list of bare strings, not file dicts) is deliberately **not**
+    counted — it is not a saved artifact, so "the recipe printed some text but
+    wrote no file" stays a failure exactly as before.
+    """
+    by_kind: dict[str, int] = {}
+    for node_out in outputs.values():
+        if not isinstance(node_out, dict):
+            continue
+        for key, items in node_out.items():
+            if not isinstance(items, list):
+                continue
+            n = sum(1 for it in items if isinstance(it, dict) and it.get("filename"))
+            if n:
+                by_kind[key] = by_kind.get(key, 0) + n
+    return by_kind
+
+
+def describe_products(by_kind: Mapping[str, int]) -> str:
+    """Plain-language phrase for what a run produced: ``"1 image"``, ``"3 videos"``,
+    ``"2 audio files"``, or ``"N output(s)"`` for a kind we have no noun for."""
+    parts = []
+    for key, n in by_kind.items():
+        noun = _PRODUCT_NOUNS.get(key, "output")
+        parts.append(f"{n} {noun}" + ("s" if n != 1 else ""))
+    return ", ".join(parts) if parts else "nothing"
 
 
 def _archive_emptiness_is_expected(dep: dict, manifest: dict) -> bool:
@@ -1146,15 +1195,21 @@ class ComfyUILauncher:
                         f"{json.dumps(status.get('messages') or [])[:400]}"
                     )
                 if status.get("completed"):
-                    images = sum(len(o.get("images") or [])
-                                 for o in (entry.get("outputs") or {}).values())
-                    if not images:
+                    by_kind = count_recipe_products(entry.get("outputs") or {})
+                    total = sum(by_kind.values())
+                    if not total:
                         raise RuntimeError(
-                            "the recipe ran to completion but produced no image. Either this "
-                            "nest's recipe saves nothing, or the rebuild is not equivalent."
+                            "the recipe ran to completion but produced no output — no image, "
+                            "video, audio or any other file came out. Either this nest's "
+                            "recipe saves nothing, or the rebuild is not equivalent."
                         )
-                    self.recipe_outcome = {"reran": True, "images": images, "why": None}
-                    return (f"Re-ran the packed recipe and it produced {images} image(s) "
+                    # `images` stays for readers that predate multi-medium support;
+                    # `outputs`/`by_kind` are the full, product-type-agnostic count.
+                    self.recipe_outcome = {"reran": True, "outputs": total,
+                                           "by_kind": dict(by_kind),
+                                           "images": by_kind.get("images", 0), "why": None}
+                    return (f"Re-ran the packed recipe and it produced "
+                            f"{describe_products(by_kind)} "
                             f"in {time.monotonic() - started:.0f}s")
             time.sleep(3.0)
         raise RuntimeError(
@@ -1177,13 +1232,26 @@ class ComfyUILauncher:
 # options / report
 # --------------------------------------------------------------------------
 def _default_runner(
-    cmd: list[str], env: dict | None = None, cwd: str | None = None
+    cmd: list[str],
+    env: dict | None = None,
+    cwd: str | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess:
-    """Default command executor (uv / post_install). Tests inject a fake."""
+    """Default command executor (uv / post_install). Tests inject a fake.
+
+    ``timeout`` is **per call and opt-in; there is deliberately no global
+    default**: the real dependency install and ``post_install`` legitimately run
+    for as long as they need (a CUDA torch stack installs for many minutes), and
+    a blanket cap here would kill healthy long runs. The only caller that passes
+    one is the S0 lock probe — a bonus check that must never park the restore.
+    On expiry ``subprocess.TimeoutExpired`` propagates to that caller, which
+    knows it asked for the cap; it is not flattened into a fake exit code that
+    other call sites could mistake for the command's own verdict.
+    """
     merged = {**os.environ, **(env or {})}
     try:
         return subprocess.run(  # noqa: S603
-            cmd, env=merged, cwd=cwd, capture_output=True, text=True
+            cmd, env=merged, cwd=cwd, capture_output=True, text=True, timeout=timeout
         )
     except FileNotFoundError as e:
         return subprocess.CompletedProcess(cmd, 127, "", str(e))
@@ -1235,12 +1303,20 @@ class RestoreOptions:
     #: **No GPU needed, runs on a laptop** — spend a minute first instead of
     #: twenty minutes plus machine cost.
     check_only: bool = False
+    #: ``--plan``: run every S0 check, then stop and say what the rebuild would
+    #: do — **without fetching one byte**. Deliberately distinct from
+    #: ``check_only``, which answers a narrower question (can the files this nest
+    #: does not carry be fetched at all?) and returns before S0 even runs.
+    plan_only: bool = False
     blob_base: str = ""  # path-pattern blob root URL when manifest has no sources
     retry_rounds: int = DEFAULT_RETRY_ROUNDS
     backoff_base_s: float = DEFAULT_BACKOFF_BASE_S
     ssim_threshold: float = DEFAULT_SSIM_THRESHOLD
     # injection seams (the key to zero-network zero-real-dep tests)
     precheck_fn: Callable[..., PrecheckReport] | None = None
+    #: Must accept ``(cmd, env=None, cwd=None, timeout=None)`` — the S0 lock
+    #: probe passes a per-call ``timeout`` (and only the probe does; see
+    #: ``_default_runner`` for why there is no global cap).
     runner: Callable[..., subprocess.CompletedProcess] | None = None
     launcher: Any = None
     oneshot_runner: Any = None  # injection seam (tests); None = default OneshotRunner
@@ -1302,8 +1378,10 @@ class RestoreReport:
     #: This makes "do I need to go accept something right now" answerable before
     #: the run starts, instead of discovering missing files at the end.
     gated: list[dict] = field(default_factory=list)
-    #: What the recipe step concluded: did it really run again, how many images came
-    #: out, and if it did not run, why. None = the step never got there.
+    #: What the recipe step concluded: did it really run again, how many products
+    #: came out (``outputs`` total, ``by_kind`` split by medium — image/video/audio;
+    #: ``images`` kept for older readers), and if it did not run, why. None = the
+    #: step never got there.
     recipe: dict | None = None
     #: Contested modules (several packages shipping the same top-level module,
     #: overwriting each other's files): system libraries the installed survivor
@@ -1326,6 +1404,11 @@ class RestoreReport:
     #: one thing the reader came for — "can I fetch what this nest doesn't carry?"
     #: — was never stated in words.
     check_only: dict | None = None
+    #: ``--plan``: everything this rebuild *would* do, worked out after the S0
+    #: checks have run and **before a single byte is fetched**. Machine-readable
+    #: half of the answer; the human half is narrated. Report layer only — it is
+    #: derived from the manifest, and adds no field to it.
+    plan: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -1353,6 +1436,7 @@ class RestoreReport:
             "contested_modules": self.contested_modules,
             "fingerprint_verdict": self.fingerprint_verdict,
             "check_only": self.check_only,
+            "plan": self.plan,
         }
 
 
@@ -1734,6 +1818,15 @@ def _hosts_of(urls: list[str]) -> list[str]:
 #: What uv prints when it cannot reach upstream, covering both break shapes:
 #: the hostname does not resolve, and the hostname resolves into a black hole.
 #: Taken from real uv output — do not extend this list from memory.
+#: **One list, two legs.** The escape hatch carries this same list verbatim
+#: (``scripts/restore.sh``, block ``upstream-unreachable-markers``) and uses it
+#: for the same purpose: uv reports an index it could not reach as "no solution
+#: found … " *plus* one of these, and keying on "no solution" alone turns a
+#: dropped connection into "your nest's dependency list is broken" — at the
+#: worst possible moment, since an unreliable network is often *why* someone is
+#: running the escape hatch. A gate re-reads both files and fails on drift
+#: (``tests/unit/test_escape_hatch_lock_precheck.py``), because a comment saying
+#: "change both" has never once stopped this repository from changing one.
 _UPSTREAM_UNREACHABLE_MARKERS = (
     "failed to fetch",
     "error sending request for url",
@@ -1751,6 +1844,74 @@ _UPSTREAM_UNREACHABLE_MARKERS = (
 _TORCH_CONFLICT_MARKERS = ("cuda", "conflict", "no solution", "incompatible", "requires")
 #: uv's wording when a version simply is not on any index it can reach.
 _NO_SOLUTION_MARKERS = ("no solution", "was not found", "not found in the package registry")
+
+#: uv's wording when the requested pin **is not available**, as opposed to a real
+#: conflict between requirements. Generated with a real uv (0.12.3) against a local
+#: file:// index on 2026-09-06 — not from memory: a version absent from the index
+#: answers "there is no version of torch==2.11.0+cu128"; a name absent altogether
+#: answers "was not found in the package registry". A genuine torch/CUDA clash says
+#: neither — it says what requires what — so this list must never grow a marker
+#: that a conflict message also contains.
+_VERSION_UNAVAILABLE_MARKERS = (
+    "there is no version of",
+    "was not found in the package registry",
+)
+
+#: A requirement carrying a PEP 440 local version (`torch==2.11.0+cu128`) quoted
+#: inside uv's complaint. Only used on whitespace-collapsed text: uv wraps its
+#: messages at terminal width, and a marker or a pin split across a line break
+#: would otherwise hide from a substring test.
+_LOCAL_PIN_IN_ERROR = re.compile(
+    r"([A-Za-z0-9][A-Za-z0-9._-]*)==([0-9][A-Za-z0-9.!]*\+[A-Za-z0-9._-]+)"
+)
+
+#: The S0 lock probe runs `uv pip compile --no-build`, and under that flag an
+#: sdist-only package produces a "No solution found" that the real install (which
+#: does build) would sail past. uv marks that case with this hint (generated with
+#: a real uv 0.12.3 on 2026-09-06, not from memory); seeing it makes the probe
+#: inconclusive, never a verdict — the probe may only block on failures the real
+#: install is certain to repeat.
+#:
+#: **One literal, two legs.** The escape hatch runs the same probe with the same
+#: ``--no-build`` and greps for this same sentence (``scripts/restore.sh``, and
+#: its byte-identical copy ``escape/restore.sh``, in the ``lock-precheck``
+#: block). Change the string here and you must change it there. It went wrong in
+#: exactly that way once: on 2026-09-06 a human running the escape hatch by hand
+#: watched it tell a perfectly good nest its environment would not work, because
+#: this discount lived on the agent leg only.
+_PROBE_ONLY_ARTIFACTS = ("building from source is disabled",)
+
+#: Wall-clock cap for the S0 resolve probe, seconds. A healthy resolution answers
+#: in 1-5 s (measured with a real uv against a local index, 2026-09-06); a cold
+#: cache over a slow line can take tens of seconds, which 60 still covers. The
+#: probe is a bonus check: on expiry it forfeits the bonus and defers to S3 —
+#: never the other way round, because a pathological resolution parking S0
+#: indefinitely is strictly worse than missing one early verdict. **Only the
+#: probe gets a cap**; the real install and post_install legitimately run long.
+_PROBE_TIMEOUT_S = 60.0
+
+
+def unvetted_lock_sources(
+    text: str,
+    *,
+    trust_hosts: tuple[str, ...] | list[str] = (),
+    env_root: Path | None = None,
+) -> list[str]:
+    """[SECURITY-REVIEW] **The one source gate for dependency-lock text.** S3's
+    refusal to install and the S0 probe's do-not-touch guard both call this same
+    symbol — deliberately, so the two judgements can never drift apart: a lock
+    the probe would hand to uv is exactly a lock S3 would install from.
+
+    Returns the URLs in ``text`` that point at hosts nobody has vetted, after
+    folding in the hosts this run's user named with ``--trust-host``. Pass an
+    empty ``trust_hosts`` for the baseline reading (what the standing allow-list
+    alone says) — the hand-off sender gate reads that baseline, so a nest someone
+    handed over cannot be waved through by host flags alone.
+    """
+    from .wheels import trusted_lock_hosts
+
+    allow = trusted_lock_hosts() | {h.strip().lower() for h in trust_hosts if h.strip()}
+    return audit_lock_urls(text, trusted=frozenset(allow), env_root=env_root)
 
 #: A package with no ready-made build for this machine falls back to compiling from
 #: source, and that compile needs system libraries and build tools the machine may not
@@ -1854,6 +2015,48 @@ def classify_deps_failure(stderr: str) -> tuple[ErrorClass, str]:
             f"dependency list captured from a system Python instead of a virtual environment. "
             f"The fix is on the packing side: rebuild that environment inside `uv venv` and "
             f"pack again, or edit these lines out of requirements.lock and re-run.",
+        )
+    # A pin that no index this install consults **has** — the wan60 shape
+    # (2026-09-06, RC=31 on a real 64 GB restore): the lock says
+    # `torch==2.11.0+cu128`, that build lives only on the vendor's own index, and
+    # uv's answer contains both "torch" and "no solution", so the torch branch
+    # below used to dress it as a CUDA conflict and send the reader off to check
+    # drivers. **Before the torch branch on purpose**; the availability markers
+    # are what tells it apart from a genuine clash, which names a requirement
+    # ("requires a cuda 12.4 runtime"), not an absence.
+    flat = " ".join(low.split())
+    pin = _LOCAL_PIN_IN_ERROR.search(" ".join(stderr.split()))
+    if pin and any(m in flat for m in _VERSION_UNAVAILABLE_MARKERS):
+        from .envlock import local_label_family
+
+        req = f"{pin.group(1)}=={pin.group(2)}"
+        base, label = pin.group(2).split("+", 1)
+        family = local_label_family(label)
+        if family == "vendor":
+            fix = (
+                "The fix is on the packing side: pack that environment again with "
+                "--pin-wheels, which records the exact vendor download address for "
+                "each such build, then restore the new nest."
+            )
+        else:
+            # An image-build (`+git…`, `+nv…`) or system rebuild: published
+            # nowhere, so --pin-wheels cannot reach it either — advising it here
+            # would send the reader somewhere it is guaranteed to fail.
+            fix = (
+                "No index ever published this build — it existed only on the "
+                "machine or image that made it, so pinning cannot reach it either. "
+                "The fix is on the packing side: rebuild that environment in a "
+                "virtual environment from an installable release (`uv venv`, then "
+                "reinstall what it needs) and pack again."
+            )
+        return (
+            ErrorClass.UNKNOWN,
+            f"Installing dependencies failed because {req} is not on the package "
+            f"index this rebuild installs from — and cannot be: a `+{label}` build "
+            f"never lands on the public index (it carries at most the plain "
+            f"{pin.group(1)}=={base}), and this nest recorded no direct download "
+            f"address for it. This is not a CUDA or GPU problem — no driver or "
+            f"hardware change fixes it, and re-running here will not help. {fix}",
         )
     if "torch" in low and any(m in low for m in _TORCH_CONFLICT_MARKERS):
         return (
@@ -2460,6 +2663,8 @@ def restore(
         # stays in the cached tally, and the closing line reports more files than the
         # nest holds. Keyed by object identity: two entries may share one landing path.
         "counted_as_cached": set(),
+        #: What the S0 lock probe concluded, kept for --plan. None = no verdict.
+        "lock_probe": None,
     }
     t_run = time.monotonic()
     failure: NestFailure | None = None
@@ -2499,7 +2704,10 @@ def restore(
         )
 
     # -- fetch primitive: resume skip -> round retry (backoff) -> journal bookkeeping --
-    def fetch_one(it: PlanItem) -> tuple[str, ResolveReport | None]:
+    # ``stage`` labels the narration only (the S0 lock probe fetches the lock early);
+    # failure attribution below stays S1 — that is the transfer contract, and the
+    # probe catches and downgrades it rather than letting a fetch hiccup block S0.
+    def fetch_one(it: PlanItem, stage: str = "S1") -> tuple[str, ResolveReport | None]:
         assert journal is not None
         if (
             opts.resume
@@ -2509,13 +2717,13 @@ def restore(
             if opts.reverify:
                 if _sha256_file(it.dest) == it.sha256:
                     return "cached", None
-                narrate(f"--reverify found a mismatch, downloading again: {it.label}", stage="S1", level="warning")
+                narrate(f"--reverify found a mismatch, downloading again: {it.label}", stage=stage, level="warning")
             elif it.dest.stat().st_size == it.size_bytes:
                 return "cached", None
             else:
                 narrate(
                     f"An earlier run marked this done, but the size is wrong — downloading again: {it.label}",
-                    stage="S1", level="warning",
+                    stage=stage, level="warning",
                 )
         if it.sha256 in gated_origin and it.dest.is_file() and _sha256_file(it.dest) == it.sha256:
             # A restricted asset (one that does not travel with the nest) was
@@ -2549,7 +2757,7 @@ def restore(
             )
         narrate(
             f"Downloading {it.label} ({it.size_bytes} bytes)",
-            stage="S1",
+            stage=stage,
             blob_sha256=it.sha256,
             blob_path=it.label,
             blob_status="start",
@@ -2581,7 +2789,7 @@ def restore(
                     wait = round(opts.backoff_base_s * (2 ** (rnd - 1)), 3)
                     narrate(
                         f"Every source failed on attempt {rnd}; retrying in {wait}s: {it.label}",
-                        stage="S1",
+                        stage=stage,
                         level="warning",
                         blob_sha256=it.sha256,
                         blob_path=it.label,
@@ -2905,10 +3113,263 @@ def restore(
                 + " (--force goes ahead anyway; the report still records the truth)",
                 context={"checks": [c.name for c in rejects]},
             )
+        # Only after the machine itself passed (or was forced past): can the
+        # dependency lock resolve at all? Asked **before any model bytes move** —
+        # the failure this catches used to surface at S3, after a 64 GB download
+        # had been paid for (real machine, 2026-09-06).
+        _probe_note = s0_lock_probe()
+        # Kept for --plan, which has to say what the dependency step is expected
+        # to do. None = the probe reached no verdict (see s0_lock_probe).
+        state["lock_probe"] = _probe_note
         if pr.overall == "reject":
             narrate("⚠ Failed checks are being ignored because you passed --force — the report still records them", stage="S0", level="warning")
             return "checks failed (forced through, recorded as such)"
-        return f"machine check: {pr.overall}"
+        return f"machine check: {pr.overall}" + (f"; {_probe_note}" if _probe_note else "")
+
+    def s0_lock_probe() -> str | None:
+        """Ask uv whether this nest's dependency lock can resolve, before S1 moves
+        a byte. This is the long-planned lock-reinstallability pre-check, done by
+        measurement instead of shape-guessing: the probe runs the same resolution
+        the S3 install will run, so it needs no image-digest signal to avoid
+        false alarms.
+
+        **Only a definitive "no solution" verdict blocks**, and `--force` goes
+        ahead anyway (same word as every other S0 check — but --force only steps
+        past the *verdict*; the source guard below is not an S0 check and no flag
+        here bypasses it). Anything else — upstream unreachable, uv missing, a
+        build the probe refuses to run (`--no-build`), an editable path that only
+        lands at S2 — is inconclusive: the probe stays quiet and the S3 install
+        remains the authority. A probe that can turn a flaky network into a
+        refusal would be worse than no probe.
+
+        Returns a short note for the S0 detail line, or None when it had nothing
+        to say.
+        """
+        assert plan is not None and journal is not None
+        lock_item = next((i for i in plan.items if i.role == "python_lock"), None)
+        if lock_item is None:
+            return None
+        if (
+            opts.resume
+            and journal.stage("S3:deps").get("lock_sha256") == plan.lock_sha256
+            and (target / ".venv" / "bin" / "python").exists()
+        ):
+            return None  # S3 will skip the install; there is nothing to predict
+        try:
+            fetch_one(lock_item, stage="S0")
+        except NestFailure:
+            # A fetch problem is S1's to report with its own attribution and
+            # retries; the probe must not steal that failure and mislabel it.
+            return None
+        try:
+            lock_text = lock_item.dest.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        # **Resolve the env-root marker before anything judges this text**, the
+        # same order S3 uses below. It is a plain string substitution — no
+        # command runs, no host is contacted — so doing it first takes nothing
+        # away from the guard underneath; it only decides *which text* gets
+        # judged, and the right answer is the text uv would be handed.
+        #
+        # Judged with the marker still in it, `file://__RENEST_ENV_ROOT__/x` has
+        # a **non-empty hostname** (`__renest_env_root__`), and the file://
+        # exemption in audit_lock_urls requires an empty host — so `env_root`
+        # never gets a chance to apply and the guard reads it as an unrecognised
+        # server. The whole probe was then skipped, silently, for every nest
+        # packed from an in-place install (kohya_ss and LLaMA-Factory's standard
+        # `pip install -e .`) — exactly the nests whose 64 GB of downloads this
+        # probe exists to save. Measured, not reasoned: with the token present
+        # audit_lock_urls returns the URL even when env_root is passed; on the
+        # resolved text it returns nothing. The escape hatch had the identical
+        # defect in the identical place and was fixed the same way (2026-09-07).
+        probe_path = lock_item.dest
+        if ENV_ROOT_TOKEN in lock_text:
+            lock_text = resolve_env_root_token(lock_text, target)
+            probe_path = target / STAGING_REL / "requirements.probe.lock"
+            probe_path.parent.mkdir(parents=True, exist_ok=True)
+            probe_path.write_text(lock_text, encoding="utf-8")
+        # [SECURITY-REVIEW] The probe hands this lock to uv, which connects to
+        # every index the text names — and the S3 gate that vets those hosts
+        # (and makes the receiver name the sender) has not run yet. A lock that
+        # names any un-vetted source is therefore not probed at all: connecting
+        # first and asking later would let a handed-off nest reach its server
+        # before the human said yes. **Same symbol as S3's refusal**
+        # (unvetted_lock_sources), so the two judgements cannot drift; baseline
+        # reading (no host flags) for a handed-off nest, exactly like S3's
+        # sender gate. Skipping is always safe: it only defers to S3.
+        if handed_off_from and unvetted_lock_sources(lock_text, env_root=target):
+            return None
+        if unvetted_lock_sources(lock_text, trust_hosts=opts.trust_hosts, env_root=target):
+            return None
+        probe_env: dict[str, str] = {}
+        if opts.package_source:
+            if unvetted_lock_sources(
+                f"--index-url {opts.package_source}", trust_hosts=opts.trust_hosts
+            ):
+                return None  # S3 refuses this source properly; do not touch it here
+            probe_env["UV_DEFAULT_INDEX"] = opts.package_source
+        try:
+            r = runner(
+                [
+                    uv_executable(), "pip", "compile", str(probe_path),
+                    "--python-version", plan.python_version,
+                    # Never build an sdist just to predict: slow, and it can fail
+                    # for reasons (missing compilers) the probe must not turn
+                    # into a block.
+                    "--no-build",
+                ],
+                env=probe_env or None,
+                # The probe is the one runner call that carries a cap: hanging S0
+                # on a pathological resolution is worse than a missed early
+                # verdict. The install and post_install calls never pass one.
+                timeout=_PROBE_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            narrate(
+                f"The dependency pre-check did not answer within "
+                f"{int(_PROBE_TIMEOUT_S)}s, so it says nothing this run — the "
+                f"real install decides, exactly as if this check did not exist.",
+                stage="S0",
+            )
+            return None
+        if r.returncode == 0:
+            return "the dependency list resolves"
+        flat = " ".join((r.stderr or "").lower().split())
+        if "no solution found" not in flat or any(m in flat for m in _PROBE_ONLY_ARTIFACTS):
+            return None  # not a resolution verdict — S3 will say it properly
+        klass, why = classify_deps_failure(r.stderr or "")
+        if klass is ErrorClass.UPSTREAM_UNREACHABLE:
+            return None
+        human = (
+            f"{why} (Found by the pre-check, before any model bytes were "
+            f"downloaded; --force skips this check and tries the full run anyway.)"
+        )
+        if opts.force:
+            narrate(f"⚠ {human}", stage="S0", level="warning")
+            return "lock does not resolve (forced past)"
+        # S0's vocabulary has no dependency class, and inventing one is a format
+        # change — so this rides the stage's unclassified slot (exit 60) and the
+        # human line above carries the true attribution.
+        raise NestFailure("S0", ErrorClass.UNKNOWN, human, detail=(r.stderr or "")[-400:])
+
+    # -- --plan: what this rebuild would do, said before it does any of it --
+    def _already_here(it: PlanItem) -> bool:
+        """Whether this file is on the disk already, judged the way S1 judges it.
+
+        Same test S1 uses to skip a download (journal says verified + the size on
+        disk matches), so the plan's "already here" count is the count S1 will
+        actually skip — not an optimistic guess made by different rules.
+        """
+        if not it.dest.is_file():
+            return False
+        if journal is not None and journal.blob(it.sha256).get("status") == BLOB_VERIFIED:
+            return it.dest.stat().st_size == it.size_bytes
+        return _sha256_file(it.dest) == it.sha256
+
+    def _build_plan() -> dict:
+        assert plan is not None
+        files, to_pull, already = [], 0, 0
+        for it in plan.items:
+            here = _already_here(it)
+            already += 1 if here else 0
+            to_pull += 0 if here else it.size_bytes
+            files.append({
+                "path": it.label,
+                "role": it.role,
+                "size_bytes": it.size_bytes,
+                "already_here": here,
+                "hosts": _hosts_of([s.url for s in it.sources]),
+            })
+        checks = (report.precheck or {}).get("checks") or []
+        libs = every_missing_library(
+            [], report.precheck)  # what the packed run loaded and this machine lacks
+        arch = next((c for c in checks if c.get("name") == "chip_family"), None)
+        # The one free-text shell command a manifest may carry, **quoted verbatim**:
+        # the whole point of reading a plan before running someone else's nest is
+        # seeing this text with your own eyes, so it is never summarised.
+        setup: list[dict] = []
+        if isinstance(mani.get("post_install"), str) and mani["post_install"].strip():
+            setup.append({"where": "this nest", "command": mani["post_install"]})
+        for dep in mani.get("code_deps", []) or []:
+            cmd = dep.get("post_install") if isinstance(dep, dict) else None
+            if isinstance(cmd, str) and cmd.strip():
+                setup.append({"where": dep.get("name") or "a code folder", "command": cmd})
+        return {
+            "nest_id": plan.nest_id,
+            "target": str(target),
+            "handed_off_from": handed_off_from,
+            "transfer": {
+                "files_total": len(plan.items),
+                "already_here": already,
+                "to_fetch": len(plan.items) - already,
+                "bytes_to_fetch": to_pull,
+                "bytes_total": plan.total_bytes,
+                "files": files,
+            },
+            "dependencies": {
+                # None = the probe reached no verdict this run; it never guesses.
+                "resolve_probe": state["lock_probe"],
+                "hosts": (mani.get("python_lock") or {}).get("hosts") or [],
+                "python_version": plan.python_version,
+            },
+            "machine": {
+                "missing_system_libraries": libs,
+                "architecture": (arch or {}).get("reason"),
+                "warnings": [c.get("reason") for c in checks
+                             if c.get("level") in (LEVEL_WARN, "reject") and c.get("reason")],
+            },
+            # Files this nest does not carry, and what each one needs from you.
+            "gated": report.gated,
+            "setup_commands": setup,
+        }
+
+    def _narrate_plan(p: dict) -> None:
+        t = p["transfer"]
+        narrate(
+            f"Plan only — nothing has been fetched and nothing has been written. "
+            f"Nest {p['nest_id']} would rebuild into {p['target']}.",
+            stage="S0",
+        )
+        narrate(
+            f"Files: {t['files_total']} in total; {t['already_here']} already on this "
+            f"disk, {t['to_fetch']} to fetch ({t['bytes_to_fetch']} bytes).",
+            stage="S0",
+        )
+        d = p["dependencies"]
+        narrate(
+            "Dependencies: "
+            + (d["resolve_probe"] or "not checked this run — the rebuild decides")
+            + (f"; installs from {', '.join(d['hosts'][:4])}" if d["hosts"] else ""),
+            stage="S0",
+        )
+        if p["machine"]["missing_system_libraries"]:
+            narrate(
+                "This machine is missing library file(s) the packed run used: "
+                + ", ".join(p["machine"]["missing_system_libraries"][:6]),
+                stage="S0", level="warning",
+            )
+        for line in p["machine"]["warnings"][:6]:
+            narrate(f"⚠ {line}", stage="S0", level="warning")
+        for g in p["gated"]:
+            narrate(
+                f"Does not travel with this nest: {g['path']} — {g.get('detail') or g.get('reach')}",
+                stage="S0", level="info" if g.get("reach") == "free" else "warning",
+            )
+        # Said last and in full: it is the one thing a plan exists to show before
+        # you run a nest somebody handed you.
+        if p["setup_commands"]:
+            who = p["handed_off_from"]
+            narrate(
+                f"This nest runs {len(p['setup_commands'])} setup command(s) on this "
+                f"machine, in full below"
+                + (f". {who} handed it to you — read them before you run it."
+                   if who else ". Read them before you run it."),
+                stage="S0", level="warning",
+            )
+            for s in p["setup_commands"]:
+                narrate(f"  [{s['where']}] {s['command']}", stage="S0", level="warning")
+        else:
+            narrate("This nest runs no setup commands of its own.", stage="S0")
 
     # -- S1 download --
     def s1_download() -> str:
@@ -3293,9 +3754,7 @@ def restore(
         # [SECURITY-REVIEW] Dependency-source allowlist: the lock was written by
         # the sender, and uv pip sync will happily go to any host it names and
         # install executable bytes. Audit before installing; block untrusted
-        # sources outright.
-        from .wheels import trusted_lock_hosts
-
+        # sources outright (unvetted_lock_sources — shared with the S0 probe).
         lock_text = lock_path.read_text(encoding="utf-8", errors="replace")
         # The pack side turned the absolute path an editable install leaves
         # behind into a token; swap it for **this machine's** rebuild root before
@@ -3316,10 +3775,13 @@ def restore(
         # first and naming a host would switch the sender gate off too, so
         # attacker-supplied instructions saying `--trust-host evil.io` would walk
         # straight through. Only then does this run's --trust-host decide whether
-        # we still block.
-        baseline_untrusted = audit_lock_urls(lock_text, trusted=trusted_lock_hosts(), env_root=target)
-        allow = trusted_lock_hosts() | {h.strip().lower() for h in opts.trust_hosts if h.strip()}
-        untrusted = audit_lock_urls(lock_text, trusted=frozenset(allow), env_root=target)
+        # we still block. Both readings go through unvetted_lock_sources — the
+        # same symbol the S0 probe's guard calls, on purpose (never two copies
+        # of this judgement).
+        baseline_untrusted = unvetted_lock_sources(lock_text, env_root=target)
+        untrusted = unvetted_lock_sources(
+            lock_text, trust_hosts=opts.trust_hosts, env_root=target
+        )
         # For a nest someone handed you: the blanket bypass is never honoured
         # (that exists for automation running its own nests), and beyond naming
         # the host the sender must be named too — what the receiver really has
@@ -3424,7 +3886,9 @@ def restore(
         # somebody else handed them.
         _deps_env = {"VIRTUAL_ENV": str(venv)}
         if opts.package_source:
-            bad_src = audit_lock_urls(f"--index-url {opts.package_source}", trusted=allow)
+            bad_src = unvetted_lock_sources(
+                f"--index-url {opts.package_source}", trust_hosts=opts.trust_hosts
+            )
             if bad_src:
                 raise NestFailure(
                     "S3",
@@ -3842,6 +4306,15 @@ def restore(
             "lived on the machine it was packed on."
         )
         run_stage("S0", s0_precheck)
+        if opts.plan_only:
+            # Every S0 check has run; stop here, **before S1 moves a byte**, and
+            # say what the rebuild would do. Both halves: narrated for a person,
+            # `report.plan` for a script.
+            report.plan = _build_plan()
+            _narrate_plan(report.plan)
+            report.ok = True
+            report.exit_code = int(ExitCode.OK)
+            return report
         run_stage("S1", s1_download, start_extra={"bytes_total": plan.total_bytes})
         run_stage("S2", s2_place)
         run_stage("S3", s3_deps)
@@ -4050,7 +4523,13 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--dir", required=True, help="where to rebuild everything")
     parser.add_argument("--blob-base", default="", help="base URL for the files, when the nest lists no sources and you have no restore code")
-    parser.add_argument("--skip-precheck", action="store_true")
+    parser.add_argument(
+        "--skip-precheck",
+        action="store_true",
+        help="Skip the S0 checks of this machine. That includes the dependency-lock "
+             "resolve probe, which is what catches a lock this machine can never "
+             "install — before the model files are downloaded rather than after",
+    )
     parser.add_argument("--force", action="store_true", help="carry on even if this machine failed the checks")
     parser.add_argument(
         "--resume", action=argparse.BooleanOptionalAction, default=True, help="carry on where a previous run stopped (on by default)"
@@ -4088,6 +4567,18 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         help="only check whether the files that do not travel with this nest can be "
              "fetched on this machine, then stop. Needs no GPU — run it on your laptop "
              "before you rent anything",
+    )
+    parser.add_argument(
+        "--plan",
+        action="store_true",
+        dest="plan_only",
+        help="check this machine, then say what the rebuild would do — and stop there, "
+             "before a single byte is fetched. Lists what would be downloaded (and what "
+             "is already here), whether the dependency list resolves, anything the "
+             "machine is missing, what this nest does not carry, and **every setup "
+             "command it would run on this machine, in full**. Worth making a habit of "
+             "for a nest somebody handed you: read it first, then run it. Add --json for "
+             "the same answer in machine-readable form",
     )
     parser.add_argument(
         "--no-setup",
@@ -4129,6 +4620,7 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
         package_source=args.package_source,
         no_setup=args.no_setup,
         check_only=args.check_only,
+        plan_only=getattr(args, "plan_only", False),
         blob_base=args.blob_base,
         retry_rounds=args.retry_rounds,
         ssim_threshold=args.ssim_threshold,

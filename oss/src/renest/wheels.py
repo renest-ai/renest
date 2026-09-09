@@ -404,6 +404,60 @@ _WHEEL_PLATFORM_TAG: dict[str, str] = {
 }
 
 
+#: Which operating system a wheel's platform tag names. A wheel built for one of these
+#: does not install on another, **however well the architecture matches**: ``x86_64``
+#: appears in ``macosx_10_13_x86_64``, ``manylinux_2_17_x86_64``, ``musllinux_1_2_x86_64``
+#: and ``linux_x86_64`` alike.
+_OS_OF_PLATFORM_TAG = (
+    ("manylinux", "linux-gnu"),
+    ("musllinux", "linux-musl"),
+    ("linux_", "linux-gnu"),      # the bare tag a vendor index uses (`linux_x86_64`)
+    ("macosx", "macos"),
+    ("win32", "windows"),
+    ("win_", "windows"),
+    ("win-", "windows"),
+)
+
+
+def platform_tag_os(tag: str) -> str | None:
+    """Which operating system this wheel platform tag names (``None`` = we don't know it).
+
+    ``None`` means **reject**, not "probably fine": an unknown tag (``android_``, ``ios_``,
+    some future one) is exactly the case where guessing writes another machine's bytes
+    into the lock.
+    """
+    t = tag.lower()
+    for prefix, os_name in _OS_OF_PLATFORM_TAG:
+        if t.startswith(prefix):
+            return os_name
+    return None
+
+
+def wheel_os_family(system: str | None = None) -> str:
+    """The operating system whose wheels this machine installs, as ``platform_tag_os``
+    names them. Reads the local machine unless told.
+
+    Linux splits by C library, because a musllinux wheel does not run on glibc and the
+    reverse: ``platform.libc_ver()`` answers ``('glibc', …)`` on a glibc machine and
+    says nothing useful on musl, so **glibc is what we conclude only when it says so**;
+    anything else on Linux is decided by looking for musl's loader on disk.
+    """
+    sys_name = (system or platform.system()).strip().lower()
+    if sys_name == "darwin":
+        return "macos"
+    if sys_name == "windows":
+        return "windows"
+    if sys_name != "linux":
+        return sys_name or "linux-gnu"
+    try:
+        if (platform.libc_ver()[0] or "").lower().startswith("glibc"):
+            return "linux-gnu"
+    except Exception:  # noqa: BLE001 - a probe that cannot answer must not crash a pack
+        pass
+    musl = any(Path("/lib").glob("ld-musl-*")) if Path("/lib").is_dir() else False
+    return "linux-musl" if musl else "linux-gnu"
+
+
 def wheel_platform_tags(machine: str | None = None) -> tuple[str, ...]:
     """Which build of a package this machine should take; asks the local machine when
     ``machine`` is not given.
@@ -431,19 +485,29 @@ def pin_lock_text(
     Only lines carrying a local version (``+xxx``) are touched; the rest are kept as they
     are -- they exist on PyPI and uv can find them itself.
 
-    **The operating system's own rebuilds are left alone.** ``python-apt==2.4.0+ubuntu3``
-    carries a local version too, and asking a vendor index for it can only 404 -- which
-    used to abort the whole run and throw away the vendor wheels already found. Nothing is
-    hidden by skipping them: packing warns about that group separately, with the only fix
-    that works for it (build the environment in a virtual environment).
+    **The operating system's own rebuilds and image-baked builds are left alone.**
+    ``python-apt==2.4.0+ubuntu3`` and ``torch==2.1.0a0+gitc263bd4`` carry a local
+    version too, and asking a vendor index for either can only 404 -- which used to
+    abort the whole run and throw away the vendor wheels already found. Nothing is
+    hidden by skipping them: packing warns about each group separately, with the
+    only fix that works for it (build the environment in a virtual environment).
     """
-    from .envlock import distro_owned_packages
+    from .envlock import distro_owned_packages, image_build_evidence
 
     own = client is None
     c = client if client is not None else httpx.Client(follow_redirects=True, timeout=FETCH_TIMEOUT)
     out: list[str] = []
     pinned: list[tuple[str, str]] = []
-    owned_by_the_os = set(distro_owned_packages(lock_text))
+    # Image-baked builds (torch==2.1.0a0+gitc263bd4, bare-hash container builds)
+    # are left alone for the same reason as the OS group, via the same recogniser
+    # the pack/lint exemption uses (envlock.image_build_evidence — one definition,
+    # never a second copy): they are published on no index, so asking the vendor
+    # index can only 404, which aborts the whole run and throws away the vendor
+    # wheels already found. With pinning on by default (2026-09-06) that abort
+    # would turn every NGC-style environment into a hard failure with no way
+    # through the panel. Nothing is hidden by skipping: packing warns about that
+    # group separately, with the only fix that works for it.
+    skip = set(distro_owned_packages(lock_text)) | set(image_build_evidence(lock_text))
     try:
         for line in lock_text.splitlines():
             m = _REQ.match(line)
@@ -451,7 +515,7 @@ def pin_lock_text(
                 out.append(line)
                 continue
             name, version = m.group(1), m.group(2)
-            if "+" not in version or line.split("#", 1)[0].strip() in owned_by_the_os:
+            if "+" not in version or line.split("#", 1)[0].strip() in skip:
                 out.append(line)
                 continue
             base, local_label = version.split("+", 1)
@@ -556,18 +620,85 @@ def pypi_index() -> str:
 #: A pure-Python package carries no platform words; its file name holds ``-none-any``.
 _ANY_PLATFORM = "none-any"
 
+#: ``cp311`` / ``py39`` / ``pp310`` -> the Python minor version the tag names.
+_TAG_MINOR = re.compile(r"^(?:cp|py|pp)3(\d+)$")
 
-def _wheel_matches(filename: str, python_tag: str, platform_tags: tuple[str, ...]) -> bool:
+
+def _tag_minor(tag: str) -> int | None:
+    """The Python 3 minor version a compatibility tag names, or ``None`` for ``py3``."""
+    m = _TAG_MINOR.match(tag)
+    return int(m.group(1)) if m else None
+
+
+def _python_tag_matches(tag: str, abi_tags: list[str], want: str) -> bool:
+    """Whether a wheel carrying compatibility tag ``tag`` installs on ``want`` (``cp311``).
+
+    Three ways a wheel can be installable, and **only the first used to be recognised**:
+
+    * the exact interpreter (``cp311``);
+    * ``py3`` -- built for any Python 3, which is what a package ships when it has
+      compiled parts but no C extension against the interpreter (bitsandbytes ships
+      ``py3-none-manylinux_2_24_x86_64``: platform-specific, interpreter-agnostic);
+    * the **stable ABI** (``cp37-abi3-...``), which installs on that Python and every
+      later one.
+    """
+    if tag == want:
+        return True
+    if not want.startswith(("cp3", "pp3", "py3")):
+        return False
+    if tag == "py3":
+        return True
+    built, target = _tag_minor(tag), _tag_minor(want)
+    if built is None or target is None:
+        return False
+    if tag.startswith("py"):  # ``py39`` = this Python 3 minor or later
+        return built <= target
+    return "abi3" in abi_tags and built <= target
+
+
+def _platform_matches(
+    plat_tags: list[str], platform_tags: tuple[str, ...], os_family: str
+) -> bool:
+    """Whether one of the wheel's platform tags is one this machine can install.
+
+    **The architecture must be the whole tail of the tag, and the operating system must
+    be ours.** Asking only "does the tag contain ``x86_64``" says yes to
+    ``macosx_10_13_x86_64`` — and on 2026-09-09 it did: a fine-tune nest packed on Linux
+    carried the macOS build's fingerprint for ``pyyaml==6.0.3``, the rebuild downloaded
+    the manylinux build as it should, the two did not match, and the restore stopped at
+    S3 (RC=30) with the model files already paid for. The wrong answer was **worse than
+    no answer**: without it the lock simply had no fingerprints and installed fine.
+    """
+    for q in plat_tags:
+        if q == "any":
+            return True
+        if platform_tag_os(q) != os_family:
+            continue
+        if any(q == p or q.endswith(f"_{p}") for p in platform_tags):
+            return True
+    return False
+
+
+def _wheel_matches(filename: str, python_tag: str, platform_tags: tuple[str, ...],
+                   os_family: str = "linux-gnu") -> bool:
     """Whether this package file is one this machine can actually install.
 
-    Two kinds count: **pure Python** (``none-any`` in the file name, identical on every
-    machine) and **built for this machine and this Python version**.
+    Reads the wheel's own compatibility tags (PEP 427: the last three dash-separated
+    fields are the Python, ABI and platform tags, each a dot-joined set) rather than
+    searching the whole name for substrings. Substring search called
+    ``bitsandbytes-0.50.2-py3-none-manylinux_2_24_x86_64.whl`` a non-match -- it holds
+    neither ``none-any`` nor ``-cp311-`` -- and one unmatched package throws away the
+    fingerprints of the whole lock, because it is all or nothing.
     """
-    if _ANY_PLATFORM in filename:
-        return True
-    if f"-{python_tag}-" not in filename:
+    if not filename.endswith(".whl"):
         return False
-    return any(p in filename for p in platform_tags)
+    fields = filename[: -len(".whl")].split("-")
+    if len(fields) < 5:  # name-version[-build]-python-abi-platform
+        return False
+    py_tags, abi_tags, plat_tags = (f.split(".") for f in fields[-3:])
+    if not _platform_matches(plat_tags, platform_tags, os_family):
+        return False
+    return any(_python_tag_matches(t, abi_tags, python_tag) for t in py_tags)
 
 
 def artifact_hash(
@@ -578,6 +709,7 @@ def artifact_hash(
     *,
     client: httpx.Client,
     index: str | None = None,
+    os_family: str = "linux-gnu",
 ) -> str | None:
     """Look up the **content fingerprint** of this package version on the index.
 
@@ -597,8 +729,17 @@ def artifact_hash(
     except Exception:  # noqa: BLE001 - not found is not found; never crash the whole pack
         return None
 
-    dist = name.replace("-", "_")
-    want = (f"{dist}-{version}-", f"{name}-{version}.tar.gz", f"{dist}-{version}.tar.gz")
+    # **Matched without case, because the file name's case is the packager's choice, not
+    # ours.** A lock records the name as the installed package declares it (``Jinja2``,
+    # ``Werkzeug``, ``Markdown``), while these projects now publish lower-cased files
+    # (``jinja2-3.1.4-py3-none-any.whl``). Comparing as written missed all three, and one
+    # miss drops the fingerprints of every other package in the lock with it.
+    dist = name.replace("-", "_").lower()
+    want = (
+        f"{dist}-{version}-",
+        f"{name.lower()}-{version}.tar.gz",
+        f"{dist}-{version}.tar.gz",
+    )
     sdist: str | None = None
     for href in _HREF.findall(page):
         filename = unquote(href.split("#", 1)[0].rsplit("/", 1)[-1])
@@ -606,10 +747,11 @@ def artifact_hash(
         if not frag.startswith("sha256="):
             continue
         digest = frag[len("sha256="):]
-        if filename.endswith(".whl") and filename.startswith(want[0]):
-            if _wheel_matches(filename, python_tag, platform_tags):
+        lowered = filename.lower()
+        if filename.endswith(".whl") and lowered.startswith(want[0]):
+            if _wheel_matches(filename, python_tag, platform_tags, os_family):
                 return digest
-        elif filename in want[1:]:
+        elif lowered in want[1:]:
             sdist = digest
     return sdist
 
@@ -620,6 +762,7 @@ def add_hashes(
     platform_tags: tuple[str, ...],
     *,
     client: httpx.Client | None = None,
+    os_family: str = "linux-gnu",
 ) -> tuple[str, int, list[str]]:
     """Add a content fingerprint to every line of the lock text.
 
@@ -657,7 +800,8 @@ def add_hashes(
                 # the pinned-URL route, and that address carries its own fingerprint
                 out.append(line)
                 continue
-            digest = artifact_hash(name, version, python_tag, platform_tags, client=c)
+            digest = artifact_hash(name, version, python_tag, platform_tags,
+                                   client=c, os_family=os_family)
             if digest is None:
                 missing.append(f"{name}=={version}")
                 out.append(line)

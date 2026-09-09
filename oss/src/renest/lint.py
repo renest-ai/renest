@@ -26,15 +26,29 @@ from pathlib import Path, PurePosixPath
 
 import httpx
 
-from .envlock import canonical_name
+from .envlock import canonical_name, vendor_only_locals
 from .errors import ExitCode
 from .integrity import probe_model_bytes
+# Nest invariants (2026-09-06): the judgments below are shared with the
+# pack exit, one source for both consumers. Finding codes come from the
+# violations themselves. I-1 (`local-version-not-pinned`) is voiced by this
+# file's own vendor_only_locals block below — same predicate, not re-wired.
+from .invariants import (
+    i3_workflow_references_travel,
+    i4_model_entries_carry_licence,
+    i5_base_image_absence_is_recorded,
+)
 from .roots import MAX_MANIFEST_FILES, bad_entrypoint_env
 from .syslibs import lock_requirements
 
 #: URLs inside the lock text. Same shape as ``wheels._ANY_URL``; lint does not
 #: import wheels, to keep its dependency surface thin.
 _ANY_URL_IN_LOCK = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://[^\s'\"#]+")
+
+#: A lock line pinned to a direct wheel address. Same shape as ``wheels._PINNED``
+#: (same thin-surface reason as above); counted against the manifest's
+#: ``pinned_wheel_urls`` ledger.
+_PINNED_LINE = re.compile(r"^\s*[A-Za-z0-9][A-Za-z0-9._-]*\s*@\s*https?://\S+\.whl(?:#\S+)?\s*$")
 
 #: The shapes a fill-this-in blank actually takes, exactly as the pack skeletons
 #: emit them. **Only these count, not "it contains an angle bracket"**: this check
@@ -285,11 +299,8 @@ def lint(
     # absence and lint names what is missing, with no completeness flag invented
     # for it. Placeholder text, by contrast, is an error -- an absent field is
     # honest, placeholder text pretends the field was filled in.
-    if not m.get("base_image"):
-        warn("base-image-missing",
-             "this nest doesn't say which container image it was built on. That is allowed "
-             "(a container often cannot see its own image name) and rebuilding never needed "
-             "it — but whoever rebuilds loses the one clue about the system layer underneath.")
+    for _v in i5_base_image_absence_is_recorded(m, "", ()):  # I-5: same text as ever
+        warn(_v.code, _v.message)
     if not (m.get("python_lock") or {}).get("lockfile"):
         warn("lockfile-missing",
              "this nest carries no dependency lockfile, so the Python environment cannot be "
@@ -356,6 +367,33 @@ def lint(
              "machine that ran this workload. A rebuild would warn against it on every "
              "machine. Re-measure, or omit the block -- absent reads as 'not measured', "
              "which is honest; a tiny figure reads as a real ceiling, which is not.")
+
+    # Format 2.11: the evidence block. The schema holds the shape (an object with a
+    # `source` from a fixed list); these are the two relations it cannot say.
+    _fv = str(m.get("format_version") or "")
+    _evb = m.get("evidence")
+    _has_verified_run = any(
+        isinstance(_a, dict) and _a.get("verified_run")
+        for _a in (m.get("adapters") or {}).values()
+    )
+    if isinstance(_evb, dict) and _evb.get("source") == "none" and _has_verified_run:
+        err("evidence-source-contradicts-verified-run",
+            "this nest says `evidence.source: none` -- looked for proof of a finished "
+            "run and found none -- while an adapter carries a `verified_run` block, "
+            "which is that proof. One of the two is wrong, and a reader has no way to "
+            "tell which, so neither can be trusted.")
+    # Absent is a legitimate answer for an older nest and for one packed from a
+    # hand-written spec, but a nest written to this version by a route that looked
+    # should say what it found. Deliberately a warning, and deliberately not an
+    # inference: nothing here fills the block in, because inventing `none` is the
+    # exact failure the field exists to prevent.
+    if _fv and _fv not in ("2.0", "2.1", "2.2", "2.3", "2.4", "2.5", "2.6", "2.7",
+                           "2.8", "2.9", "2.10") and not isinstance(_evb, dict):
+        warn("evidence-block-missing",
+             f"this nest declares format {_fv} and carries no `evidence` block, so it "
+             "does not say whether anyone ever saw this environment work. Absent is "
+             "read as 'nobody looked' -- which is the honest reading for a nest built "
+             "from a hand-written spec, and a gap for one packed from an environment.")
 
     # Format 2.8: contested modules. The schema holds the shape (the fingerprint
     # must be 64 lower-case hex characters, the method one of two words); this is
@@ -469,6 +507,12 @@ def lint(
         if um.get("state") == "no_upstream" and (c.get("repo_url") or c.get("commit")):
             err("upstream-contradiction",
                 f"{c.get('name')} says it has no upstream, but names a repo or commit")
+
+    # I-4 (invariants.py, shared with the pack exit): a model-weight entry with
+    # no license block at all. Pack-built manifests always carry one, so this
+    # names nests built by hand or by other tools.
+    for _v in i4_model_entries_carry_licence(m, "", ()):
+        warn(_v.code, _v.message)
 
     for f in m.get("files", []):
         lic = f.get("license", {})
@@ -664,10 +708,11 @@ def lint(
         lock_blob = (m.get("python_lock") or {}).get("lockfile") or {}
         lock_path = base / str(lock_blob.get("sha256", ""))[:2] / str(lock_blob.get("sha256", ""))
         if lock_blob.get("sha256") and lock_path.exists():
+            _lock_text = lock_path.read_text(errors="replace")
             # Format 2.8: every candidate of a contested module must be a package
             # this lock installs -- the field describes a contest between packages
             # in the lock, and a name outside it describes nothing.
-            _in_lock = {n for n, _ in lock_requirements(lock_path.read_text(errors="replace"))}
+            _in_lock = {n for n, _ in lock_requirements(_lock_text)}
             for _i, _e in enumerate(_cm):
                 for _c in (_e.get("candidates") or []):
                     if isinstance(_c, str) and canonical_name(_c) not in _in_lock:
@@ -675,8 +720,80 @@ def lint(
                             f"runtime.contested_modules[{_i}] ({_e.get('module')}): candidate "
                             f"{_c!r} is not in this nest's dependency lock, so it cannot be "
                             f"one of the packages competing for that folder.")
+            # ---- Vendor-only pins must be direct addresses (the artifact-side gate
+            # behind the pack-side refusal; long planned as the lock-reinstallability
+            # check). A bare `torch==2.11.0+cu128` reads as installable,
+            # verifies green, and a rebuild against the public index can never
+            # install it — a real 64 GB restore died exactly there on 2026-09-06,
+            # after the downloads. Deliberately scoped: distro-owned (`+ubuntu3`)
+            # and image-build (`+gitc263bd4`) pins are different diseases with
+            # different fixes and keep their own pack-time warnings — telling
+            # their owner "--pin-wheels" would send them somewhere it cannot work.
+            _bare = vendor_only_locals(_lock_text)
+            if _bare:
+                _n = ", ".join(ln.split("==")[0].strip() for ln in _bare[:6])
+                _m = f" and {len(_bare) - 6} more" if len(_bare) > 6 else ""
+                err(
+                    "local-version-not-pinned",
+                    f"this nest's dependency lock pins {len(_bare)} build(s) that only a "
+                    f"vendor's own package index carries ({_n}{_m}; e.g. {_bare[0]}), with "
+                    f"no direct download address recorded. The public index has no such "
+                    f"version, so a rebuild dies at the dependency step — after the model "
+                    f"downloads. Re-pack with --pin-wheels while the packing machine "
+                    f"still exists.",
+                )
+            # ---- Format 2.11: a bare vendor pin should at least say which index it
+            # came from, so whoever repairs the lock is not left guessing. A warning,
+            # not an error: the error above already names the real fault (the pin has
+            # no address at all), and stacking a second refusal on the same line would
+            # say the same thing twice.
+            _lvs = (m.get("python_lock") or {}).get("local_version_sources") or {}
+            if _bare and not _lvs:
+                warn(
+                    "local-version-source-unrecorded",
+                    f"this nest's dependency lock carries {len(_bare)} vendor-only pin(s) "
+                    f"and records no index for any of them, so whoever repairs it has "
+                    f"nothing to go on but the version suffix. Packing reads that from the "
+                    f"installed package's own metadata while the environment still exists; "
+                    f"after that it cannot be recovered.",
+                )
+            # The disclosure obligation that came with the field: an index recorded
+            # beside the lock rather than inside it would otherwise be contacted during
+            # a rebuild without ever appearing on the "who will my machine talk to"
+            # surface -- and the escape hatch's source gate reads the lock text, so it
+            # would never see this one at all.
+            _declared_hosts = {
+                str(h).strip().lower()
+                for h in ((m.get("python_lock") or {}).get("hosts") or [])
+                if str(h).strip()
+            }
+            for _pkg, _src in sorted(_lvs.items()):
+                _u = str((_src or {}).get("index_url") or "")
+                _h = _u.split("://", 1)[-1].split("/", 1)[0].split("@")[-1].split(":")[0].lower()
+                if _h and _h not in _declared_hosts:
+                    err(
+                        "local-version-source-host-not-disclosed",
+                        f"python_lock.local_version_sources[{_pkg!r}] names {_h}, which a "
+                        f"rebuild will connect to, but python_lock.hosts does not list it. "
+                        f"Every host this nest reaches out to has to be on that list — a "
+                        f"source disclosed nowhere is exactly the one worth disclosing.",
+                    )
+            # The manifest's pinned_wheel_urls is a disclosure ledger; it must match
+            # the artifact it describes, or one of the two is lying.
+            _declared = (m.get("python_lock") or {}).get("pinned_wheel_urls")
+            _actual = sum(
+                1 for ln in _lock_text.splitlines() if _PINNED_LINE.match(ln)
+            )
+            if _declared is not None and _declared != _actual:
+                err(
+                    "pinned-count-drift",
+                    f"the manifest says {_declared} package(s) are pinned to a direct "
+                    f"download address, but the lock actually carries {_actual} such "
+                    f"line(s). The ledger and the artifact disagree, so one of them is "
+                    f"wrong — re-pack this nest.",
+                )
             wheel_urls = [
-                u for u in _ANY_URL_IN_LOCK.findall(lock_path.read_text(errors="replace"))
+                u for u in _ANY_URL_IN_LOCK.findall(_lock_text)
                 if u.endswith(".whl")
             ]
             # A spot check, not an audit: confirming the host is still alive
@@ -694,6 +811,21 @@ def lint(
                         f"environment still exists; a restore will die at the "
                         f"dependency step.",
                     )
+
+        # ---- 5. I-3 (invariants.py, shared with the pack exit): the recipe's
+        #         references must all be listed in files[]. Only possible here,
+        #         where the recipe's bytes are on hand. ----
+        _wfb = ((m.get("adapters") or {}).get("comfyui") or {}).get("workflow") or {}
+        _wfh = str(_wfb.get("sha256") or "")
+        _wfp = base / _wfh[:2] / _wfh
+        if _wfh and _wfp.is_file():
+            try:
+                _wf = json.loads(_wfp.read_text(encoding="utf-8", errors="replace"))
+            except (json.JSONDecodeError, OSError):
+                _wf = None
+            if isinstance(_wf, dict):
+                for _v in i3_workflow_references_travel(m, "", (), workflow=_wf):
+                    warn(_v.code, _v.message)
 
     return result
 

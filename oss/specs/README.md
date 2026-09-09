@@ -16,7 +16,7 @@
 
 | Component | Version | Status | Document |
 |---|---|---|---|
-| manifest format | 2.10 | **current** | [`manifest.md`](manifest.md) + [`manifest.schema.json`](manifest.schema.json) |
+| manifest format | 2.11 | **current** | [`manifest.md`](manifest.md) + [`manifest.schema.json`](manifest.schema.json) |
 | exit codes / `error_class` | — | frozen baseline | [`restore-protocol.md`](restore-protocol.md) |
 
 Every document here has a Chinese twin alongside it, named `*.cn.md`. The plain

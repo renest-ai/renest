@@ -2,10 +2,10 @@
 # =============================================================================
 # Renest restore.sh — the escape hatch
 #
-# Nest formats this copy reads: 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10  (and, with a warning,
+# Nest formats this copy reads: 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11  (and, with a warning,
 #   any later 2.x — a higher minor version only ever adds optional fields, and
 #   refusing one would turn a nest whose bytes restore perfectly into a brick).
-#   Written for format 2.10, 2026-09-05. Keep this line: from format 2.3 on a
+#   Written for format 2.11, 2026-09-07. Keep this line: from format 2.3 on a
 #   copy of this script travels inside every nest at .renest/escape/restore.sh,
 #   and this comment is how you tell which copy you are holding — there is no
 #   version field anywhere else.
@@ -29,7 +29,7 @@
 # Promise: this script needs only curl, jq, sha256sum (or shasum), tar and uv,
 # plus the stock tools every base system already ships (grep, sed, sort, cut, tr,
 # paste, df, cat, head, tail, wc, ls, mkdir, rm, cp, mv, dirname, basename, date,
-# uname, getconf, tee, sleep, awk, find, chmod, touch, and bash itself). It does not need Renest,
+# uname, getconf, tee, sleep, kill, awk, find, chmod, touch, and bash itself). It does not need Renest,
 # our servers, or anything else we ship. Read it, keep a copy, and you can always
 # rebuild a nest without us.
 # (git was on this list until 2026-08-08 but the script never once called it —
@@ -326,10 +326,28 @@ FV=$(jq -r '.format_version' "$MANIFEST")
 # memory ceiling is lower (loading may be killed for running out of memory); this
 # script only gets the bytes back and does not start the application, so there is
 # nothing here to act on. Every 2.0–2.9 nest restores unchanged.
+# 2.11 (2026-09-07) adds three optional fields. **This script reads two of them, and
+# only ever to tell you something:**
+#   - `evidence` -- whether anyone ever saw this nest work. Printed once, up front, so
+#     you know which of the two nests you are holding: one packed off a run somebody
+#     watched finish, or one packed as the environment stood. It changes nothing about
+#     what this script does. A nest nobody watched work still restores byte for byte,
+#     and refusing one would break the promise this whole script exists for.
+#     **Absent is not the same as "none"**: absent means nobody looked (every nest
+#     older than 2.11 is in that state), "none" means somebody looked and found
+#     nothing. The two are printed differently on purpose.
+#   - `python_lock.local_version_sources` -- which index a vendor-only pin came from,
+#     for the lock lines that were never pinned to a direct download address. Shown
+#     only when the dependency install fails, because that is the moment it helps.
+#     **It is never handed to the installer.** Resolving one package name across two
+#     indexes is what dependency-confusion attacks are made of, and this script will
+#     not loosen that on a nest's say-so.
+# The third (`adapters.comfyui.verified_run.evidence_source`) is disclosure a reader
+# looks at. Every 2.0–2.10 nest restores unchanged: all three are absent there.
 case "$FV" in
-  2.0|2.1|2.2|2.3|2.4|2.5|2.6|2.7|2.8|2.9|2.10) ;;
+  2.0|2.1|2.2|2.3|2.4|2.5|2.6|2.7|2.8|2.9|2.10|2.11) ;;
   2.*)
-    warn "This nest says format $FV; this script knows up to 2.10. Same major version, so it only adds optional fields this script does not use — carrying on. A newer Renest will make full use of them." ;;
+    warn "This nest says format $FV; this script knows up to 2.11. Same major version, so it only adds optional fields this script does not use — carrying on. A newer Renest will make full use of them." ;;
   *)
     # Same three facts the agent side gives, in the same order: how old this nest is,
     # that there is no upgrade path and why, and that the files themselves are fine.
@@ -337,7 +355,7 @@ case "$FV" in
     # is not (the manifest still lists every one of them, with fingerprints).
     _WHEN=$(jq -r '.created_at // empty' "$MANIFEST" 2>/dev/null | cut -c1-10)
     _NFILES=$(jq -r '(.files // []) | length' "$MANIFEST" 2>/dev/null)
-    die FORMAT-VERSION "Unrecognised nest format version: $FV — this script reads format 2.x (knows 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9 and 2.10).${_WHEN:+ This nest was packed on ${_WHEN}.} Nests in the older 1.x format cannot be read here, and **there is no upgrade path**: format 2.0 made it compulsory to say which parts of a nest are the application and which are your own code, and nobody can work that out after the fact.${_NFILES:+ **Your files are not lost** — this nest still lists all ${_NFILES} of them with their fingerprints, so they can be fetched one by one even though the environment cannot be rebuilt automatically.} If you still have the environment, pack it again with a current Renest." ;;
+    die FORMAT-VERSION "Unrecognised nest format version: $FV — this script reads format 2.x (knows 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10 and 2.11).${_WHEN:+ This nest was packed on ${_WHEN}.} Nests in the older 1.x format cannot be read here, and **there is no upgrade path**: format 2.0 made it compulsory to say which parts of a nest are the application and which are your own code, and nobody can work that out after the fact.${_NFILES:+ **Your files are not lost** — this nest still lists all ${_NFILES} of them with their fingerprints, so they can be fetched one by one even though the environment cannot be rebuilt automatically.} If you still have the environment, pack it again with a current Renest." ;;
 esac
 
 # ---- Where the files may land ------------------------------------------------
@@ -820,6 +838,154 @@ if [ -n "$WANT_LIBC" ]; then
 fi
 # END libc-check
 
+# ---- Which servers may we install from? -------------------------------------
+# Whoever packed this nest wrote the lockfile, and uv installs whatever it points
+# at — which means running their code on this machine, with access to everything
+# on it. So this one we refuse rather than warn about. Two ways through: name your
+# own private index in RENEST_TRUSTED_HOSTS, or, if you trust where this nest came
+# from, re-run with TRUST_UNSAFE_URLS=1.
+#
+# Note this list is a snapshot baked into the script. The Renest agent refreshes
+# its copy automatically; this script deliberately does not phone home, so a newly
+# popular source is recognised there before it is recognised here. That is the
+# price of not depending on us — use one of the two ways through above.
+# BEGIN unvetted-lock-urls -- the behaviour test runs exactly these lines, so they cannot drift
+# `/a/./b/../c` -> `/a/c`, **without touching the disk**, so a folder that has not
+# been unpacked yet still gets an answer. `..` pops a segment instead of being
+# carried along, which is what stops a lock from climbing out of the rebuild root
+# with `<root>/../evil`. Same job as the agent side's `_inside()` normalisation.
+# Globbing is switched off around the split: a segment containing `*` would
+# otherwise be expanded into whatever filenames happen to sit in the way.
+lexical_abs_path() {
+  local _p="$1" _out="" _seg _reglob=""
+  case "$_p" in (/*) ;; (*) _p="/$_p" ;; esac
+  case "$-" in (*f*) ;; (*) _reglob=1 ;; esac
+  set -f
+  local IFS=/
+  set -- $_p
+  [ -z "$_reglob" ] || set +f
+  for _seg in "$@"; do
+    case "$_seg" in
+      (''|.) ;;
+      (..) _out="${_out%/*}" ;;
+      (*) _out="$_out/$_seg" ;;
+    esac
+  done
+  printf '%s' "${_out:-/}"
+}
+TRUST_UNSAFE_URLS="${TRUST_UNSAFE_URLS:-}"
+EXTRA_HOSTS=$(printf '%s' "${RENEST_TRUSTED_HOSTS:-}" | tr ';,' '\n\n' | tr -d ' ' | tr 'A-Z' 'a-z')
+# RENEST-TRUSTED-HOSTS-SNAPSHOT-BEGIN
+# ↓ Kept identical to the hosts list in oss/src/renest/data/trusted-hosts.json.
+#   A consistency test (oss/tests/consistency/test_trusted_hosts_snapshot.py)
+#   fails the moment one side is edited without the other.
+TRUSTED_HOSTS_SNAPSHOT="
+pypi.org files.pythonhosted.org download.pytorch.org download-r2.pytorch.org
+pypi.nvidia.com pypi.ngc.nvidia.com data.pyg.org
+developer.download.nvidia.com developer.download.nvidia.cn developer.nvidia.cn
+github.com codeload.github.com objects.githubusercontent.com
+release-assets.githubusercontent.com raw.githubusercontent.com gitlab.com
+huggingface.co hf-mirror.com
+pypi.tuna.tsinghua.edu.cn mirrors.tuna.tsinghua.edu.cn mirrors.bfsu.edu.cn
+mirrors.aliyun.com mirrors.aliyuncs.com mirrors.cloud.aliyuncs.com
+mirrors.cloud.tencent.com mirrors.tencent.com mirrors.tencentyun.com mirror.ccs.tencentyun.com
+repo.huaweicloud.com mirrors.huaweicloud.com mirror.baidu.com mirrors.163.com
+pypi.mirrors.ustc.edu.cn mirrors.ustc.edu.cn mirrors.pku.edu.cn
+mirror.nju.edu.cn mirrors.nju.edu.cn
+mirror.sjtu.edu.cn mirrors.sjtu.edu.cn mirrors.sjtug.sjtu.edu.cn
+mirrors.zju.edu.cn mirrors.hit.edu.cn mirrors.bupt.edu.cn mirrors.cernet.edu.cn
+pypi.douban.com pypi.doubanio.com
+"
+# RENEST-TRUSTED-HOSTS-SNAPSHOT-END
+# Skip whole-line comments, matching the agent's own check exactly — the two
+# must never disagree about the same lockfile.
+# Extracted into a function on 2026-09-07 so the pre-check below (section 3b) and the
+# refusal here judge the same lockfile by **one** set of rules. Two copies of "which
+# sources are unrecognised" is exactly how a gate and the check that warns ahead of it
+# drift apart -- the agent side reached the same conclusion the same week and put both
+# of its own callers on one function. Nothing about the judgement changed in the move.
+unvetted_lock_urls() {   # unvetted_lock_urls <lockfile> -> one unrecognised URL per line
+  grep -v '^[[:space:]]*#' "$1" 2>/dev/null \
+  | grep -oE '[A-Za-z][A-Za-z0-9+.-]*://[^[:space:]'"'"'"#]+' \
+  | sort -u \
+  | while IFS= read -r url; do
+      # case arms are written with balanced parentheses (pattern): an old bash
+      # (3.2, the one macOS ships) trips over the lone closing parenthesis when
+      # it parses a case inside $( ), and the balanced form is read correctly by
+      # both generations of bash.
+      # Strip a version-control prefix before judging. `pip`/`uv` write
+      # `git+https://github.com/org/repo@commit` for a dependency taken straight
+      # from a repository, and that string does **not** start with `https://`, so
+      # without this line it fell into the catch-all below and was refused
+      # **without its host ever being looked at** -- even though github.com is on
+      # the list right here. 2026-08-12, on a real machine: a nest holding one of
+      # the five most-installed ComfyUI extensions could not be rebuilt at all.
+      # The agent side has stripped this prefix since 2026-08-02; this leg had
+      # not, and the consistency test between the two legs compares the host
+      # **list** only, so the divergence in *logic* went unnoticed.
+      # Only `something+https://` is stripped: a bare `git://` or `http://` still
+      # falls through to the refusal below, as it should.
+      case "$url" in
+        (*+https://*) vcsurl="${url#*+}" ;;
+        (*) vcsurl="$url" ;;
+      esac
+      # `file://` pointing **inside the directory being rebuilt** is not an outside
+      # server: it is code this nest brought with it. Editable installs of the
+      # fine-tuning frameworks leave exactly such a line, so refusing it made those
+      # nests impossible to rebuild by this route at all -- and rule 5 promises this
+      # script alone can rebuild any nest. `file://host/path` is another machine
+      # and stays refused.
+      #
+      # **Whether the folder is on the disk yet must not change the verdict.** It
+      # used to: the location was read with `cd`+`pwd -P`, so a path that did not
+      # exist failed the `cd` and was called an unrecognised **server** -- the
+      # rebuild then stopped with "do you trust whoever gave you this nest?" over
+      # a folder that simply had not been unpacked. Measured on a real machine,
+      # 2026-09-07. The agent side never had that behaviour (its `_inside()`
+      # normalises without touching the disk), and "does this path point outside
+      # the nest" is a question about the *text*, not about what happens to exist.
+      # A path that is inside and missing is uv's to complain about, in words that
+      # say what is actually wrong.
+      #
+      # So: normalise the text (`lexical_abs_path`, no disk access), then compare
+      # **at a path separator** -- a plain prefix test lets `/rebuild-evil` pass as
+      # `/rebuild`. The disk is consulted only to make the answer *stricter*: if
+      # the path does exist, symlinks must not lead out of the root either. A path
+      # that does not exist cannot be installed from at all, so nothing is lost by
+      # judging it on the text alone.
+      case "$vcsurl" in
+        (file://*)
+          fpath="${vcsurl#file://}"
+          case "$fpath" in (/*) ;; (*) printf '%s\n' "$url"; continue ;; esac
+          # Percent-escapes are not decoded here, and a path carrying them cannot
+          # be judged as text (`%2E%2E` is `..` after decoding, which would walk
+          # out of the root while reading as an ordinary segment). Undecidable is
+          # refused, never allowed -- the agent side decodes and would catch it.
+          case "$fpath" in (*%*) printf '%s\n' "$url"; continue ;; esac
+          troot=$(cd "$TARGET" 2>/dev/null && pwd -P) || troot=""
+          [ -n "$troot" ] || { printf '%s\n' "$url"; continue; }
+          flex=$(lexical_abs_path "$fpath")
+          case "$flex/" in ("$troot"/*) ;; (*) printf '%s\n' "$url"; continue ;; esac
+          if fphys=$(cd "$flex" 2>/dev/null && pwd -P); then
+            case "$fphys/" in ("$troot"/*) ;; (*) printf '%s\n' "$url"; continue ;; esac
+          fi
+          continue ;;
+      esac
+      case "$vcsurl" in
+        (https://*) ;;
+        (*) printf '%s\n' "$url"; continue ;;  # plain http can be tampered with in transit
+      esac
+      host="${vcsurl#https://}"; host="${host%%/*}"; host="${host##*@}"; host="${host%%:*}"
+      host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+      [ -n "$host" ] || { printf '%s\n' "$url"; continue; }
+      case " ${TRUSTED_HOSTS_SNAPSHOT//$'\n'/ } ${EXTRA_HOSTS//$'\n'/ } " in
+        (*" $host "*) ;;                       # on the list (EXTRA comes from RENEST_TRUSTED_HOSTS)
+        (*) printf '%s\n' "$url" ;;
+      esac
+    done || true
+}
+# END unvetted-lock-urls
+
 # BEGIN machine-libs -- the parity test runs exactly these lines, so they cannot drift
 NL_METHOD=$(jq -r '.runtime.native_libs.method // empty' "$MANIFEST")
 # The names in a nest are Linux shared-object names looked up in Linux library
@@ -865,6 +1031,257 @@ elif [ -n "$NL_METHOD" ]; then
   fi
 fi
 # END machine-libs
+
+# ---- 3a. Which of the two nests is this? (format 2.11) ----------------------
+# Said once, up front. A nest either carries proof that somebody watched this
+# environment finish a run, or it does not, and until format 2.11 those two looked
+# identical from the outside. It changes nothing about what happens next: this script
+# gets your bytes back either way, and would do so for a nest nobody has ever run.
+# **Absent is not "none".** A nest older than 2.11, or one built from a hand-written
+# description, has no such record because nobody looked -- which is a different thing
+# from having looked and found nothing, and the two are worded differently below.
+# Silence here means the older case; there is deliberately no line inventing one.
+EV_SOURCE=$(jq -r '.evidence.source // empty' "$MANIFEST")
+EV_NOTE=$(jq -r '.evidence.note // empty' "$MANIFEST")
+case "$EV_SOURCE" in
+  none)
+    log "This nest carries no proof it was ever run: whoever packed it looked, and this environment had no finished run recorded.${EV_NOTE:+ $EV_NOTE}"
+    log "  That is a statement about evidence, not about the files. Every byte still comes back and is still checked, one at a time." ;;
+  observed_run)
+    log "This nest was packed from a run that finished: the recipe came out of a file that run wrote for itself." ;;
+  "") ;;                              # older nest, or nobody looked -- say nothing
+  *)
+    log "This nest records evidence of the kind '$EV_SOURCE'. A newer Renest knows what that means; nothing here depends on it." ;;
+esac
+
+# ---- 3b. Can the dependency list be resolved at all? (format 2.11) ----------
+# Asked here, before a single code archive is downloaded, because the failure it
+# catches used to surface long after -- on a real machine, 2026-09-06, after 64 GB of
+# model files had been fetched and paid for. Locks that name a package no public index
+# carries (`torch==2.11.0+cu128`, a vendor's own build) look perfectly ordinary until
+# something tries to install them.
+#
+# **This one only ever tells you.** The agent side stops on the same verdict; this
+# script does not, and the difference is not an oversight. The 2026-07-15 ruling puts
+# every refusal on the agent side: the escape hatch informs, it does not block, does
+# not ask, and does not consult anything outside the nest. Its promise is your bytes,
+# not a working application -- refusing to hand them over because a dependency list
+# will not resolve would break exactly that promise. So: a warning here, and the
+# install below still gets its turn to be the authority.
+#
+# **Silence is the default, and most outcomes are silence.** Only uv's own definite
+# "no solution found" is a verdict. Offline, no uv, a package that would have to be
+# compiled (`--no-build` refuses to), a resolution that runs long -- all of them mean
+# the pre-check learnt nothing, and a check that can turn a flaky network into a scary
+# warning is worse than no check. Zero new dependencies: uv and jq are already
+# required, and the time limit below is built out of shell builtins because `timeout`
+# is not on this script's dependency list and is not going on it.
+# **A path on the packing machine, carried as a marker.** A framework installed in
+# place (`pip install -e .` -- the normal shape for kohya_ss and LLaMA-Factory)
+# leaves the *packing machine's* absolute path in the dependency lock. That folder
+# travels inside the nest but lands somewhere else here, so packing replaced the
+# path with a token and every rebuilder has to swap it back before uv sees it. A
+# real nest carries the line `-e file://__RENEST_ENV_ROOT__/sd-scripts`
+# (kept from a real fine-tuning nest packed on an A4000, 2026-08-18); left as-is,
+# uv is handed a folder that does not exist and **the whole dependency step dies**
+# -- your files
+# are all restored and checked, but nothing runs. Long-standing, not new in 2.11:
+# the agent side has done this swap since the token was introduced
+# (`resolve_env_root_token`, restore.py, at the probe and again at the install)
+# and this script simply never learnt it.
+#
+# **Both places or neither.** The probe and the install each get their own working
+# copy; missing one leaves the other lying. And the copy is a *copy*: the lock
+# inside the nest is content-addressed evidence and keeps the token, which is what
+# the byte-for-byte promise covers -- same rule the agent side follows.
+# BEGIN env-root-token -- gate-parsed and behaviour-tested; keep self-contained
+ENV_ROOT_TOKEN='__RENEST_ENV_ROOT__'
+# resolve_env_root_token <lock-in> <working-copy-out>
+#   Writes the swapped copy and succeeds, or leaves everything alone and fails
+#   (nothing to swap) -- so a caller can say `if ...; then feed uv the copy; fi`.
+#   The swap is `${var//.../...}`, a shell builtin, deliberately not `sed`: a
+#   rebuild root containing `&` or `|` would be mangled by a sed replacement, and
+#   the corruption would be silent. No command runs here at all, so nothing joins
+#   this script's dependency list.
+resolve_env_root_token() {
+  local _in="$1" _out="$2" _txt _root
+  _txt=$(cat "$_in") || return 1
+  case "$_txt" in
+    *"$ENV_ROOT_TOKEN"*) ;;
+    *) return 1 ;;
+  esac
+  # **The same path the agent side substitutes**: the rebuild root itself
+  # (`resolve_env_root_token(lock_text, target)` there), absolute and with
+  # symlinks resolved, which is what `Path(target).resolve()` gives it. Pointing
+  # this at anything else -- the venv, the staging folder -- would be worse than
+  # not swapping: it would name a directory that exists but is the wrong one.
+  _root="$(cd "$TARGET" 2>/dev/null && pwd -P)" || _root="$TARGET"
+  printf '%s\n' "${_txt//$ENV_ROOT_TOKEN/$_root}" > "$_out"
+  ENV_ROOT_RESOLVED_TO="$_root"
+  return 0
+}
+# END env-root-token
+# BEGIN lock-precheck -- the behaviour test runs exactly these lines, so they cannot drift
+# 60 seconds, wall clock, the same limit the agent side uses (it learnt the number
+# first). Overridable only so the test can drive the give-up path in two seconds
+# instead of sixty; nothing sets it in the field.
+PROBE_TIMEOUT_S="${PROBE_TIMEOUT_S:-60}"
+# **The two sentences that turn uv's "no solution found" into no verdict at all.**
+# Both are the agent side's, word for word, and a gate re-reads both files and
+# fails if they drift (test_escape_hatch_lock_precheck.py):
+#   * this one            = `_PROBE_ONLY_ARTIFACTS` in oss/src/renest/restore.py
+#   * the list below it   = `_UPSTREAM_UNREACHABLE_MARKERS`, same file
+# The two probes ask uv the identical question, so they have to discount the
+# identical answers. **Editing either list here without editing it there (or the
+# other way round) is the exact defect this pair was born from**: on 2026-09-06
+# the `--no-build` discount existed on the agent leg only, and a human running
+# this script by hand watched it tell a healthy nest it would get no working
+# Python environment.
+# BEGIN probe-only-artifacts -- gate-parsed, one string per line, keep verbatim
+PROBE_ONLY_ARTIFACTS='building from source is disabled'
+# END probe-only-artifacts
+#
+# **Network trouble that speaks in the language of a verdict.** uv reports an
+# index it could not reach as "no solution found ... because X was not found in
+# the registry" *and* "failed to fetch"; keying on "no solution" alone turns a
+# dropped connection into "your nest's dependency list is broken". Three reasons
+# this one matters more than the `--no-build` case it sits beside: (a) the design
+# note at the top of this section forbids exactly it -- a check that can turn a
+# flaky network into a scary warning is worse than no check; (b) the person
+# running the escape hatch is very often running it *because* their network is
+# unreliable, so the false alarm arrives at the worst possible moment; (c) it is
+# the same disease as the fix above -- one remedy applied to one leg only --
+# and shipping the pair half-done is the trap this repository keeps falling into.
+# BEGIN upstream-unreachable-markers -- gate-parsed, one string per line, keep verbatim
+PROBE_UPSTREAM_MARKERS='failed to fetch
+error sending request for url
+client error (connect)
+tcp connect error
+connection refused
+tls handshake eof
+dns error
+failed to lookup address information
+could not resolve host
+failed to clone'
+# END upstream-unreachable-markers
+# Does uv's output (flattened, see PROBE_FLAT below) contain any of these
+# strings? One per line, matched **literally** (`grep -F`, so `client error
+# (connect)` is not read as a regular expression) and case-insensitively, the
+# same way the agent side lowercases before testing membership.
+probe_says() {
+  local _m
+  while IFS= read -r _m; do
+    [ -n "$_m" ] || continue
+    if printf '%s' "$PROBE_FLAT" | grep -qiF -e "$_m"; then return 0; fi
+  done <<<"$1"
+  return 1
+}
+PROBE_LOCK_H=$(jq -r '.python_lock.lockfile.sha256 // empty' "$MANIFEST")
+PROBE_PYVER=$(jq -r '.runtime.python_version // empty' "$MANIFEST")
+if [ -n "$PROBE_LOCK_H" ] && [ -n "$PROBE_PYVER" ]; then
+  # The lock is small; fetching it here costs nothing and section 5 finds it already
+  # present and byte-checked.
+  if fetch_blob "$PROBE_LOCK_H" "$TARGET/.renest/requirements.lock" >/dev/null 2>&1; then
+    # Swap the packing machine's path marker for this rebuild root **before the
+    # vetting below, not after**. It is a plain text substitution -- no command
+    # runs, no host is contacted -- so doing it first takes nothing away from the
+    # rule that nothing is touched until the sources have been approved; it only
+    # decides *which text* gets approved, and the right answer is the text uv will
+    # be given. Judged with the marker still in it, `file://__RENEST_ENV_ROOT__/x`
+    # reads as an unrecognised **host**, the vetting says no, and this whole probe
+    # is skipped in silence: no log file, not one word, for every nest packed from
+    # an in-place install. Measured on a real machine, 2026-09-07 -- the check that
+    # warns before the download simply did not exist for the nests that need it
+    # most. Same defect as section 5's refusal, one step upstream of it; the swap
+    # there is separate on purpose, so neither step depends on the other's copy.
+    PROBE_LOCK_FOR_UV="$TARGET/.renest/requirements.lock"
+    if resolve_env_root_token \
+         "$PROBE_LOCK_FOR_UV" "$TARGET/.renest/requirements.probe.lock"; then
+      PROBE_LOCK_FOR_UV="$TARGET/.renest/requirements.probe.lock"
+    fi
+    # **Vet the sources before letting uv touch this file.** uv connects to every
+    # index the text names, and the refusal that vets those hosts has not run yet
+    # (it is in section 5). A lock naming anything unrecognised is not probed at
+    # all: connecting first and asking afterwards would let a nest somebody handed
+    # you reach its own server before you had said yes. Skipping is always safe --
+    # it only leaves the question to section 5, which answers it properly. The
+    # agent side vets the resolved text too, and for the same reason: it passes
+    # `env_root` to its own audit, so a file:// inside the rebuild root is not an
+    # outside server there either.
+    if [ -z "$(unvetted_lock_urls "$PROBE_LOCK_FOR_UV")" ]; then
+      PROBE_OUT="$TARGET/.renest/lock-precheck.log"
+      # Built from a background job plus `sleep` and `kill` rather than `timeout`,
+      # which is not one of the five tools this script is allowed to need. "Just
+      # this one extra command" is how a dependency list stops being a promise.
+      ( uv pip compile "$PROBE_LOCK_FOR_UV" \
+          --python-version "$PROBE_PYVER" --no-build >"$PROBE_OUT" 2>&1 ) &
+      PROBE_PID=$!
+      PROBE_WAITED=0
+      PROBE_RC=""
+      while [ "$PROBE_WAITED" -lt "$PROBE_TIMEOUT_S" ]; do
+        if ! kill -0 "$PROBE_PID" 2>/dev/null; then
+          # **`wait` inside an `if`, not bare.** This script runs under `set -e`, and a
+          # bare `wait` on a job that exited non-zero ends the whole restore right here
+          # -- with no stage, no attribution, and every model file still undownloaded.
+          # A pre-check that can kill the run it was added to protect is worse than no
+          # pre-check. Caught by the behaviour test, not by reading: `bash -n` is happy
+          # with it and so is every run where the lock happens to resolve.
+          if wait "$PROBE_PID"; then PROBE_RC=0; else PROBE_RC=$?; fi
+          break
+        fi
+        sleep 1
+        PROBE_WAITED=$((PROBE_WAITED + 1))
+      done
+      # **Flatten before judging, because uv wraps and `grep` does not.** Every
+      # judgement below keys on one sentence of uv's, and uv folds its output to
+      # a line width -- so `building from source is disabled` can arrive split
+      # across two indented lines and a line-based `grep` walks straight past
+      # the discount that exists to prevent a false alarm. That failure is
+      # **silent**: the check would go on passing while quietly judging nothing.
+      # This is the shell spelling of the agent side's
+      # `" ".join(stderr.lower().split())` in restore.py -- newlines and runs of
+      # indentation collapse to single spaces. `tr` is used a dozen times
+      # already in this script; nothing new joins the dependency list.
+      PROBE_FLAT=$(tr -s '[:space:]' ' ' < "$PROBE_OUT" 2>/dev/null || true)
+      if [ -z "$PROBE_RC" ]; then
+        kill "$PROBE_PID" 2>/dev/null || true
+        wait "$PROBE_PID" 2>/dev/null || true
+        log "The dependency pre-check did not answer within ${PROBE_TIMEOUT_S}s, so it says nothing this run — the real install decides, exactly as if this check had not run."
+      elif [ "$PROBE_RC" = 0 ]; then
+        log "The dependency list resolves."
+      elif probe_says "$PROBE_ONLY_ARTIFACTS"; then
+        # **`--no-build` inventing its own dead end.** The flag above forbids
+        # compiling, so a package that publishes only an sdist makes uv
+        # announce "no solution found" for a lock the real install resolves in
+        # a second. uv flags exactly that case with this sentence, and it is
+        # the difference between a verdict and an artefact of how we asked.
+        # Real machine, 2026-09-06: a nest whose lock names
+        # aliyun-python-sdk-core==2.16.0 was told it would get no working
+        # Python environment, then restored, installed in one second and
+        # checked byte for byte. Found by a human running the escape hatch by
+        # hand, which is what iron law 5 asks for after every format change.
+        # So this belongs in the same drawer as offline / no uv / timed out:
+        # not a word is said, and the install below is the authority.
+        :
+      elif probe_says "$PROBE_UPSTREAM_MARKERS"; then
+        # **A network that failed mid-resolve, wearing a verdict's clothes.**
+        # See the marker list above for why this is not optional. Same drawer
+        # again: nothing is said, and the install below -- which retries, and
+        # which reports unreachable sources with its own words -- decides.
+        :
+      elif printf '%s' "$PROBE_FLAT" | grep -qi 'no solution found'; then
+        # A definite verdict from uv, and the one thing worth interrupting for --
+        # said now rather than after the downloads. Still only a warning.
+        warn "This nest's dependency list cannot be resolved: uv reports no solution for it. The install in a moment will almost certainly fail the same way."
+        warn "  Carrying on regardless — every file in this nest is still restored and still checked byte for byte. What you will not get is a working Python environment."
+        warn "  The usual cause is a package pinned to a build only its vendor's own index carries. uv's own words are in $PROBE_OUT."
+      fi
+      # Anything else — network trouble, no uv, a package needing a compiler — is not
+      # a verdict on the lock. Nothing is said: the install below is the authority.
+    fi
+  fi
+fi
+# END lock-precheck
 
 # ---- 4. Put the source code back --------------------------------------------
 STAGE="S2-place"
@@ -942,97 +1359,30 @@ if [ -z "$PYVER" ]; then
   warn "This nest does not say which Python version it needs, so the environment cannot be built from it — skipping that step. Every file is still restored and still checked byte for byte, and the dependency list is back in place."
   warn "  That happens when it was packed from a setup where the interpreter could not be found. Pack it again from that machine with --env-python pointing at the interpreter the app starts with, or build the environment yourself from $TARGET/$LOCK_LANDING."
 else
-# ---- Which servers may we install from? -------------------------------------
-# Whoever packed this nest wrote the lockfile, and uv installs whatever it points
-# at — which means running their code on this machine, with access to everything
-# on it. So this one we refuse rather than warn about. Two ways through: name your
-# own private index in RENEST_TRUSTED_HOSTS, or, if you trust where this nest came
-# from, re-run with TRUST_UNSAFE_URLS=1.
-#
-# Note this list is a snapshot baked into the script. The Renest agent refreshes
-# its copy automatically; this script deliberately does not phone home, so a newly
-# popular source is recognised there before it is recognised here. That is the
-# price of not depending on us — use one of the two ways through above.
-TRUST_UNSAFE_URLS="${TRUST_UNSAFE_URLS:-}"
-EXTRA_HOSTS=$(printf '%s' "${RENEST_TRUSTED_HOSTS:-}" | tr ';,' '\n\n' | tr -d ' ' | tr 'A-Z' 'a-z')
-# RENEST-TRUSTED-HOSTS-SNAPSHOT-BEGIN
-# ↓ Kept identical to the hosts list in oss/src/renest/data/trusted-hosts.json.
-#   A consistency test (oss/tests/consistency/test_trusted_hosts_snapshot.py)
-#   fails the moment one side is edited without the other.
-TRUSTED_HOSTS_SNAPSHOT="
-pypi.org files.pythonhosted.org download.pytorch.org download-r2.pytorch.org
-pypi.nvidia.com pypi.ngc.nvidia.com data.pyg.org
-developer.download.nvidia.com developer.download.nvidia.cn developer.nvidia.cn
-github.com codeload.github.com objects.githubusercontent.com
-release-assets.githubusercontent.com raw.githubusercontent.com gitlab.com
-huggingface.co hf-mirror.com
-pypi.tuna.tsinghua.edu.cn mirrors.tuna.tsinghua.edu.cn mirrors.bfsu.edu.cn
-mirrors.aliyun.com mirrors.aliyuncs.com mirrors.cloud.aliyuncs.com
-mirrors.cloud.tencent.com mirrors.tencent.com mirrors.tencentyun.com mirror.ccs.tencentyun.com
-repo.huaweicloud.com mirrors.huaweicloud.com mirror.baidu.com mirrors.163.com
-pypi.mirrors.ustc.edu.cn mirrors.ustc.edu.cn mirrors.pku.edu.cn
-mirror.nju.edu.cn mirrors.nju.edu.cn
-mirror.sjtu.edu.cn mirrors.sjtu.edu.cn mirrors.sjtug.sjtu.edu.cn
-mirrors.zju.edu.cn mirrors.hit.edu.cn mirrors.bupt.edu.cn mirrors.cernet.edu.cn
-pypi.douban.com pypi.doubanio.com
-"
-# RENEST-TRUSTED-HOSTS-SNAPSHOT-END
-# Skip whole-line comments, matching the agent's own check exactly — the two
-# must never disagree about the same lockfile.
-UNSAFE_URLS=$(grep -v '^[[:space:]]*#' "$TARGET/.renest/requirements.lock" 2>/dev/null \
-  | grep -oE '[A-Za-z][A-Za-z0-9+.-]*://[^[:space:]'"'"'"#]+' \
-  | sort -u \
-  | while IFS= read -r url; do
-      # case arms are written with balanced parentheses (pattern): an old bash
-      # (3.2, the one macOS ships) trips over the lone closing parenthesis when
-      # it parses a case inside $( ), and the balanced form is read correctly by
-      # both generations of bash.
-      # Strip a version-control prefix before judging. `pip`/`uv` write
-      # `git+https://github.com/org/repo@commit` for a dependency taken straight
-      # from a repository, and that string does **not** start with `https://`, so
-      # without this line it fell into the catch-all below and was refused
-      # **without its host ever being looked at** -- even though github.com is on
-      # the list right here. 2026-08-12, on a real machine: a nest holding one of
-      # the five most-installed ComfyUI extensions could not be rebuilt at all.
-      # The agent side has stripped this prefix since 2026-08-02; this leg had
-      # not, and the consistency test between the two legs compares the host
-      # **list** only, so the divergence in *logic* went unnoticed.
-      # Only `something+https://` is stripped: a bare `git://` or `http://` still
-      # falls through to the refusal below, as it should.
-      case "$url" in
-        (*+https://*) vcsurl="${url#*+}" ;;
-        (*) vcsurl="$url" ;;
-      esac
-      # `file://` pointing **inside the directory being rebuilt** is not an outside
-      # server: it is code this nest brought with it. Editable installs of the
-      # fine-tuning frameworks leave exactly such a line, so refusing it made those
-      # nests impossible to rebuild by this route at all -- and rule 5 promises this
-      # script alone can rebuild any nest. Resolved with `cd`+`pwd -P` (shell
-      # builtins, no new dependency) so a symlink or `..` cannot lead outside.
-      # `file://host/path` is another machine and stays refused.
-      case "$vcsurl" in
-        (file://*)
-          fpath="${vcsurl#file://}"
-          case "$fpath" in (/*) ;; (*) printf '%s\n' "$url"; continue ;; esac
-          freal=$(cd "$fpath" 2>/dev/null && pwd -P) || { printf '%s\n' "$url"; continue; }
-          troot=$(cd "$TARGET" 2>/dev/null && pwd -P) || troot=""
-          if [ -n "$troot" ]; then
-            case "$freal/" in ("$troot"/*) continue ;; esac
-          fi
-          printf '%s\n' "$url"; continue ;;
-      esac
-      case "$vcsurl" in
-        (https://*) ;;
-        (*) printf '%s\n' "$url"; continue ;;  # plain http can be tampered with in transit
-      esac
-      host="${vcsurl#https://}"; host="${host%%/*}"; host="${host##*@}"; host="${host%%:*}"
-      host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
-      [ -n "$host" ] || { printf '%s\n' "$url"; continue; }
-      case " ${TRUSTED_HOSTS_SNAPSHOT//$'\n'/ } ${EXTRA_HOSTS//$'\n'/ } " in
-        (*" $host "*) ;;                       # on the list (EXTRA comes from RENEST_TRUSTED_HOSTS)
-        (*) printf '%s\n' "$url" ;;
-      esac
-    done || true)
+# BEGIN deps-source-gate -- the behaviour test runs exactly these lines, so they cannot drift
+# **Swap the packing machine's path marker before anything judges this lock, and
+# that ordering is the whole point.** It is the agent side's order too
+# (restore.py: resolve the token, then audit, then install). Judged with the
+# token still in it, `-e file://__RENEST_ENV_ROOT__/sd-scripts` parses as a
+# **hostname**: the check below sees a server nobody recognises and stops the
+# rebuild with "do you trust whoever gave you this nest?", naming a domain called
+# `__renest_env_root__`. Measured on a real machine, 2026-09-07, with a nest whose
+# environment was installed in place -- so a fine-tuning nest did not fail at the
+# dependency step, it was **refused before it, in the most alarming words this
+# script has**. Resolved first, the same line reads `file:///<this rebuild
+# root>/sd-scripts`, which the audit already knows to allow: a file:// inside the
+# rebuild root is code the nest brought with it, not an outside server (see
+# unvetted_lock_urls). Section 4 has already put that folder on the disk, which is
+# why this can only be done here and not earlier.
+LOCK_FOR_UV="$TARGET/.renest/requirements.lock"
+if resolve_env_root_token "$LOCK_FOR_UV" "$TARGET/.renest/requirements.resolved.lock"; then
+  LOCK_FOR_UV="$TARGET/.renest/requirements.resolved.lock"
+  log "This nest was packed from a setup installed in place, so part of its dependency list pointed at the folder it lived in. Pointed at $ENV_ROOT_RESOLVED_TO instead."
+fi
+# The same judgement the pre-check used, from the same function -- applied to the
+# copy uv is actually going to be handed, because that is the file whose sources
+# can reach out to a server.
+UNSAFE_URLS=$(unvetted_lock_urls "$LOCK_FOR_UV")
 if [ -n "$UNSAFE_URLS" ]; then
   if [ -n "$TRUST_UNSAFE_URLS" ]; then
     warn "Allowing these unrecognised sources because you set TRUST_UNSAFE_URLS=1:"
@@ -1062,6 +1412,7 @@ $(printf '%s\n' "$UNSAFE_URLS" | head -5 | sed -e 's/?.*//' -e 's/^/       /')
            exactly this step, and the restore looks normal the whole time."
   fi
 fi
+# END deps-source-gate
 # Re-running has to be safe: anyone who hits a failure will try again. uv fails
 # hard when the directory exists but is not a venv, and --clear does not save it,
 # so remove it first. Only the .venv this script created — nothing else.
@@ -1076,7 +1427,32 @@ if [ -n "${PACKAGE_SOURCE:-}" ]; then
   log "Installing dependencies from $PACKAGE_SOURCE instead of the default. Every package is still checked against the fingerprint recorded in this nest."
   export UV_DEFAULT_INDEX="$PACKAGE_SOURCE"
 fi
-VIRTUAL_ENV="$TARGET/.venv" uv pip sync "$TARGET/.renest/requirements.lock" 2>&1 | tee "$DEPSLOG" || die DEPS-SYNC "Installing dependencies failed. uv's own output above is the real diagnosis — read it, and it is also saved to $DEPSLOG. The three usual causes:
+# Where the vendor-only pins came from (format 2.11), for the lines that were never
+# pinned to a direct download address. Printed **only if the install fails**, because
+# that is the moment it helps and any earlier it is noise. **It is never handed to uv.**
+# Adding an index behind your back is precisely the move dependency-confusion attacks
+# rely on -- one package name resolvable from two places -- and uv refusing to do it is
+# a defence, not an inconvenience. So this is shown to you, and you decide.
+#
+# Assembled into one variable **before** the message rather than inline: inside a
+# double-quoted string, the body of a `${VAR:+...}` is parsed again, so an apostrophe
+# in the prose silently starts a new quote and the script stops loading with a syntax
+# error hundreds of lines further down. It cost one such error to find out; building
+# the block first keeps the trap away from whoever edits this wording next.
+LVS_LINES=$(jq -r '(.python_lock.local_version_sources // {}) | to_entries[] | "       \(.key) ← \(.value.index_url)"' "$MANIFEST" 2>/dev/null || true)
+LVS_BLOCK=""
+if [ -n "$LVS_LINES" ]; then
+  LVS_BLOCK="
+
+       Some packages in this list came from a vendor's own index rather than the
+       public one, and this nest recorded which:
+$LVS_LINES
+       Nothing here has been installed from those addresses — we do not add an index
+       on your behalf. They are recorded so that you, or whoever repairs this lock,
+       do not have to guess where those builds live.
+"
+fi
+VIRTUAL_ENV="$TARGET/.venv" uv pip sync "$LOCK_FOR_UV" 2>&1 | tee "$DEPSLOG" || die DEPS-SYNC "Installing dependencies failed.$LVS_BLOCK uv's own output above is the real diagnosis — read it, and it is also saved to $DEPSLOG. The three usual causes:
        (1) torch/CUDA will not install on this machine (wrong base image)
        (2) a package needs compiling here and there is no compiler
        (3) a pinned wheel link returns 404 because that build was removed upstream.
@@ -1154,9 +1530,29 @@ while read -r f; do
     fetch_blob "$h" "$path" "[$i/$N] "
     printf '\033[1;32m[renest]\033[0m   [✓ %d/%d] %s (%s)\n' "$i" "$N" "$relpath" "$(hsize "$sz")"
   ) &
-  # cap how many run at once
-  while [ "$(jobs -rp | wc -l)" -ge "$PARALLEL" ]; do wait -n; done
+  # cap how many run at once.
+  # **The `||` on `wait -n` is load-bearing.** `wait -n` hands back the exit
+  # status of whichever job finished, and a loop body is not exempt from `set -e` (only
+  # a loop *condition* is) -- so the first download that fails ends the whole run right
+  # here, skipping the block below whose entire job is to report that failure with the
+  # right attribution. Measured 2026-09-07 on Ubuntu's bash, running these very lines:
+  # with a live job that exits 3, the loop is never passed and the script leaves with 3;
+  # with `|| true` the attribution block is reached. Losing the status costs nothing --
+  # FAILFILE below is the real handler, and it is the one that knows *which* file died.
+  # **`|| sleep 1`, not `|| true`**: bash before 4.3 has no `wait -n` at all (macOS still
+  # ships 3.2), and there `wait -n` fails instantly every time -- with `|| true` this
+  # loop becomes a busy spin at full CPU for as long as a download takes. Falling back
+  # to a one-second poll costs nothing on a modern bash (that branch is only reached
+  # when a job actually failed) and keeps an old one merely slow instead of pathological.
+  # `sleep` is already on this script's dependency list; nothing new is required.
+  while [ "$(jobs -rp | wc -l)" -ge "$PARALLEL" ]; do wait -n || sleep 1; done
 done < <(jq -c '.files[]' "$MANIFEST")
+# **`wait` with no argument, on purpose, and it is safe under `set -e`**: with no
+# argument it waits for every child and its status is always 0, so a failed download
+# cannot end the run here and skip the attribution block below. (`wait "$pid"` is the
+# dangerous form -- it hands back that job's status. Measured 2026-09-07 after a gate
+# flagged this line: bare `wait` on a job that exited 3 returns 0 and the script runs
+# on; `wait "$pid"` on the same job kills it. Do not "fix" this line.)
 wait
 # A failure inside a background job only exits that job. If one of them already
 # recorded a failure, stop now and keep its attribution — otherwise the script

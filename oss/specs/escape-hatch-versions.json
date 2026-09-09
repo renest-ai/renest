@@ -2,7 +2,7 @@
   "_what_this_is": "Every version of restore.sh, the escape hatch, that has existed in this project, listed by the sha256 of the script itself. From nest format 2.3 on, a copy of the script travels inside every nest at .renest/escape/restore.sh, and that copy is frozen: fixes made later never reach it. This table is how you tell which copy you are holding.",
   "_how_to_use": "sha256sum .renest/escape/restore.sh inside your nest, then find that hash below. known_issues lists what was wrong with that copy and fixed later.",
   "_an_empty_issue_list_means": "No issue has been recorded against that version -- not that it is known to have none. Only issues we found and fixed appear here.",
-  "current": "4ef0bcbf46a17ac9bdf5cece035e8fe447fa1651bcaada61b73d7d8c3ef5a0c3",
+  "current": "3f4cba3354ef7ebf0f722f7a7dfb3401a3de2e6a1b5131f182126209e63fb192",
   "known_issues": [
     {
       "id": "no-transfer-speed-floor",
@@ -1846,6 +1846,116 @@
         "2.8",
         "2.9",
         "2.10"
+      ],
+      "travels_in_nests": true,
+      "known_issues": []
+    },
+    {
+      "sha256": "60330b14bc7fbbcd063c2ed4fb87b41615c5bb461a38f6fd44821075dff8c1d1",
+      "bytes": 97975,
+      "first_seen": "2026-09-07",
+      "written_for_format": "2.11",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8",
+        "2.9",
+        "2.10",
+        "2.11"
+      ],
+      "travels_in_nests": true,
+      "known_issues": []
+    },
+    {
+      "sha256": "e82337ad5587052d44c4c62fcfaed8f7b64ac9503f5fc4c51cc822e7f7be5d6c",
+      "bytes": 106856,
+      "first_seen": "2026-09-07",
+      "written_for_format": "2.11",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8",
+        "2.9",
+        "2.10",
+        "2.11"
+      ],
+      "travels_in_nests": true,
+      "known_issues": []
+    },
+    {
+      "sha256": "14b410a6790af19261fb358e4c2721060f83a844fd0f424269b42b94a1011c3a",
+      "bytes": 107929,
+      "first_seen": "2026-09-07",
+      "written_for_format": "2.11",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8",
+        "2.9",
+        "2.10",
+        "2.11"
+      ],
+      "travels_in_nests": true,
+      "known_issues": []
+    },
+    {
+      "sha256": "75b4a3ac3a46dcc1b3d984e06c53fdf70209a27c41e9fd8701443cf7775b99d0",
+      "bytes": 110443,
+      "first_seen": "2026-09-07",
+      "written_for_format": "2.11",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8",
+        "2.9",
+        "2.10",
+        "2.11"
+      ],
+      "travels_in_nests": true,
+      "known_issues": []
+    },
+    {
+      "sha256": "3f4cba3354ef7ebf0f722f7a7dfb3401a3de2e6a1b5131f182126209e63fb192",
+      "bytes": 111072,
+      "first_seen": "2026-09-07",
+      "written_for_format": "2.11",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8",
+        "2.9",
+        "2.10",
+        "2.11"
       ],
       "travels_in_nests": true,
       "known_issues": []

@@ -645,6 +645,11 @@ class ServeApp:
             no_fingerprint=bool(body.get("no_fingerprint", False)),
             workflow=workflow,
             emitter=emitter,
+            # Explicit, not inherited (decided 2026-09-06): the panel path always
+            # pins vendor-only versions to direct addresses. A pod that just ran
+            # a workflow has network by definition, and a nest sealed from the
+            # panel must never be the one that cannot be rebuilt.
+            pin_wheels=True,
             # Whatever the confirm page's preview already read, so this pack does
             # not read the same weights all over again.
             hash_cache=self._read_record_for(body["target"]),

@@ -986,6 +986,20 @@ def capture_training(
         pack_spec["python_lock"] = {"tool": "uv", "lockfile_path": lock_rel}
     if adapter:
         pack_spec["adapters"] = {framework: adapter}
+    # Format 2.11: say which of the two nests this is in the manifest, not only in the
+    # words on the screen. This route looked for proof of a finished run -- an adapter
+    # file with a step count above zero -- so it is entitled to record `none`, "looked,
+    # found nothing". That reads differently from an absent block, which means nobody
+    # looked and is the only thing a nest older than 2.11 could ever say.
+    pack_spec["_evidence"] = (
+        {"source": "observed_run"}
+        if adapter.get("verified_run")
+        else {
+            "source": "none",
+            "note": "No finished training run was found: no adapter file with a step "
+                    "count above zero sits where the recipe says it should.",
+        }
+    )
 
     # Read what is still missing off the spec we just built, instead of naming the same four
     # fields every time. Everything above tries hard to fill these in, so a fixed list sends

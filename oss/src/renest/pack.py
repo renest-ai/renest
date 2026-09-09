@@ -39,21 +39,32 @@ import httpx
 
 from .capture import _parse_extra_model_paths, capture
 from .envlock import (
+    COMPILE_REQUIRED_VERDICT,
     LOCK_FROM_ENV_HEADER,
     LOCK_FROM_INSTALLED_HEADER,
+    compile_required_evidence,
     conda_owned_evidence,
     env_dir_of,
+    env_python_matches_run_record,
     find_env_python,
     find_launchers,
     find_site_packages,
+    dists_built_from_a_directory,
+    lock_lines_for,
+    unreinstallable_manager_parts,
+    split_out_package_manager,
+    image_build_evidence,
     is_conda_build_url,
     distro_owned_packages,
+    vendor_only_locals,
     freeze_environment,
     is_system_interpreter,
     freeze_from_installed,
     interpreter_kernel,
     interpreter_python_series,
     launcher_interpreter_dir,
+    local_path_evidence,
+    local_version_sources,
     venv_python_candidates,
 )
 from .errors import NestFailure, ErrorClass, ExitCode
@@ -84,6 +95,7 @@ from .licensing import (
     stricter_of,
 )
 from .roots import (
+    ENV_ROOT_TOKEN,
     bad_root_entry as _bad_root_entry,
     resolve_file_root,
     tokenise_env_root,
@@ -96,6 +108,7 @@ from .wheels import (
     lock_hosts,
     pin_lock_text,
     python_tag_of,
+    wheel_os_family,
     wheel_platform_tags,
 )
 
@@ -150,17 +163,70 @@ def lock_carries_renest(lock_text: str) -> str | None:
     """
     match = _RENEST_IN_LOCK.search(lock_text or "")
     return match.group(0).strip() if match else None
+
+
+def _own_package_dir() -> Path:
+    """The directory this running copy of renest is loaded from.
+
+    A hard fact of this process — the import system already resolved it — never
+    a guess from ``PATH``, an executable name, or what a symlink points at.
+    """
+    return Path(__file__).resolve().parent
+
+
+def self_installed_in_env(env_root: Path | None) -> Path | None:
+    """Where this running copy of renest lives, **when that place is inside
+    ``env_root``** (the environment being packed); ``None`` otherwise.
+
+    Why it matters: ``uv pip install renest`` in a shell with that environment
+    active lands us right there, and uv resolves our dependencies against the
+    virtualenv layer alone — it does not count a ``--system-site-packages``
+    layer as satisfied. Measured 2026-09-06 on a real ComfyUI environment: all
+    seven libraries the app was importing got displaced by newer versions, and
+    the dependency list read afterwards records the displaced versions — a list
+    describing an environment the workflow never actually ran on.
+
+    Judged on install paths, deliberately: the tool run as ``uv tool install``
+    or from anywhere outside the environment compares unrelated and stays
+    silent. The complementary guard in :mod:`renest.envlock`
+    (``drop_ourselves``) keeps our own line out of the list; this one exists
+    because that line is not the damage — the displaced versions are, and only
+    a word at pack time can still reach the user about them.
+    """
+    if env_root is None:
+        return None
+    own = _own_package_dir()
+    try:
+        target = Path(env_root).resolve()
+    except OSError:
+        return None
+    return own if own.is_relative_to(target) else None
+
+
 #: uploader: (blobs_dir, manifest) -> dict of verify info {sha256: size}
 Uploader = Callable[[Path, dict], dict]
 
 
 class PackError(Exception):
     """A pack problem carrying an exit code (pre-gate config/usage). Distinct
-    from the byte-level P-stage failures which raise :class:`NestFailure`."""
+    from the byte-level P-stage failures which raise :class:`NestFailure`.
 
-    def __init__(self, human: str, *, exit_code: int = int(ExitCode.USAGE)) -> None:
+    ``failure`` optionally carries a contract-1.3 error object (the shape
+    :meth:`NestFailure.to_error_object` produces) for the machine-readable
+    report. Without it, ``--json`` ends on ``ok:false`` with ``failure: null``
+    and an automated caller learns nothing about what happened — exactly how
+    the still-verifying timeout got buried on 2026-09-06."""
+
+    def __init__(
+        self,
+        human: str,
+        *,
+        exit_code: int = int(ExitCode.USAGE),
+        failure: dict | None = None,
+    ) -> None:
         self.human = human
         self.exit_code = exit_code
+        self.failure = failure
         super().__init__(human)
 
 
@@ -587,28 +653,18 @@ def _refuse_undownloaded_code(src_dir: Path, install_path: str, exclude=()) -> N
     restore, and the rebuilt environment is missing the code. **Hard-refuse
     rather than warn** — a nest that passes every check and crashes on startup
     is worse than no nest.
+
+    The judgment itself is invariant I-2 and lives in :mod:`renest.invariants`
+    (2026-09-06): one source, so no second consumer can drift from what counts
+    as "never downloaded". This raise, its message and its exit code are
+    unchanged — the invariant sweep did not make pack stricter or looser here.
     """
-    pointers = _lfs_pointer_files(src_dir, exclude)
-    if pointers:
-        raise PackError(
-            f"{install_path} has {len(pointers)} file(s) that are only Git LFS pointer text, "
-            f"not the real files — this copy never downloaded them, so the nest would verify "
-            f"fine and rebuild with the code missing.\n"
-            f"  For example: {', '.join(pointers[:3])}\n"
-            f"  Run `git lfs pull` inside {install_path}, then pack again.",
-            exit_code=int(ExitCode.USAGE),
-        )
-    empty_subs = _empty_submodule_dirs(src_dir)
-    if empty_subs:
-        raise PackError(
-            f"{install_path} declares {len(empty_subs)} sub-project folder(s) that are empty — "
-            f"that code was never downloaded, so the nest would verify fine and rebuild "
-            f"without it.\n"
-            f"  Empty: {', '.join(empty_subs[:3])}\n"
-            f"  Run `git submodule update --init --recursive` inside {install_path}, then "
-            f"pack again.",
-            exit_code=int(ExitCode.USAGE),
-        )
+    from .invariants import ArchiveDir, i2_code_bytes_never_downloaded
+
+    for v in i2_code_bytes_never_downloaded(
+        {}, "", [ArchiveDir(install_path, src_dir, tuple(exclude))]
+    ):
+        raise PackError(v.message, exit_code=int(ExitCode.USAGE))
 
 
 def _dir_size_as_packed(src_dir: Path, exclude=()) -> int:
@@ -929,11 +985,46 @@ class PackReport:
     #: hand-off surface asks again on the strength of this** — the escape valve
     #: only lets you pack, it does not let you hand off.
     i_know_used: bool = False
+    #: renest itself was found installed **inside the environment being packed**
+    #: (see :func:`self_installed_in_env`). Installing it there can displace
+    #: library versions the app in that environment was already using, so the
+    #: dependency list captured here may describe an environment the workflow
+    #: never actually ran on. Advisory: the pack goes through; this flag lives
+    #: in the report only, never in the manifest.
+    renest_in_packed_env: bool = False
+    #: Whether this nest, as packed, can be rebuilt on another machine. False when
+    #: the shipped lock keeps a vendor-only pin with no download address (an
+    #: offline pack of a torch==…+cuXXX environment): archived faithfully, but a
+    #: rebuild against the public index can never install it, and the restore
+    #: side's pre-check refuses it up front. **Report layer only, never in the
+    #: manifest** (same rule as renest_in_packed_env: a manifest field goes
+    #: through the format process). Meaningful for a pack that succeeded; a
+    #: failed pack produced nothing to judge and keeps the default.
+    restorable: bool = True
+    #: Plain-language reasons behind ``restorable=False``, one per cause, each
+    #: carrying its own way out. Kept apart from ``findings``: warnings scroll,
+    #: this is the fact a hand-off or a restore decision hangs on.
+    unrestorable_reasons: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         d = asdict(self)
         d.pop("manifest", None)  # keep report light; manifest lives on disk
         return d
+
+
+def offline_effects(
+    offline: bool, pin_wheels: bool, no_licence_lookup: bool
+) -> tuple[bool, bool]:
+    """What ``--offline`` means for the two online pack steps, as
+    ``(pin_wheels, no_licence_lookup)`` — one definition, so the CLI and its
+    tests cannot disagree.
+
+    ``--offline`` = pin nothing and look up no licences. The fine-grained flags
+    stay individual overrides: an explicit ``--pin-wheels`` wins over the
+    pinning half even under ``--offline`` (the user asked for that one online
+    step by name), and ``--no-licence-lookup`` simply folds in.
+    """
+    return (pin_wheels or not offline, no_licence_lookup or offline)
 
 
 def sealed_summary(report: PackReport) -> str:
@@ -1347,13 +1438,19 @@ def _base_image_for_manifest(spec_img: object, warnings: list[str]) -> dict | No
     return out
 
 
-def _site_packages_for(root: Path, env_python: str | None) -> Path | None:
+def _site_packages_for(
+    root: Path, env_python: str | None, program_dir: Path | None = None
+) -> Path | None:
     """The installed-packages folder of the environment being packed: asked of its
-    interpreter when one can run here, found by layout when not."""
+    interpreter when one can run here, found by layout when not.
+
+    ``program_dir`` covers the split program/data layout: when the program tree
+    lives apart from the data root, its environment lives with the program, and
+    a scan of the root alone reads empty there."""
     cand = root / ".venv" / "bin" / "python"
     py = env_python or (str(cand) if cand.exists() else None)
     sp = interpreter_site_packages(py) if py else None
-    return sp if sp is not None else find_site_packages(root)
+    return sp if sp is not None else find_site_packages(root, program_dir)
 
 
 def _env_python_for(root: Path, env_python: str | None) -> str | None:
@@ -1430,7 +1527,14 @@ def _build_manifest(
     no_fingerprint: bool,
     warnings: list[str],
     dry_run: bool,
-    pin_wheels: bool = False,
+    # Online pinning is the default since 0.1.13 (decided 2026-09-06): a bare
+    # vendor pin shipped as-is killed the first real 64 GB restore after the
+    # downloads. ``pack()`` owns the public default; this one only mirrors it.
+    pin_wheels: bool = True,
+    # Collects the reasons this nest, as packed, cannot be rebuilt elsewhere
+    # (mutated in place, same convention as ``warnings``). The caller folds it
+    # into PackReport.restorable / unrestorable_reasons — report layer only.
+    unrestorable: list[str] | None = None,
     client: httpx.Client | None = None,
     no_licence_lookup: bool = False,
     mine: set[str] | None = None,
@@ -1450,7 +1554,7 @@ def _build_manifest(
     # from "hung".
     tracker = _ProgressTracker(emitter, root, spec) if (emitter and not dry_run) else None
     manifest: dict = {
-        "format_version": "2.10",
+        "format_version": "2.11",
         "id": nest_id,
         "created_at": _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "runtime": spec["runtime"],
@@ -1861,6 +1965,13 @@ def _build_manifest(
                 f"versions pinned as installed. Package hashes and the original index URLs were "
                 f"not recorded — a restore installs those versions from the public index"
             )
+            # Jupyter kernel != shell env (diagnostic, never a block). The list was read
+            # from one interpreter; the run may have happened in another (a kernel whose
+            # packages differ from the shell). Say so when the run record disagrees; a
+            # false stop here would misfire on every ordinary pack, so unknown stays quiet.
+            _mismatch = env_python_matches_run_record(from_env["python"], read_run_record(root))
+            if _mismatch:
+                warnings.append(_mismatch)
         elif pl.get("from_installed"):
             sp = Path(pl["from_installed"]["site_packages"])
             frozen = freeze_from_installed(sp)
@@ -1912,8 +2023,14 @@ def _build_manifest(
         # published a wheel for python-apt, so pinning cannot reach it. Split them, because
         # only one of the two has a fix that works.
         distro_ver = distro_owned_packages(lock_text)
-        local_ver = [ln for ln in lock_text.splitlines()
-                     if "==" in ln and "+" in ln.split("==")[-1] and ln.strip() not in distro_ver]
+        # A local build baked into the image (torch==2.1.0a0+gitc263bd4) is a third
+        # dead end: unlike a vendor +cuNNN build it is on no index and --pin-wheels
+        # cannot reach it, so it gets its own warning and is taken out of local_ver
+        # below -- the generic "--pin-wheels fixes this" advice is wrong for it.
+        image_ver = image_build_evidence(lock_text)
+        # One definition, shared with `renest lint`'s artifact-side gate — two copies
+        # of "which pins are vendor-only" is exactly how a gate and its ledger drift.
+        local_ver = vendor_only_locals(lock_text)
         if distro_ver:
             names = ", ".join(ln.split("==")[0].strip() for ln in distro_ver[:6])
             more = f" and {len(distro_ver) - 6} more" if len(distro_ver) > 6 else ""
@@ -1937,6 +2054,46 @@ def _build_manifest(
         # (file:///croot/...) names a path that exists on no machine. Said here with the
         # one fix that works — not the un-followable "--trust-host file://" the URL audit
         # below would otherwise suggest for each such line.
+        # **Take the package manager's own parts out before anything else looks at the
+        # list.** This is a reading, not a judgement: it asks only "which distributions
+        # make up conda itself", off conda's own METADATA headers, and never "does the
+        # app need this". Measured on a real fine-tune run: the packed environment was
+        # conda's base environment, so `libmambapy` and `menuinst` rode along in a
+        # 121-line lock. Neither is on any index; the restore stopped on the first of
+        # them **after 2.1 GB had been downloaded and paid for**. They are the package
+        # manager, not the work -- a nest is a record of the app, and shipping a lock
+        # that cannot install is not a more faithful record, it is a broken one.
+        # Which environment to read this off is whatever the lock itself came from --
+        # `_sp` / `_exe` above only exist on one of the branches that lead here.
+        _pl_inst = (pl or {}).get("from_installed") or {}
+        _pl_env = (pl or {}).get("from_environment") or {}
+        _plumbing_py = _pl_env.get("python") or (str(env_python) if env_python else None)
+        _plumbing_sp = (
+            Path(_pl_inst["site_packages"]) if _pl_inst.get("site_packages")
+            else (interpreter_site_packages(_plumbing_py) if _plumbing_py else None)
+        )
+        if _plumbing_sp is None:
+            # A lock the spec pointed at names no environment, but one is usually
+            # sitting right here -- and the conda parts ride in through that lock
+            # exactly the same way. Without this the filter never fired on the
+            # commonest route of all: `python_lock.lockfile_path`.
+            _plumbing_sp = find_site_packages(root)
+        if _plumbing_sp is not None:
+            _owned = unreinstallable_manager_parts(Path(_plumbing_sp))
+            lock_text, _dropped = split_out_package_manager(lock_text, _owned)
+            if _dropped:
+                lock_src = work / "requirements.lock"
+                lock_src.write_text(lock_text)
+                _names = ", ".join(ln.split("==")[0].strip() for ln in _dropped[:6])
+                _more = f" and {len(_dropped) - 6} more" if len(_dropped) > 6 else ""
+                warnings.append(
+                    f"Left {len(_dropped)} package(s) out of the dependency list: they are "
+                    f"conda's own installation ({_names}{_more}), read off conda's METADATA, "
+                    "not something this environment's work depends on. They are on no package "
+                    "index, so keeping them would stop the rebuild on the first one — after "
+                    "the model files had been downloaded and paid for. Nothing the app "
+                    "installed was touched, whichever tool installed it."
+                )
         conda_ev = conda_owned_evidence(lock_text)
         if conda_ev:
             names = ", ".join(ln.split(" @ ")[0].split("==")[0].strip() for ln in conda_ev[:6])
@@ -1945,17 +2102,137 @@ def _build_manifest(
                 f"This looks like a conda-built environment ({names}{more}). renest rebuilds "
                 "with uv/PyPI and cannot reproduce conda-only packages: they have no wheel on "
                 "any package index, and a conda build path (file:///croot/...) exists on no "
-                "other machine — so a restore would stop on the first of them, after the model "
-                "files have already been downloaded and paid for. Build this environment in a "
-                "virtual environment (`uv venv`, then reinstall what it needs) and pack again. "
-                "Packing continues: the code and models in this archive are still a faithful "
-                "record of this machine."
+                "other machine — so a restore would stop on the first of them. Build this "
+                "environment in a virtual environment (`uv venv`, then reinstall what it "
+                "needs) and pack again. Packing continues: the code and models in this "
+                "archive are still a faithful record of this machine."
+            )
+        # **A lock that installs nowhere makes this nest unrestorable, and the report has
+        # to say so.** Until now these three families only produced a warning, while
+        # `PackReport.restorable` stayed True -- so a packer who scrolled past the warning
+        # was told, in the one field a hand-off decision reads, that the archive was fine.
+        # This is the same channel the offline/vendor-pin case already uses below, and it
+        # changes no exit code and no format: packing still succeeds, because the archive
+        # is still a faithful record of this machine. What it stops is the archive being
+        # *described* as rebuildable when the dependency list provably is not.
+        # The restore side does not depend on this mark -- it measures for itself at S0,
+        # before any model bytes move (`restore.py::s0_lock_probe`). Measurement is the
+        # stronger guard; this one exists for the person doing the packing, who otherwise
+        # finds out only when someone else tries to rebuild.
+        # **A distribution installed from a folder on this machine.** `pip install -e .`
+        # -- the last line of kohya_ss's own requirements.txt, and what its README tells
+        # you to run -- records the repository as an ordinary distribution, and a freeze
+        # writes it out as a bare `library==0.0.0`. No index has that name at that
+        # version, so a rebuild stops on it exactly as it does on a conda-only package;
+        # measured on a real fine-tune archive, line 44 of its 121-line lock. Nothing in
+        # the lock *text* can see this -- the line looks like any other -- so it is read
+        # off the install record instead. Named, never removed: unlike conda's own
+        # machinery this is the user's own work, and the app certainly needs it.
+        _local_dirs = (
+            dists_built_from_a_directory(Path(_plumbing_sp))
+            if _plumbing_sp is not None else {}
+        )
+        _local_lines = lock_lines_for(lock_text, set(_local_dirs)) if _local_dirs else []
+        if _local_lines:
+            _n = ", ".join(ln.split("==")[0].strip() for ln in _local_lines[:6])
+            _m = f" and {len(_local_lines) - 6} more" if len(_local_lines) > 6 else ""
+            warnings.append(
+                f"{len(_local_lines)} package(s) in this dependency list were installed "
+                f"from a folder on this machine ({_n}{_m}; e.g. {_local_lines[0]}), which is "
+                f"what `pip install -e .` records. The line reads like an ordinary package, "
+                f"but no index carries that name at that version, so a rebuild stops on it. "
+                f"The folder itself is in this archive if it was packed as code; the "
+                f"dependency list is what cannot express it. Packing continues: the archive "
+                f"is still a faithful record of this machine."
+            )
+        # Each family gets **its own way out**. They are not interchangeable: telling
+        # someone to rebuild in a virtual environment fixes a conda base environment and
+        # does nothing at all for `pip install -e .`, which records the same line inside
+        # a venv too. Advice that does not work is worse than no advice -- it is followed.
+        _VENV_FIX = ("build this environment in a virtual environment (`uv venv`, then "
+                     "reinstall what it needs) and pack again")
+        for _family, _lines, _fix in (
+            ("conda", conda_ev, _VENV_FIX),
+            ("the operating system", distro_ver, _VENV_FIX),
+            ("a folder on the packing machine", _local_lines,
+             "pack that folder as code and install it from there on the rebuild, or "
+             "publish it somewhere a rebuild can fetch it from"),
+        ):
+            if _lines and unrestorable is not None:
+                _n = ", ".join(ln.split(" @ ")[0].split("==")[0].strip() for ln in _lines[:6])
+                _m = f" and {len(_lines) - 6} more" if len(_lines) > 6 else ""
+                unrestorable.append(
+                    f"Archived faithfully, but as recorded this dependency list cannot be "
+                    f"installed on another machine: {len(_lines)} package(s) belong to "
+                    f"{_family} rather than to any package index ({_n}{_m}). A rebuild looks "
+                    f"them up on the public index, which never has them, and stops. To make "
+                    f"this nest rebuildable elsewhere, {_fix}."
+                )
+        # An image-preinstalled torch build carries a local version no index serves
+        # (torch==2.1.0a0+gitc263bd4, an NGC container build): the pin reads fine and
+        # installs nowhere, and --pin-wheels cannot find it either. Same warn-not-block
+        # line as the cases above; the fix is a venv rebuild, or a direct wheel URL if
+        # one exists. Taken out of local_ver above so the two do not contradict.
+        if image_ver:
+            names = ", ".join(ln.split("==")[0].strip() for ln in image_ver[:6])
+            more = f" and {len(image_ver) - 6} more" if len(image_ver) > 6 else ""
+            warnings.append(
+                f"{len(image_ver)} package(s) carry a local build that only ever existed on "
+                f"this machine or in its image ({names}{more}) — a from-source or container "
+                f"build like torch==2.1.0a0+git…, which no package index carries and "
+                f"--pin-wheels cannot find. The pin reads as installable and a restore stops "
+                f"on it, after the model files have already been downloaded and paid for. "
+                f"Rebuild this environment in a virtual environment (`uv venv`, then reinstall "
+                f"from an installable release) and pack again, or pin a direct wheel URL by "
+                f"hand if you have one. Packing continues: the archive is still a faithful "
+                f"record of this machine."
+            )
+        # Packages that are rebuilt from source against the exact torch/CUDA/GPU-arch of
+        # whatever machine installs them (flash-attn and friends): a byte-for-byte carry
+        # is impossible in principle, so this is not a "pack it better" warning -- it is a
+        # verdict, stated at pack time, that the restore machine must recompile. We read
+        # the arch this run was built for out of the gpu block already assembled above
+        # (no new field, no format bump) so the note names the target it was built against.
+        compile_ev = compile_required_evidence(lock_text)
+        if compile_ev:
+            names = ", ".join(ln.split("==")[0].split(" @ ")[0].strip() for ln in compile_ev[:6])
+            more = f" and {len(compile_ev) - 6} more" if len(compile_ev) > 6 else ""
+            _cap = (manifest.get("gpu") or {}).get("captured_on") or {}
+            _built_for = _cap.get("name") or _cap.get("sm_arch")
+            built = f" (built here for {_built_for})" if _built_for else ""
+            warnings.append(
+                f"{len(compile_ev)} package(s) in this dependency list must be built from "
+                f"source for the card that runs them{built}: {names}{more}. For each, "
+                f"{COMPILE_REQUIRED_VERDICT}. The nest does not try to install these back — a "
+                f"restore recompiles them or fetches the official wheel for its own card. "
+                f"Packing continues: the archive is still a faithful record of this machine."
             )
         pinned: list[tuple[str, str]] = []
         if pin_wheels and not dry_run:
-            # Explicit pinning (--pin-wheels): the one step in pack that touches
-            # the network; the zero-network default is unchanged.
+            # Pinning: the one step in pack that touches the network — on by
+            # default since 0.1.13 (decided 2026-09-06); --offline is the
+            # explicit zero-network path.
             py_ver = (spec.get("runtime") or {}).get("python_version", "")
+            # Both pinning and fingerprints need the environment's Python version
+            # to pick the right package files. A spec may legitimately not carry
+            # one, and with pinning now the default that must not crash the pack:
+            # no vendor pins -> skip the online extras with a warning; vendor
+            # pins present -> refuse with the way out, never ship a dead nest.
+            try:
+                py_tag: str | None = python_tag_of(py_ver)
+            except WheelPinError:
+                py_tag = None
+            if local_ver and py_tag is None:
+                raise PackError(
+                    f"{len(local_ver)} package(s) here pin a vendor-only build "
+                    f"(e.g. {local_ver[0]}) that needs a direct download address "
+                    f"recorded, but this environment's Python version was not "
+                    f"captured, and picking the right package file needs it. "
+                    f"Point --env-python at the Python that runs this environment "
+                    f"and pack again — or pass --offline to archive as-is, marked "
+                    f"as not rebuildable on other machines.",
+                    exit_code=int(ExitCode.USAGE),
+                )
             # **Fingerprints are not conditional on there being a vendor build.**
             # This block used to also require local_ver, so an ordinary lock got no
             # fingerprints at all and --package-source then promised a check that
@@ -1964,7 +2241,7 @@ def _build_manifest(
                 try:
                     new_text, pinned = pin_lock_text(
                         lock_text,
-                        python_tag_of(py_ver),
+                        py_tag,
                         # **Wheels must be chosen for the chip doing the packing.**
                         # Omit this and the x86_64 default applies: packing on ARM
                         # pins Intel wheels, and the archive verifies green while
@@ -1975,8 +2252,16 @@ def _build_manifest(
                 except WheelPinError as e:
                     # Honest boundary: a failed pin is a hard failure. Skipping
                     # silently = shipping a nest that passes sha256 and can never be
-                    # installed again.
-                    raise PackError(str(e), exit_code=int(ExitCode.USAGE)) from e
+                    # installed again. Pinning is the default now, so the machine
+                    # with no network gets pointed at the deliberate way out.
+                    raise PackError(
+                        str(e)
+                        + "\n  Packing with no network on purpose? Pass --offline: "
+                          "the nest is archived exactly as this machine stands and "
+                          "marked as not rebuildable on other machines (licence "
+                          "lookups are skipped too).",
+                        exit_code=int(ExitCode.USAGE),
+                    ) from e
                 if pinned:
                     lock_src = work / "requirements.lock"
                     lock_src.write_text(new_text)
@@ -1989,15 +2274,49 @@ def _build_manifest(
                         "the nest is designed but NOT built yet — setting it only records "
                         "your intent in the manifest, it does not archive anything.)"
                     )
+                # Machine reconciliation, not memory: every vendor-only pin must now
+                # be a direct address. Re-scan the text that actually ships — a
+                # silent fall-back inside pinning would otherwise produce a nest
+                # that verifies green and can never be rebuilt, which is how the
+                # July fix (tools/lock_rewrite.py) degraded into an optional flag
+                # with no gate and shipped bare pins for two months.
+                still_bare = vendor_only_locals(lock_src.read_text())
+                if still_bare or len(pinned) != len(local_ver):
+                    raise PackError(
+                        "--pin-wheels ran, and the lock that would ship still carries "
+                        f"{len(still_bare)} vendor-only pin(s) with no direct address "
+                        f"({', '.join(ln.split('==')[0].strip() for ln in still_bare[:4])})"
+                        f" — pinned {len(pinned)} of {len(local_ver)}. Such a nest "
+                        "verifies green and can never be rebuilt, so packing stops. "
+                        "This is a bug on our side (a silent fall-back in the pinning "
+                        "step); please report it.",
+                        exit_code=int(ExitCode.USAGE),
+                    )
             # While we are online, also record a content fingerprint for every
             # package. It can only come from the index: once a package is
             # installed the .whl is gone, so the question is unanswerable
             # locally. **All of them or none of them** — one hashed line puts the
             # installer into verify-every-package mode and every unhashed line
             # then fails the install, so half a job is worse than none.
-            hashed_text, n_hashed, unhashable = add_hashes(
-                lock_src.read_text(), python_tag_of(py_ver), wheel_platform_tags(), client=client
-            )
+            if py_tag is None:
+                hashed_text, n_hashed, unhashable = "", 0, []
+                warnings.append(
+                    "No content fingerprints were recorded: this environment's Python "
+                    "version was not captured, and matching a package to its file "
+                    "needs it. Point --env-python at the Python that runs this "
+                    "environment to get them recorded."
+                )
+            else:
+                # **The operating system is read here, at the boundary, like the
+                # architecture next to it** — a wheel built for another OS does not
+                # install however well the architecture matches, and writing its
+                # fingerprint into the lock is worse than writing none: without one the
+                # lock installs, with a wrong one the rebuild stops after paying for the
+                # model files (2026-09-09, RC=30 on `pyyaml`'s macOS build).
+                hashed_text, n_hashed, unhashable = add_hashes(
+                    lock_src.read_text(), py_tag, wheel_platform_tags(), client=client,
+                    os_family=wheel_os_family(),
+                )
             if n_hashed:
                 lock_src = work / "requirements.lock"
                 lock_src.write_text(hashed_text)
@@ -2016,18 +2335,36 @@ def _build_manifest(
                     + "). It is all or nothing on purpose: a half-hashed list makes the "
                     "rebuild fail outright, which is worse than today's no-hash list."
                 )
-        elif local_ver:
-            why = (
-                "a dry run never rewrites the lock file"
-                if pin_wheels
-                else "pinning has to read the vendor's index, which needs network — "
-                     "pass --pin-wheels to allow it"
-            )
+        elif local_ver and pin_wheels:
+            # A dry run of an online pack: the rehearsal never rewrites the lock
+            # and never goes online; the real pack will pin — or fail loudly.
             warnings.append(
                 f"{len(local_ver)} package(s) carry a vendor-only version PyPI doesn't have "
                 f"(like torch==…+cu124): a restore can only install them from direct wheel URLs, "
-                f"and we didn't pin any this time ({why}), so pinned_wheel_urls is left out"
+                f"and a dry run never rewrites the lock file, so pinned_wheel_urls is left out. "
+                f"The real pack will pin them."
             )
+        elif local_ver:
+            # An offline pack (decided 2026-09-06): archive the scene faithfully,
+            # refuse nothing — and record, in the report, that this nest as packed
+            # cannot be rebuilt on another machine. The stopping points for an
+            # unrestorable nest are the restore side's pre-check and hand-off
+            # issuance, not the packing machine.
+            _names = ", ".join(ln.split("==")[0].strip() for ln in local_ver[:6])
+            _more = f" and {len(local_ver) - 6} more" if len(local_ver) > 6 else ""
+            reason = (
+                f"Archived faithfully, but as recorded this lock cannot be installed on "
+                f"another machine: {len(local_ver)} package(s) pin a build that only its "
+                f"vendor's own package index carries ({_names}{_more}; e.g. {local_ver[0]}), "
+                f"and this pack was offline, so no download address was recorded for them. "
+                f"A rebuild looks such a build up on the public index, which never has it, "
+                f"and stops. To make this nest rebuildable elsewhere, pack again while "
+                f"online — pinning is on by default, or pass --pin-wheels explicitly — so "
+                f"each such build gets its exact download address."
+            )
+            if unrestorable is not None:
+                unrestorable.append(reason)
+            warnings.append(reason)
         # Move the warning forward in time: the restore side blocks unknown hosts
         # against the dependency-source allowlist, and by then the original
         # machine is usually gone. Nothing is blocked here — packing preserves
@@ -2061,6 +2398,30 @@ def _build_manifest(
         # these here rather than tell the user to `--trust-host file://` once per line.
         if conda_ev:
             unknown_src = [u for u in unknown_src if not is_conda_build_url(u)]
+        # An editable/local-path install (-e /opt/mylib, or a wheel pinned by file://)
+        # points at a folder that does NOT travel inside the nest, so a restore cannot
+        # reach it — but "--trust-host <domain>" is un-followable for it (there is no
+        # host). Same move as the conda case: give the one fix that works instead of the
+        # trust-host line. The environment root's own editable install is exempt: it
+        # travels as a token and the audit line for it is a false alarm at pack time
+        # (the token has no real path here, but restore swaps it back and lets it
+        # through), so drop those from unknown_src too.
+        local_refs = local_path_evidence(lock_text_for_audit)
+        _local_urls = {u for u in unknown_src
+                       if ENV_ROOT_TOKEN in u or any(u in ln for ln in local_refs)}
+        unknown_src = [u for u in unknown_src if u not in _local_urls]
+        if local_refs:
+            names = ", ".join(ln[:80] for ln in local_refs[:3])
+            more = f" and {len(local_refs) - 3} more" if len(local_refs) > 3 else ""
+            warnings.append(
+                f"{len(local_refs)} dependency line(s) install from a path on this machine "
+                f"that does not travel inside the nest ({names}{more}) — an editable install "
+                f"of a folder outside the environment, or a wheel pinned by file://. A restore "
+                f"stops there: the path is not on the new machine and the nest did not carry "
+                f"it. Move that code into code_deps[] so it is packed with the nest, or install "
+                f"it from a published wheel or a git URL that pins a commit, and pack again. "
+                f"(The environment's own editable install is fine — it travels with the nest.)"
+            )
         if unknown_src:
             warnings.append(
                 f"{len(unknown_src)} dependency source(s) we don't recognize: "
@@ -2119,7 +2480,37 @@ def _build_manifest(
         # URLs: the name answers "who will my machine talk to" while full URLs
         # would blow up the disclosure surface. Pairs with the hard refusal of
         # non-allowlisted hosts — that side blocks, this side warns in advance.
-        _hosts = lock_hosts(lock_text)
+        # **Read from the text that ships, not the text that arrived**: --pin-wheels
+        # rewrites vendor pins into download.pytorch.org addresses after lock_text
+        # was read, and a disclosure computed from the stale copy would omit the
+        # very host every pinned nest is guaranteed to contact (found 2026-09-06,
+        # the day pinning stopped being optional for such locks).
+        _hosts = lock_hosts(lock_text_for_audit)
+        # Which index every still-bare vendor pin came from (format 2.11). Pinning
+        # rewrites such a line into a direct wheel URL and that line needs nothing
+        # here; what is left over is `torch==2.11.0+cu128` -- a name and a version no
+        # public index serves, with no address anywhere in the nest until now. Read
+        # off the installed package's own direct_url.json, or off this environment's
+        # index config; **never worked back from the version suffix** (see
+        # envlock.local_version_sources for why that route does not exist).
+        _lvs_sp = _site_packages_for(root, env_python)
+        # Two places a config file can sit: the environment root we were handed, and
+        # the virtual environment the packages actually live in. Looked at in that
+        # order -- a nest is packed from the tree the user points at, and that is where
+        # a studio's own index setting is kept.
+        _lvs_roots = [root] + ([env_dir_of(_lvs_sp)] if _lvs_sp is not None else [])
+        _lvs = local_version_sources(lock_text_for_audit, _lvs_sp, *_lvs_roots)
+        if _lvs:
+            manifest["python_lock"]["local_version_sources"] = _lvs
+            # Disclosure obligation of 2.11: these are hosts a rebuild will reach out
+            # to, so they belong in the same list as the ones named inside the lock.
+            # Recorded beside the lock rather than inside it, they would otherwise be
+            # contacted without ever appearing on the disclosure surface -- and the
+            # escape hatch's source gate reads the lock text, so an index only the
+            # manifest knows about must be visible to the reader some other way.
+            _hosts = sorted(set(_hosts) | set(lock_hosts(
+                "\n".join(f"--index-url {v['index_url']}" for v in _lvs.values())
+            )))
         if _hosts:
             manifest["python_lock"]["hosts"] = _hosts
         if pinned:
@@ -2281,6 +2672,7 @@ def _build_manifest(
     _attach_recipes(manifest, place, dry_run, work, spec.get("_extra_recipes") or [])
 
     # -- adapters.comfyui.workflow --
+    _wf_json: dict | None = None  # the recipe's own JSON, for the invariant sweep below
     cui = spec.get("adapters", {}).get("comfyui")
     if cui and (cui.get("workflow_path") or "workflow_inline" in cui):
         if cui.get("workflow_path"):
@@ -2311,6 +2703,12 @@ def _build_manifest(
             if k in cui:
                 comfy[k] = cui[k]
         manifest.setdefault("adapters", {})["comfyui"] = comfy
+        # Keep the recipe's own JSON for the invariant sweep at the end (I-3
+        # reads it). Unparseable or non-dict content is skipped honestly there.
+        with contextlib.suppress(OSError, json.JSONDecodeError, UnicodeDecodeError):
+            _parsed = json.loads(wf_src.read_text(encoding="utf-8"))
+            if isinstance(_parsed, dict):
+                _wf_json = _parsed
 
     # A training-side adapter is pure data (it names which files[] entries are
     # the recipe, plus the evidence of the run that worked); there is nothing to
@@ -2322,6 +2720,37 @@ def _build_manifest(
         if name == "comfyui":
             continue
         manifest.setdefault("adapters", {})[name] = block
+
+    # -- evidence: was this nest ever seen to work? (format 2.11) --------------
+    # **Written only when somebody actually looked.** The two inference routes look --
+    # that is their whole job -- and hand their verdict down here; a hand-written spec
+    # (`--spec`) does not, and gets no block at all. That asymmetry is the field's whole
+    # point: absent means "nobody looked", `none` means "looked, and there was nothing",
+    # and a reader that collapses the two turns an unasked question into a clean answer.
+    # So there is deliberately no `else` here filling in `none` for the quiet case --
+    # that would be exactly the invention this field exists to prevent.
+    _ev = spec.get("_evidence")
+    if isinstance(_ev, dict) and _ev.get("source"):
+        manifest["evidence"] = {
+            k: v for k, v in _ev.items() if k in ("source", "note") and v
+        }
+
+    # -- invariant sweep, record layer (2026-09-06). One judgment, every
+    # consumer: `renest lint` reads the same functions off renest.invariants, so
+    # the two sides cannot drift on what counts as a violation. Pack is not the
+    # police (packing preserves the scene): nothing here fails the pack.
+    # Two invariants are deliberately not re-said here: I-2 already hard-refused
+    # at archive time through the same module, and I-1 is voiced above by the
+    # family-split lock warnings, which carry family-specific advice the generic
+    # record cannot (--pin-wheels helps a vendor +cuNNN build and is exactly
+    # wrong for a distro- or image-owned one).
+    from .invariants import check_all as _check_invariants
+
+    warnings.extend(
+        v.message
+        for v in _check_invariants(manifest, "", (), workflow=_wf_json)
+        if v.code in ("workflow-ref-missing", "model-license-missing", "base-image-missing")
+    )
 
     return manifest, inventory
 
@@ -2523,7 +2952,32 @@ def infer_spec_current_state(
             cui.pop("workflow_path", None)
             cui["workflow_inline"] = driving.workflow
         if evidence.verified:
-            cui["verified_run"] = {"queue_completed_at": _iso_utc(evidence.most_recent.mtime)}
+            cui["verified_run"] = {
+                "queue_completed_at": _iso_utc(evidence.most_recent.mtime),
+                # Format 2.11: the strongest claim in the format states its own rung
+                # rather than leaving a reader to know the convention. A recipe read out
+                # of a file the finished run wrote for itself is `observed_run` -- the
+                # one rung a consumer is allowed to refuse on.
+                "evidence_source": "observed_run",
+            }
+
+    # **Whether this nest carries proof it ever ran** (format 2.11). This route looked
+    # -- that is the whole of what it does -- so it may say `none` when it found
+    # nothing, and `none` is a different statement from saying nothing at all. Before
+    # 2.11 both came out as an absent `verified_run` block, so a nest packed as it
+    # stands (`--auto`) was indistinguishable downstream from one packed off a run
+    # somebody watched finish. Written from the same `evidence` object the disclosure
+    # line below is written from, so the manifest and the words on the screen cannot
+    # disagree.
+    spec["_evidence"] = (
+        {"source": "observed_run"}
+        if evidence.verified
+        else {
+            "source": "none",
+            "note": "Packed as it stands: no finished run with its recipe attached was "
+                    "found in this environment.",
+        }
+    )
 
     extra = [r.workflow for r in (*evidence.recipes, *saved) if r is not driving]
     if extra:
@@ -2666,7 +3120,12 @@ def pack(
     run_record: dict | None = None,
     uploader: Uploader | None = None,
     emitter: EventEmitter | None = None,
-    pin_wheels: bool = False,
+    # On by default since 0.1.13 (decided 2026-09-06): the one online pack step.
+    # A vendor-only pin (torch==…+cuXXX) shipped bare killed the first real 64 GB
+    # restore after the downloads — so the exact download address is recorded by
+    # default, and packing with no network is the explicit choice (--offline),
+    # which archives faithfully and marks the nest as not rebuildable elsewhere.
+    pin_wheels: bool = True,
     client: httpx.Client | None = None,
     i_know: bool = False,
     no_licence_lookup: bool = False,
@@ -2699,6 +3158,9 @@ def pack(
     _program_dir = Path(program_dir).resolve() if program_dir else None
     report = PackReport(dry_run=dry_run)
     warnings: list[str] = []
+    # Reasons this nest, as packed, cannot be rebuilt elsewhere (report layer
+    # only; folded into report.restorable below). Filled by the offline branch.
+    unrestorable: list[str] = []
     # One record of what has been read, held across capture and the pack that
     # follows. It gets its file below, once the environment root is known.
     if hash_cache is None:
@@ -2762,6 +3224,28 @@ def pack(
         # custom node came from, so it is not in the nest" hands the user an
         # inventory that looks complete and fails at rebuild time.
         warnings.extend(cap_report.get("gaps", []))
+
+    # -- Are we ourselves installed in the environment being packed? -----------
+    # The one wrong-but-natural move a newcomer makes: venv active, mental model
+    # "back this app up", so `pip install renest` / `uv pip install renest` goes
+    # straight into the environment about to be captured. By pack time any
+    # displacement has already happened, so nothing here blocks — but it must be
+    # said out loud, and the report must carry the fact as data, not prose only.
+    _env_sp = _site_packages_for(root, env_python, program_dir=_program_dir)
+    _self_at = self_installed_in_env(env_dir_of(_env_sp) if _env_sp is not None else None)
+    if _self_at is not None:
+        report.renest_in_packed_env = True
+        warnings.append(
+            f"renest itself is installed inside the environment being packed "
+            f"({_self_at}). Installing it there can displace libraries this "
+            f"environment's app was already using with the versions our own "
+            f"dependencies want — `uv pip install` does this without a word — so "
+            f"the dependency list going into this nest may describe an environment "
+            f"your workflow never actually ran on. Packing continues: the archive "
+            f"is still a faithful record of this machine as it stands. Next time, "
+            f"install the tool with `uv tool install renest` — that gives it an "
+            f"environment of its own, away from the ones it packs."
+        )
 
     # -- Never quietly produce a nest that is doomed not to rebuild ------------
     # With no interpreter found (no .venv, no --env-python) the python version is
@@ -2837,15 +3321,25 @@ def pack(
                 manifest, inventory = _build_manifest(
                     root, spec, place=place, work=work, env_python=env_python,
                     no_fingerprint=no_fingerprint, warnings=warnings, dry_run=True,
+                    unrestorable=unrestorable,
                     pin_wheels=pin_wheels, client=client, no_licence_lookup=no_licence_lookup,
                     mine=mine, cache=hash_cache, program_dir=_program_dir,
                 )
+                # The same last gate as a real pack. A dry run that waves an
+                # unresolved placeholder through lets "the dry run was green"
+                # pass for a safety statement, while the real pack is certain to
+                # refuse the very same manifest — one rented machine burned on
+                # exactly that on 2026-09-06. A dry run must predict the real
+                # pack, not flatter it.
+                _refuse_unresolved_placeholders(manifest)
                 report.nest_id = manifest["id"]
                 report.manifest = manifest
                 report.inventory = inventory
                 report.blob_count = len(inventory)
                 report.total_bytes = sum(i.get("size_bytes", i.get("approx_bytes", 0)) for i in inventory)
                 report.findings = warnings
+                report.restorable = not unrestorable
+                report.unrestorable_reasons = list(unrestorable)
                 report.ok = True
                 report.exit_code = int(ExitCode.OK)
                 log(f"Dry run: {report.blob_count} item(s), {report.total_bytes} bytes in total")
@@ -2871,6 +3365,7 @@ def pack(
             manifest, inventory = _build_manifest(
                 root, spec, place=place, work=work, env_python=env_python,
                 no_fingerprint=no_fingerprint, warnings=warnings, dry_run=False,
+                unrestorable=unrestorable,
                 pin_wheels=pin_wheels, client=client, no_licence_lookup=no_licence_lookup,
                 mine=mine, emitter=emitter, cache=hash_cache, program_dir=_program_dir,
             )
@@ -2926,6 +3421,8 @@ def pack(
                 return report
 
             report.findings = warnings
+            report.restorable = not unrestorable
+            report.unrestorable_reasons = list(unrestorable)
             report.ok = True
             report.exit_code = int(ExitCode.OK)
             log(f"Packed: {manifest_path} (nest {nest_id})")
@@ -2933,7 +3430,21 @@ def pack(
     except PackError as e:
         report.exit_code = e.exit_code
         report.ok = False
+        # Not every PackError carries a structured failure object yet; the ones
+        # that do (the still-verifying timeout) must reach the JSON report
+        # instead of leaving ``failure: null`` next to ``ok: false``.
+        report.failure = e.failure
         report.findings = warnings + [e.human]
+        return report
+    except NestFailure as e:
+        # The refusal gates inside packing (unresolved placeholders, and any
+        # other P-stage NestFailure) end as a structured red report — exit code
+        # and error object from the failure itself — not as a traceback with a
+        # meaningless interpreter exit code.
+        report.exit_code = e.exit_code
+        report.ok = False
+        report.failure = e.to_error_object()
+        report.findings = warnings + [e.format_human()]
         return report
     except subprocess.CalledProcessError as e:
         report.exit_code = int(ExitCode.USAGE)
@@ -3071,7 +3582,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
              "re-reads only files whose size, time or place on disk moved since last "
              "time — use this if you suspect a file changed without any of those moving",
     )
-    parser.add_argument("--env-python", help="Python interpreter of the environment being packed (we read its details from there)")
+    parser.add_argument("--env-python", help="Python interpreter of the environment being packed (we read its details from there). Applies to the ComfyUI / generic pack path; in the fine-tuning pack path the python version is taken from the run record instead, so this flag does not set it there.")
     parser.add_argument("--no-fingerprint", action="store_true")
     parser.add_argument(
         "--no-licence-lookup",
@@ -3103,8 +3614,19 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "--pin-wheels",
         action="store_true",
         help="Pin packages carrying a vendor-only version (like torch==2.4.1+cu124) to direct "
-             "wheel URLs. PyPI doesn't have those versions, so without this a restore can't "
-             "install them. This reads the vendor's index, so it needs network access and is off by default",
+             "wheel URLs — PyPI doesn't have those versions, so without a pinned address a "
+             "restore can't install them. On by default; this flag only forces it back on "
+             "when combined with --offline",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Pack with zero network: no wheel pinning, no licence lookups. The archive is "
+             "still a faithful record of this machine, but packages pinned to a vendor-only "
+             "version (torch==…+cuXXX) keep no download address, so the nest is marked as "
+             "not rebuildable on another machine and a restore will say so up front. "
+             "Licences stay marked as your own claim, unchecked. --pin-wheels and "
+             "--no-licence-lookup still override their half individually",
     )
     # -- Direct upload to the hosted drive (needs an access token) -------------
     # First-layer help offers one road. "s3" stays a fully valid value — the
@@ -3311,6 +3833,11 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
         for note in kind_advice(spec.get("files")):
             print(f"! {note}", file=sys.stderr)
 
+    _pin, _no_licence = offline_effects(
+        getattr(args, "offline", False),
+        getattr(args, "pin_wheels", False),
+        getattr(args, "no_licence_lookup", False),
+    )
     report = pack(
         args.dir,
         spec,
@@ -3327,9 +3854,9 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
         run_record=run_record,
         uploader=hosted_uploader or byos_uploader,
         emitter=None,
-        pin_wheels=getattr(args, "pin_wheels", False),
+        pin_wheels=_pin,
         i_know=getattr(args, "i_know", False),
-        no_licence_lookup=getattr(args, "no_licence_lookup", False),
+        no_licence_lookup=_no_licence,
         mine=set(getattr(args, "mine", None) or ()),
         full_rehash=getattr(args, "full_rehash", False),
     )
@@ -3372,6 +3899,19 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
                 f"{report.blob_count} items / {report.total_bytes} bytes",
                 file=sys.stderr,
             )
+        # The one fact a hand-off or a restore decision hangs on, said at the
+        # end where it cannot scroll away among the warnings. Deliberately
+        # separate from the "renest inside the packed environment" advisory:
+        # that one says the record may describe the wrong environment, this one
+        # says the record cannot be rebuilt — mixing them buries both.
+        if report.ok and not report.restorable:
+            print(
+                "■ Rebuildable elsewhere: NO — archived faithfully, but as packed "
+                "this nest cannot be rebuilt on another machine:",
+                file=sys.stderr,
+            )
+            for _r in report.unrestorable_reasons:
+                print(f"  · {_r}", file=sys.stderr)
         else:
             print(
                 f"✗ Pack failed: nest {report.nest_id} "

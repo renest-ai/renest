@@ -36,6 +36,7 @@ from .config import (
     resolve_credentials,
     user_config_path,
 )
+from .envlock import installed_dist_infos, requires_of
 from .errors import ErrorClass, ExitCode
 from .events import EventEmitter
 from .fingerprint import Fingerprint, collect, collect_wheel_env
@@ -68,6 +69,7 @@ __all__ = [
     "TORCH_FAMILY",
     "check_lock_cuda_vs_driver",
     "check_lock_torch_floors",
+    "check_tool_isolation",
     "lock_versions",
     "SILENT_TORCH_FLOORS",
     "lock_cuda_majors",
@@ -129,6 +131,13 @@ _NEST_FREE_CHECKS: frozenset[str] = frozenset({"cpu_flags", "local_disk", "ram",
 _LOCK_CHECKS: frozenset[str] = frozenset(
     {"lock_cuda_family", "lock_cuda_vs_driver", "lock_sources", "lock_torch_floors"}
 )
+
+#: Checks that are advice about this machine's own housekeeping, never about
+#: whether the nest at hand can be rebuilt here. They show in the table and in
+#: the JSON, and **never move the exit code**: a verdict about a nest must not
+#: turn yellow over how the tool itself happens to be installed — that trains
+#: people to reach for --force, and --force fixes nothing about it anyway.
+_ADVICE_ONLY_CHECKS: frozenset[str] = frozenset({"tool_isolation"})
 
 #: Names of the Intel/AMD chip family — every spelling ``platform.machine()``
 #: uses for it across systems.
@@ -1396,6 +1405,100 @@ def check_uv() -> CheckResult:
     )
 
 
+#: Installer plumbing that ``python -m venv`` drops into every fresh
+#: environment. Sharing an environment with these is not sharing it with an
+#: application, so they never count as evidence of a shared environment.
+_ENV_PLUMBING = frozenset({"pip", "setuptools", "wheel"})
+
+#: The distribution name at the front of a ``Requires-Dist`` value, before any
+#: extras, version specifier or environment marker. **One implementation, in
+#: envlock** -- pack now walks the same headers to tell conda's own parts from the
+#: app's, and two copies of "what does this distribution require" is exactly how a
+#: gate and its ledger drift apart.
+_requires_of = requires_of
+
+
+def check_tool_isolation(site_packages: Path | None = None) -> CheckResult:
+    """Does renest have a Python environment of its own, or does it live with
+    an application? Advice-level, never a reject (see _ADVICE_ONLY_CHECKS).
+
+    Why this is worth a line: installed into the same environment as an app
+    (the natural first move — venv active, `pip install renest`), installing or
+    upgrading us can move versions of libraries that app was already using, and
+    a pack of that environment then records the moved versions. `uv tool
+    install renest` puts the tool in an environment of its own and the whole
+    class of trouble disappears.
+
+    Judged on installation facts read off disk, not on paths looking a certain
+    way: the environment renest is installed in either holds distributions
+    beyond renest and its own dependency closure, or it does not. A `uv tool` /
+    `pipx` install passes by that same fact (nothing else lives there), without
+    this code recognising either tool by name.
+    """
+    if site_packages is None:
+        import importlib.metadata as _im
+
+        try:
+            site_packages = Path(_im.distribution("renest").locate_file("")).resolve()
+        except (_im.PackageNotFoundError, OSError, TypeError):
+            site_packages = None
+    if site_packages is None or not site_packages.is_dir():
+        return CheckResult(
+            "tool_isolation",
+            LEVEL_UNKNOWN,
+            "Could not tell where renest itself is installed, so no view on "
+            "whether it shares an environment with other software.",
+            {"site_packages": None},
+        )
+    installed = installed_dist_infos(site_packages)
+    if "renest" not in installed:
+        return CheckResult(
+            "tool_isolation",
+            LEVEL_UNKNOWN,
+            "renest's own installation record was not found next to it, so no "
+            "view on whether it shares an environment with other software.",
+            {"site_packages": str(site_packages)},
+        )
+    # Everything renest itself drags in, transitively, judged among what is
+    # actually installed here.
+    closure = {"renest"}
+    frontier = ["renest"]
+    while frontier:
+        for req in _requires_of(installed[frontier.pop()]):
+            if req in installed and req not in closure:
+                closure.add(req)
+                frontier.append(req)
+    cohabitants = sorted(set(installed) - closure - _ENV_PLUMBING)
+    reading = {
+        "site_packages": str(site_packages),
+        "cohabitants": cohabitants[:20],
+        "cohabitant_count": len(cohabitants),
+    }
+    if not cohabitants:
+        return CheckResult(
+            "tool_isolation",
+            LEVEL_PASS,
+            "renest has this Python environment to itself, out of the way of "
+            "every application's libraries.",
+            reading,
+        )
+    names = ", ".join(cohabitants[:5]) + (
+        f" and {len(cohabitants) - 5} more" if len(cohabitants) > 5 else ""
+    )
+    return CheckResult(
+        "tool_isolation",
+        LEVEL_WARN,
+        f"renest is installed in the same Python environment as other software "
+        f"({names}), not in one of its own. Installing or upgrading it there "
+        f"can move versions of libraries that software was depending on — and a "
+        f"pack of that environment records the moved versions, not the ones "
+        f"your workflow ran on. Prefer `uv tool install renest`: it gives the "
+        f"tool an environment of its own, away from the ones it packs. Advice "
+        f"only — nothing is blocked, and the verdict does not change because of it.",
+        reading,
+    )
+
+
 def _nearest_existing_dir(path: str | os.PathLike[str]) -> Path:
     """The deepest part of ``path`` that exists as a directory today."""
     p = Path(os.fspath(path))
@@ -2226,7 +2329,8 @@ def compare_fingerprint(local: Fingerprint | dict, required: dict,
     Rules (initial, deliberately lenient — more warnings, fewer blocks):
     Python major.minor differs → blocking PYTHON_BLOCK; CUDA major differs →
     blocking CUDA_BLOCK; torch/os/critical-package diffs → warning; identical →
-    exact; torch+cuda major match with lesser diffs → compatible.
+    exact; torch+cuda major match with lesser diffs → compatible. A local torch
+    that was not found at all is *unmeasured*, never a mismatch: it warns.
     """
     local_d = local.to_dict(include_absent=True) if isinstance(local, Fingerprint) else dict(local)
     rows: list[dict] = []
@@ -2269,8 +2373,26 @@ def compare_fingerprint(local: Fingerprint | dict, required: dict,
     rtorch = required.get("torch") or {}
     lcuda = ltorch.get("cuda_version")
     rcuda = rtorch.get("cuda_version")
+    ltv = ltorch.get("version")
+    # Did the probe find a torch at all where it looked? `collect()` with no
+    # interpreter named probes **the interpreter renest itself runs on**, and the
+    # install form we tell strangers to use -- `uv tool install renest` -- puts the
+    # tool in an environment of its own (check_tool_isolation calls that the *good*
+    # install). That environment has no torch, so the reading comes back empty on
+    # exactly the machines a nest was packed on. Measured 2026-09-08, fine-tune cell:
+    # same image (pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime), same card, torch
+    # 2.4.0+cu121 sitting in /opt/conda -- and this check answered "blocked ... rent
+    # a machine that matches". An empty reading is an unanswered question, not a
+    # mismatch, and the authoritative CUDA reading is taken after the rebuild anyway
+    # (restore's checks_after_deps/torch_version_cuda, off the interpreter that will
+    # really run). A torch that *is* here but was built without CUDA is a different
+    # thing -- that is a real reading of a real mismatch, and still blocks.
+    torch_unmeasured = not ltv and not lcuda
     if rcuda:
-        if _major(lcuda) != _major(rcuda):
+        if torch_unmeasured:
+            row("torch.cuda_version", lcuda, rcuda, LEVEL_WARNING)
+            bump(LEVEL_WARNING, ErrorClass.WARNING_UNCONFIRMED)
+        elif _major(lcuda) != _major(rcuda):
             row("torch.cuda_version", lcuda, rcuda, LEVEL_BLOCKING)
             bump(LEVEL_BLOCKING, ErrorClass.CUDA_BLOCK)
         elif lcuda != rcuda:
@@ -2280,7 +2402,6 @@ def compare_fingerprint(local: Fingerprint | dict, required: dict,
             row("torch.cuda_version", lcuda, rcuda, LEVEL_EXACT)
 
     # -- torch version (warning on diff, compatible on major match) --
-    ltv = ltorch.get("version")
     rtv = rtorch.get("version")
     if rtv:
         if ltv == rtv:
@@ -2328,6 +2449,18 @@ def compare_fingerprint(local: Fingerprint | dict, required: dict,
         ),
     }
     summary = summaries[level]
+    # An empty reading needs its own sentence. Reusing the mismatch line above told a
+    # user standing on a matching machine that this machine "differs from the nest" --
+    # a claim nothing here measured. Say what actually happened: we looked in renest's
+    # own environment, which is not where the rebuild will run.
+    if torch_unmeasured and rcuda and level == LEVEL_WARNING:
+        summary = (
+            "could not read torch or CUDA from here: renest is installed in a Python "
+            "environment of its own, and the packages this nest names do not live "
+            "there. That is an unanswered question, not a mismatch -- nothing here "
+            "says this machine is wrong. The rebuild checks the CUDA it really gets "
+            "once the packages are installed"
+        )
     # Saying "check you booted the right image" without saying which one leaves the
     # reader to go dig the nest out. The name is in the manifest -- print it. Booting
     # that image is also how the system libraries a nest cannot carry all arrive at once.
@@ -2351,7 +2484,12 @@ def _verdict_exit_code(
         klass = PRECHECK_CLASS.get(rejects[0].name, ErrorClass.UNKNOWN)
         code = int(_S0_BY_CLASS.get(klass, ExitCode.S0_UNKNOWN))
         return int(ExitCode.OK) if force else code
-    warn = (precheck.overall == "warn") or (fp is not None and fp.level == LEVEL_WARNING)
+    # Advice-only checks (tool housekeeping) stay visible in the table and the
+    # JSON but never move the exit code — see _ADVICE_ONLY_CHECKS for why.
+    warn = any(
+        c.level == LEVEL_WARN and c.name not in _ADVICE_ONLY_CHECKS
+        for c in precheck.checks
+    ) or (fp is not None and fp.level == LEVEL_WARNING)
     if warn and not force:
         # 61 means only "short the libraries the working run used"; every other warning
         # is 67. Widened to cover both on 2026-08-23, narrowed back 08-29: one number
@@ -2544,6 +2682,10 @@ def doctor(
     emitter: EventEmitter | None = None,
     _local: Fingerprint | None = None,
     _precheck: PrecheckReport | None = None,
+    #: Test seam for the tool-isolation advice row. A real run (no injected
+    #: ``_precheck``) reads the machine; tests inject either report to stay
+    #: independent of how the machine running them installed this tool.
+    _tool_isolation: CheckResult | None = None,
     _gpu_name: str | None = None,
     #: Tests pin this so they never depend on which Pythons the machine running
     #: them happens to have; None means ask uv, which is what a real run does.
@@ -2559,6 +2701,12 @@ def doctor(
     local = _local if _local is not None else collect(python_path)
     local_d = local.to_dict(include_absent=True)
     storage = storage_report(_creds)
+    # How the tool itself is installed — advice about this machine, asked once
+    # for either branch below. Only measured for real when the precheck is too
+    # (an injected precheck means a test that wants full control of the rows).
+    iso = _tool_isolation if _tool_isolation is not None else (
+        check_tool_isolation() if (with_host_checks and _precheck is None) else None
+    )
 
     if manifest is None:
         # Without a nest there is nothing to *compare*, but most of the machine
@@ -2585,6 +2733,11 @@ def doctor(
                         if c.name in _NEST_FREE_CHECKS or c.name in _LOCK_CHECKS],
                 forced=precheck.forced,
             )
+        if iso is not None:
+            # The tool's own installation is a subject this machine does name,
+            # but the row is advice (_ADVICE_ONLY_CHECKS): shown, never scored.
+            precheck = precheck or PrecheckReport(forced=force)
+            precheck.checks.append(iso)
         # Machine findings stay notes; the lockfile is the only subject that was
         # named here, so it is the only one allowed to set the exit code.
         code = _verdict_exit_code(lock_only, None, force=force)
@@ -2645,6 +2798,8 @@ def doctor(
                 nest_runtime=runtime,
             )
     precheck = precheck or PrecheckReport(forced=force)
+    if iso is not None:
+        precheck.checks.append(iso)
     code = _verdict_exit_code(precheck, fp_verdict, force=force)
 
     coverage = gpu_coverage(_gpu_name if _gpu_name is not None else collect_gpu_name())

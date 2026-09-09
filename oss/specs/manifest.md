@@ -1,4 +1,4 @@
-# manifest v2.10 · Nest manifest specification
+# manifest v2.11 · Nest manifest specification
 
 <!-- Version tripwire: the line "current version **x.y**" below is parsed by
      oss/tests/consistency/test_format_version_pinned.py and must agree with
@@ -6,11 +6,11 @@
      top line of the change log. This is the fifth place the version appears --
      the prose is not allowed to drift from the other four. -->
 
-> Status: **current version 2.10** (2026-09-05). Any field change is a format
+> Status: **current version 2.11** (2026-09-07). Any field change is a format
 > change: bump the version and update `manifest.schema.json`, `restore.sh` and
 > `renest lint` in the same change.
 >
-> **Readable versions**: `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` / `2.10`, plus **any future minor
+> **Readable versions**: `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` / `2.10` / `2.11`, plus **any future minor
 > version of the same major** (a reader meeting a newer minor number warns and
 > continues; it does not reject the nest -- see §2).
 > **1.x is refused outright** (a one-time clean break taken while there were no
@@ -24,7 +24,9 @@
 > from machine to machine), 2.6 in §12 (four things packing knew and threw away),
 > 2.7 in §13 (`files[].kind` became an open string), 2.8 in §16 (which copy of a
 > module the working run used when several packages write the same folder),
-> 2.10 in §17 (how much system memory the packing machine could use).
+> 2.10 in §17 (how much system memory the packing machine could use),
+> 2.11 in §18 (where a recorded claim came from, and whether anyone ever saw
+> this nest work).
 > **Every 2.x nest still reads**: no version after 2.0 tightened anything.
 >
 > This document is the **frozen description** of the format: written field by
@@ -70,7 +72,7 @@ have restored perfectly into a brick.
 
 | Field | Required | Type | One line |
 |---|---|---|---|
-| `format_version` | ✔ | enum `2.0` … `2.10` | Format version (the schema enum is the only source of truth) |
+| `format_version` | ✔ | enum `2.0` … `2.11` | Format version (the schema enum is the only source of truth) |
 | `id` | ✔ | string (ULID) | Nest identifier, 26-character Crockford base32 |
 | `created_at` | ✔ | date-time | When it was packed |
 | `name` | | string ≤120 | Human-chosen name |
@@ -85,6 +87,7 @@ have restored perfectly into a brick.
 | `post_install` | | string | Global post-install command (escape hatch) |
 | `adapters` | | object | Scenario adapter namespace |
 | `creation` | | object | Metadata about where it was created |
+| `evidence` | | object | **Added in 2.11**: whether anyone ever saw this nest work, and how strong the proof is (§18) |
 | `derived_from` | | object | **Added in 2.4, reserved**: which nest this one was made from (§6.2) |
 | `api_deps` | | array | External API dependencies (honest boundary) |
 
@@ -113,7 +116,7 @@ of truth.
 
 ## 2. Identity and metadata
 
-### `format_version` — enum `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` / `2.10` `[schema]`
+### `format_version` — enum `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` / `2.10` / `2.11` `[schema]`
 
 **The `enum` in the schema is the only source of truth.** Everywhere else,
 including this document, is a restatement. Changing the version means changing
@@ -561,7 +564,8 @@ installer this project standardises on.
 | `lockfile_path` | | relpath | **Added in 2.6**: where that lockfile sat in the environment |
 | `pinned_wheel_urls` | | integer ≥0 | **How many packages are pinned to a direct wheel URL** (a count, not a list) |
 | `wheels_archived` | | boolean (default false) | true = the wheels are archived too (resists link rot, costs size) |
-| `hosts` | | array of string | **Added in 2.2**: which hosts installing dependencies will contact |
+| `local_version_sources` | | object | **Added in 2.11**: which index each still-bare vendor-only pin came from (§18) |
+| `hosts` | | array of string | **Added in 2.2**: which hosts installing dependencies will contact. **Widened in 2.11**: it also covers the indexes named by `local_version_sources` |
 
 **Why `lockfile` became optional, and the packing discipline that goes with it**
 `[2.3]`: some environments have no lockfile at all (the desktop build of ComfyUI
@@ -634,6 +638,39 @@ downstream that this lock's reproducibility depends on that wheel host staying
 up. **Note**: the actual URLs and their hashes **live inside the `lockfile`
 blob**; the top level exposes only a count -- which is where the escape hatch's
 "no uv available" fallback problem comes from (§9).
+
+**`local_version_sources` (2.11) -- the honest record for the pins that stayed
+bare.** Pinning a vendor-only line to a direct wheel URL is opt-in (it needs the
+network), so nests ship carrying lines like `torch==2.11.0+cu128`: a name and a
+version that no public index serves, with no address anywhere in the nest. This
+field records which index that package was installed from, per package.
+
+- **A direct URL stays the only authoritative address.** A line already pinned is
+  resolved and does not appear here at all, so the two records cannot disagree
+  about one package. This one describes an *unresolved* line, and says so.
+- **The shape.** Keys are distribution names as they appear in the lock; each
+  value carries `index_url` (the index, `https` only -- a plain-http one is not
+  recorded, because recording it would read as a recommendation) and `source`
+  (how that address was learnt).
+- **Read, never inferred.** `source: direct_url` = the installed package's own
+  `direct_url.json` (PEP 610) recorded it -- `observed_machine` on the evidence
+  ladder (§18). `source: index_config` = the index this environment was configured
+  to use -- `declared_metadata`, weaker, because it says where packages came from
+  in general and not where this one did. **There is deliberately no value meaning
+  "worked out from the `+cuNNN` suffix"**: that mapping is a table someone would
+  have to keep matching a vendor's URL layout, and in the manifest it would be
+  indistinguishable from something measured. When neither route answers, the
+  package is left out -- a nest that says nothing is repairable; one that says
+  something wrong sends the person repairing it to the wrong place.
+- **Three obligations on a consumer.** (1) These hosts count as hosts a rebuild
+  reaches out to and must also appear in `hosts` -- `renest lint` refuses a nest
+  where one does not (`local-version-source-host-not-disclosed`). (2) The host
+  allow-list applies to them exactly as to any URL inside the lock. (3) **Never
+  add this index to the installer on its own** -- no automatic
+  `--extra-index-url`. Resolving one package name across two indexes is what
+  dependency-confusion attacks are made of, and the installer's refusal to do it
+  must not be loosened on a nest's say-so. Show it to the person repairing the
+  lock and let them decide.
 
 ### 4.3 `entrypoint` (optional) `[schema]`
 
@@ -908,7 +945,11 @@ still cannot reach the core fields.
   environment root. See below.
 - `workflow_name`: string.
 - `verified_run`: evidence for the "it worked" judgement -- `queue_completed_at`
-  (date-time), `duration_seconds` (number), `output_samples` (array of blobs).
+  (date-time), `duration_seconds` (number), `output_samples` (array of blobs),
+  `evidence_source` (**added in 2.11**: which rung of the evidence ladder this
+  proof sits on -- today always `observed_run`, because the recipe was read out of
+  a file the finished run wrote for itself; absent in every nest packed before
+  2.11, where `observed_run` is what it meant).
   **`output_samples` is never written** (2026-08-11 ruling) and the field is kept
   only for nests that already carry it: storing a sample would mean holding the
   user's own artwork and handing it on with the nest, and comparing against it
@@ -1568,3 +1609,89 @@ warns** -- the same discipline `gpu.observed_use` draws.
 | No refusal on a shortfall | The figure is what the packing machine had, not what the run was measured to use; a machine below it *may* still work (frameworks trade speed for memory). A wrong stop before the download costs more than a wrong warning -- the same line `gpu.observed_use` and `native_libs.method: "declared"` draw |
 | No "measured peak memory" figure | The application keeps no system-memory counter this pipeline can read at pack time, unlike video memory (which the panel samples while a run is alive). Recording the ceiling the run had is honest about being a bound; inventing a peak would not be |
 | `source` left optional | The reading always knows which path produced the number, but a third-party writer may not; making it required would push such a writer toward a guess, and a wrong `source` is worse than an absent one |
+
+## 18. What 2.11 changed (2026-09-07)
+
+**Three optional additions plus one reading rule, purely additive.** Every
+2.0-2.10 nest reads unchanged, and a nest without any of them behaves exactly as
+before on both restore paths.
+
+| # | Change | Breaks compatibility? | Why |
+|---|---|---|---|
+| ① | `$defs.evidence_source` -- a four-rung ladder naming how far a recorded claim stands from the run that actually worked | No (a reading rule over fields that already exist) | Five different provenance vocabularies were already in the format, each meaningful only to whoever wrote it. A consumer had to learn all five to decide how much weight a fact deserved |
+| ② | `evidence` (top level) -- whether anyone ever saw this nest work, and on which rung that proof sits | No (additive, optional) | "Packed as it stands" (`renest pack --auto`) and "packed off a run somebody watched finish" were indistinguishable downstream: both simply had no `verified_run` block, and so does every older nest |
+| ③ | `python_lock.local_version_sources` -- which index a still-bare vendor-only pin came from | No (additive, optional) | A lock line like `torch==2.11.0+cu128` names a package no public index serves, and until now no address for it existed anywhere in the nest. Measured 2026-09-06: a 64 GB restore died exactly there, after every model file had been paid for |
+
+### 18.1 The evidence ladder is a reading rule, not a second source of truth
+
+`$defs.evidence_source` has four values, strongest first:
+
+| Rung | What it means | What a consumer may do |
+|---|---|---|
+| `observed_run` | Read off something the successful run itself left behind, or read out of the application while it was still running | The only rung on which a consumer may **refuse** |
+| `observed_machine` | Measured on the packing machine after the fact -- true of the environment, only inferred to be true of the run | Warn, never refuse |
+| `declared_metadata` | Copied out of somebody else's declaration: package metadata, a lockfile on disk, a distribution's package database, a file header | Warn, never refuse |
+| `user_stated` | A person said so | **Never** the basis of a machine judgement; recorded because who said it matters in a dispute |
+
+**Nothing was renamed to fit this ladder, and nothing states its rung twice.**
+Every provenance marker already in the format keeps its own name and values; the
+table below says which rung each sits on, so that a consumer weighing a fact
+needs one vocabulary rather than five:
+
+| Existing field | Rung |
+|---|---|
+| `adapters.*.verified_run` | `observed_run` |
+| `runtime.native_libs.method: "loaded"` | `observed_run` |
+| node ownership taken from the extension's run record | `observed_run` |
+| `runtime.system_memory` | `observed_machine` |
+| `runtime.contested_modules[].winner_evidence` | `observed_machine` |
+| `runtime.driver_version`, the `gpu.*` machine readings | `observed_machine` |
+| `runtime.native_libs.method: "declared"` | `declared_metadata` |
+| `runtime.native_libs.packages` / `packages_from` | `declared_metadata` |
+| `python_lock` cases ③ and ④ (§3) | `declared_metadata` |
+| `files[].declared_base`, `code_deps[].upstream_match` | `declared_metadata` |
+| `license.declared_by: "user"`, any hand-written pack spec | `user_stated` |
+
+**The rungs measure distance from the run, not correctness.** A
+`declared_metadata` fact can be perfectly right; the ladder says only how much of
+it was witnessed. And the discipline `native_libs` already established holds
+throughout: **a thin authoritative claim is more dangerous than an honest weak
+one**, so a collector that cannot prove it reached the higher rung must record
+the lower one.
+
+### 18.2 `evidence` -- and why absent is not `none`
+
+| Sub-field | Required | Type | Notes |
+|---|---|---|---|
+| `source` | ✔ | `evidence_source`, or `none` | The rung the strongest proof in this nest sits on; `none` = looked for, and there was nothing |
+| `note` | | string ≤500 | One line of plain English for a person. A consumer branches on `source`, never on this text |
+
+**Absent means nobody looked. `none` means somebody looked and there was
+nothing.** A reader must never turn one into the other. This is the same failure
+this project keeps meeting from the other direction: a check whose precondition
+did not hold prints nothing, and the silence reads exactly like a pass.
+
+Which is why the packer writes the block **only from a route that actually
+looked**. The two inference routes do -- that is their whole job -- and they hand
+their verdict down; a nest built from a hand-written spec gets no block at all,
+because nothing in that path examined the environment. There is deliberately no
+fallback filling in `none` for the quiet case: inventing it is precisely what
+this field exists to prevent.
+
+**It is a disclosure, not a gate on restoring.** A nest whose evidence is `none`
+restores exactly like any other and every byte still comes back -- `none` says
+nothing about whether the files are intact, only about whether anyone ever saw
+them work. Refusing to restore on this field would break rule 5's promise.
+Handing off, publishing and serving are a different question and may take it into
+account.
+
+### Explicitly not done (2.11)
+
+| Not done | Why |
+|---|---|
+| No rename of the five existing provenance fields onto the new enum | Renaming them is a breaking change for every reader that already branches on them, buys nothing a mapping table does not, and would leave two spellings of one fact in circulation for years |
+| No `evidence` block written when nobody looked | Writing `none` there would be an invention, and it is the exact invention this field exists to prevent |
+| No refusal to restore on `evidence.source: none` | The escape hatch promises bytes, not a working application. A nest nobody watched work still restores byte for byte, and stopping it would break rule 5 |
+| No `local_version_sources` route that reads the index back from the `+cuNNN` suffix | It is a table someone must keep matching a vendor's URL layout, it is right until the vendor moves a path, and in the manifest it would be indistinguishable from a measurement |
+| No automatic `--extra-index-url` from `local_version_sources` | Resolving one package name across two indexes is what dependency-confusion attacks are made of. The installer's refusal to do it is a defence, not an inconvenience, and must not be loosened on a nest's say-so |
+| No new exit code, and no new refusal in the escape hatch | The exit-code table is a frozen contract, and the 2026-07-15 ruling puts every refusal on the agent side: the escape hatch informs, it does not block |

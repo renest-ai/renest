@@ -29,7 +29,7 @@ from typing import Any
 
 import httpx
 
-from .errors import ExitCode
+from .errors import ErrorClass, ExitCode, NestFailure
 from .pack import PackError
 from .update_rules import DEFAULT_ORIGIN
 from .uplink import UPLINK_CONTRACT_VERSION, machine_facts, scrub_events
@@ -128,21 +128,56 @@ def manifest_blobs(manifest: dict) -> dict[str, int]:
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 #: How long to wait for the server's verdict on a freshly uploaded nest.
-#: 120s is generous on purpose: since the check went event-driven (2026-08-18) a
-#: verdict lands in about 4-5 seconds, so this is ~25x headroom and costs nothing
-#: on the normal path. **Revisit if the check ever goes back to polling** — the
-#: old path could take up to an hour, and this default would be far too short.
-_VERDICT_WAIT_SECONDS = 120.0
+#: The wait *is* a poll (the very situation the old note here said would need a
+#: rethink), and the server paces its check by nest size. Real-machine numbers,
+#: 2026-09-06 (wan60 large packs): 18 GB verified in 4m37s, 46 GB in 10m45s —
+#: about 14-15 seconds per GB. So the window scales with the declared bytes at
+#: twice that measured rate (margin for a slower day), keeps the old 120 s floor
+#: so small nests lose nothing, and is capped at 30 minutes: past that, holding
+#: the terminal (often a billed GPU machine) costs more than handing over the
+#: check-later instructions the timed-out branch gives (version id + command).
+_VERDICT_MEASURED_SECONDS_PER_GB = 15.0  # measured 2026-09-06 (wan60): 14-15 s/GB
+_VERDICT_WAIT_SECONDS_PER_GB = 2 * _VERDICT_MEASURED_SECONDS_PER_GB
+_VERDICT_WAIT_FLOOR_SECONDS = 120.0
+_VERDICT_WAIT_CEILING_SECONDS = 30 * 60.0
 _VERDICT_POLL_FIRST = 1.0   # first gap; grows 1.6x per round
 _VERDICT_POLL_MAX = 5.0     # never sit longer than this between asks
 
 
-def _verdict_complaint(status: str, nest_id: str) -> tuple[str, int]:
+def _verdict_wait_seconds(total_bytes: int) -> float:
+    """The verdict window for a nest declaring ``total_bytes`` bytes.
+
+    ``min(max(120 s, 30 s/GB), 30 min)`` — see the constants above for where
+    every number comes from. Sized from the *declared* manifest bytes, not the
+    bytes uploaded this run: the server verifies the whole version, so a pack
+    that skipped most blobs as already-owned still waits for the full check.
+    """
+    gb = max(int(total_bytes), 0) / 1e9
+    return min(
+        max(_VERDICT_WAIT_FLOOR_SECONDS, gb * _VERDICT_WAIT_SECONDS_PER_GB),
+        _VERDICT_WAIT_CEILING_SECONDS,
+    )
+
+
+def _verdict_complaint(
+    status: str,
+    nest_id: str,
+    *,
+    version_id: str = "",
+    waited_seconds: float = 0.0,
+    total_bytes: int = 0,
+) -> tuple[str, int, dict | None]:
     """What to tell the user when the server did not say "stored and verified".
 
     Every branch has to answer the same question: *do I need to do this all over
     again?* Getting that wrong is expensive — a nest can be tens of gigabytes, and
     a wrong "try again" makes someone re-upload all of it for nothing.
+
+    Returns ``(message, exit_code, failure_object_or_None)``. Only the timed-out
+    branch carries a failure object: that is the one ending where nothing went
+    wrong, and before it did, ``--json`` closed on ``ok:false`` with
+    ``failure: null`` — a healthy server still at work dressed up as an
+    unexplained death (2026-09-06, twice on real machines).
     """
     check_again = f"renest list {nest_id}"
     if status == "failed":
@@ -152,6 +187,7 @@ def _verdict_complaint(status: str, nest_id: str) -> tuple[str, int]:
             f"lost — run `{check_again}` to see it, then pack and send again. If it "
             "fails the same way twice, the copy on this machine is likely damaged.",
             int(ExitCode.S2_HASH_MISMATCH),
+            None,
         )
     if status == "blocked":
         return (
@@ -159,15 +195,46 @@ def _verdict_complaint(status: str, nest_id: str) -> tuple[str, int]:
             f"Run `{check_again}` to see it. If you think that is wrong, open a support "
             "ticket — packing and sending again will not change the answer.",
             int(ExitCode.S2_HASH_MISMATCH),
+            None,
         )
-    return (
+    # Ran out of window while the server was still verifying. Estimate what is
+    # left from the measured rate: the window already covered 2x that rate, so
+    # one more measured-rate pass (never less than a minute) is the honest
+    # "check again in about this long".
+    gb = max(total_bytes, 0) / 1e9
+    est_remaining = max(int(round(gb * _VERDICT_MEASURED_SECONDS_PER_GB)), 60)
+    message = (
         "Your files are already on the server — **do not pack or upload this again**. "
-        "What has not happened yet is the server finishing its check, and we stopped "
-        f"waiting after {int(_VERDICT_WAIT_SECONDS)} seconds. Run `{check_again}` in a "
-        "few minutes: when that version reads 'stored & verified' it is done and there "
-        "is nothing more for you to do.",
-        int(ExitCode.S2_UNKNOWN),
+        "This is not a failure: the server is still verifying what you sent "
+        f"(nest version {version_id}), and we stopped waiting after "
+        f"{int(waited_seconds)} seconds. Verification runs at roughly "
+        f"{int(_VERDICT_MEASURED_SECONDS_PER_GB)} seconds per GB ({gb:.1f} GB here), "
+        f"so give it about {max(est_remaining // 60, 1)} more minute(s), then run "
+        f"`{check_again}`: when that version reads 'stored & verified' it is done "
+        "and there is nothing more for you to do."
     )
+    # Exit code stays 20 (S2_UNKNOWN): the exit-code table is the frozen
+    # "Master plan 1.2" contract (specs/restore-protocol.md is its human
+    # authority, and a consistency gate pins doc and enum together), so a new
+    # "uploaded, verdict pending" code is a format change with its own process,
+    # not something a bug fix smuggles in. The unambiguous semantics ride in
+    # the message above and in this failure object instead.
+    failure = NestFailure(
+        "P3",
+        ErrorClass.UNKNOWN,
+        message,
+        context={
+            "status": "verifying",
+            "not_a_failure": True,
+            "nest_id": nest_id,
+            "nest_version_id": version_id,
+            "waited_seconds": int(waited_seconds),
+            "estimated_remaining_seconds": est_remaining,
+            "check_command": check_again,
+        },
+        exit_code=int(ExitCode.S2_UNKNOWN),
+    ).to_error_object()
+    return message, int(ExitCode.S2_UNKNOWN), failure
 
 
 def _clean(text: object) -> str:
@@ -309,18 +376,27 @@ class HostedUploader:
         return resp
 
     def _await_verdict(
-        self, client: httpx.Client, version_id: str, *, sleep=time.sleep
+        self,
+        client: httpx.Client,
+        version_id: str,
+        *,
+        wait_seconds: float,
+        sleep=time.sleep,
+        clock=time.monotonic,
     ) -> str:
         """Poll until the server stops saying "verifying". Returns the final status.
 
-        Returns ``"verifying"`` if the wait ran out — the caller must treat that as
-        *not* a success. It never guesses: an unreachable server during the wait is
-        also reported as still-unknown rather than quietly turned into a pass.
+        ``wait_seconds`` is sized by the caller from the declared bytes (see
+        :func:`_verdict_wait_seconds`) — a fixed window here is what silently
+        timed out every nest over ~8 GB (2026-09-06). Returns ``"verifying"``
+        if the wait ran out — the caller must treat that as *not* a success.
+        It never guesses: an unreachable server during the wait is also
+        reported as still-unknown rather than quietly turned into a pass.
         """
-        deadline = time.monotonic() + _VERDICT_WAIT_SECONDS
+        deadline = clock() + wait_seconds
         gap = _VERDICT_POLL_FIRST
         status = "verifying"
-        while time.monotonic() < deadline:
+        while clock() < deadline:
             try:
                 got = self._api(client, "GET", f"/nest-versions/{version_id}").json()
                 status = str(got.get("status") or status)
@@ -330,7 +406,7 @@ class HostedUploader:
                 pass
             if status != "verifying":
                 return status
-            sleep(min(gap, max(deadline - time.monotonic(), 0.0)))
+            sleep(min(gap, max(deadline - clock(), 0.0)))
             gap = min(gap * 1.6, _VERDICT_POLL_MAX)
         return status
 
@@ -635,9 +711,14 @@ class HostedUploader:
             vno = commit.get("version_no")
             self.result.version_no = int(vno) if isinstance(vno, int) else None
             human_version = f"version {vno} of" if vno else "a new version of"
+            # The window scales with the *declared* bytes of the whole version
+            # (the server verifies all of it, not just what travelled this run).
+            total_declared = sum(wanted.values())
+            wait_seconds = _verdict_wait_seconds(total_declared)
             self._log(
                 f"Hosted storage has it: {human_version} nest {self.result.nest_id} "
-                "— waiting for the server to finish checking it…"
+                f"— the server is verifying {total_declared / 1e9:.1f} GB, "
+                f"waiting up to {max(int(round(wait_seconds / 60)), 1)} minute(s)…"
             )
 
             # **Wait for the real verdict before calling this a success.**
@@ -647,11 +728,17 @@ class HostedUploader:
             # callers read ok:true and moved on — one of ours did exactly that.
             # Reporting a success we have not been told about is worse than
             # reporting a failure: nobody goes back to look at a green run.
-            status = self._await_verdict(client, str(self.result.nest_version_id))
+            status = self._await_verdict(
+                client, str(self.result.nest_version_id), wait_seconds=wait_seconds
+            )
             self.result.status = status
             ok = status == "committed"
-            complaint, code = ("", int(ExitCode.OK)) if ok else _verdict_complaint(
-                status, str(self.result.nest_id)
+            complaint, code, failure = ("", int(ExitCode.OK), None) if ok else _verdict_complaint(
+                status,
+                str(self.result.nest_id),
+                version_id=str(self.result.nest_version_id),
+                waited_seconds=wait_seconds,
+                total_bytes=total_declared,
             )
             # Only ``ok`` and ``exit_code`` say how this ended, and both are already in
             # the outbound whitelist (uplink.py). Deliberately **not** adding a "status"
@@ -667,7 +754,7 @@ class HostedUploader:
                 "seconds": round(time.monotonic() - t0, 3),
             }])
             if not ok:
-                raise PackError(complaint, exit_code=code)
+                raise PackError(complaint, exit_code=code, failure=failure)
             self._log(f"The server checked it and it holds up: {human_version} "
                       f"nest {self.result.nest_id} is stored and verified.")
             return sizes
