@@ -36,8 +36,9 @@ from .config import (
     resolve_credentials,
     user_config_path,
 )
-from .envlock import installed_dist_infos, requires_of
+from .envlock import env_dir_of, installed_dist_infos, requires_of
 from .errors import ErrorClass, ExitCode
+from .roots import ENV_ROOT_TOKEN, resolve_env_root_token
 from .events import EventEmitter
 from .fingerprint import Fingerprint, collect, collect_wheel_env
 from .rules import DOCTOR_RULES, FINGERPRINT_MATRIX, load_rules
@@ -930,7 +931,13 @@ def check_lock_cuda_family(lock_text: str) -> CheckResult:
     )
 
 
-def check_lock_sources(lock_text: str) -> CheckResult:
+#: Stands in for the rebuild root when nobody has told us where it will be.
+#: `renest doctor --lock` judges a file on disk; there is no rebuild directory yet.
+#: The token itself is the fact we need — see `check_lock_sources`.
+_ENV_ROOT_STAND_IN = Path("/__renest_rebuild_root__")
+
+
+def check_lock_sources(lock_text: str, env_root: Path | None = None) -> CheckResult:
     """Does the lock draw dependencies from hosts we don't recognise?
 
     Said **before any money is spent**, not halfway through the install. This is
@@ -947,7 +954,25 @@ def check_lock_sources(lock_text: str) -> CheckResult:
     """
     from .wheels import audit_lock_urls
 
-    unknown = audit_lock_urls(lock_text)
+    # **Judge the text the rebuild will actually be handed.** A lock packed from an
+    # in-place install carries `file://__RENEST_ENV_ROOT__/x`: the token *means* "inside
+    # this nest's own rebuild root", which is precisely the case `audit_lock_urls`
+    # exempts. But with the token still in it the URL has a non-empty hostname
+    # (`__renest_env_root__`), so the exemption can never apply and every such line came
+    # back as an unknown source — a warning that is always wrong, on exactly the nests
+    # (`pip install -e .`: kohya_ss, LLaMA-Factory) where it fires. Restore already
+    # resolves the token before judging, in its S0 probe and its S3 gate; this makes
+    # doctor read the same text. Nothing is loosened: the resolved path still has to sit
+    # inside that root, so `…/../../etc` is reported exactly as before.
+    root = env_root
+    if ENV_ROOT_TOKEN in lock_text:
+        root = Path(env_root) if env_root is not None else _ENV_ROOT_STAND_IN
+        lock_text = resolve_env_root_token(lock_text, root)
+
+    unknown = audit_lock_urls(lock_text, env_root=root)
+    if root is _ENV_ROOT_STAND_IN:
+        # Say it back the way it was written, not with our stand-in in it.
+        unknown = [u.replace(str(_ENV_ROOT_STAND_IN), ENV_ROOT_TOKEN) for u in unknown]
     reading = {"unknown_sources": [u[:100] for u in unknown[:5]], "count": len(unknown)}
     if not unknown:
         return CheckResult("lock_sources", LEVEL_PASS,
@@ -1418,6 +1443,68 @@ _ENV_PLUMBING = frozenset({"pip", "setuptools", "wheel"})
 _requires_of = requires_of
 
 
+def _pyvenv_config(env_root: Path) -> dict[str, str] | None:
+    """``pyvenv.cfg`` next to an environment root, as lowercase key -> value.
+
+    ``None`` when there is no such file, i.e. the path is not a virtual
+    environment at all (a system interpreter's site-packages, a ``--user``
+    install) and there is no second layer to reason about.
+    """
+    try:
+        text = (env_root / "pyvenv.cfg").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            out[key.strip().lower()] = value.strip()
+    return out
+
+
+def _inherited_site_packages(env_root: Path) -> tuple[list[Path], bool]:
+    """The site-packages folders a venv **inherits** from its base interpreter,
+    and whether the base could be located at all.
+
+    Why this has to exist: a venv made with ``--system-site-packages`` is *two*
+    layers, and reading only the venv's own folder answers a different question
+    than the one asked. That is the shape a rented pod is usually in --
+    measured 2026-09-10 in a same-shape environment: the application's
+    libraries all sat in the inherited layer, the venv's own folder held
+    nothing but renest and its dependencies, and this check called that "renest
+    has this environment to itself".
+
+    Returns ``([], True)`` for an environment that inherits nothing (the normal
+    ``uv tool install`` / ``pipx`` shape, and any venv built without the flag)
+    and ``([], False)`` when the file says a layer is inherited but the base
+    cannot be found -- the caller must not read that as "nothing there".
+    """
+    cfg = _pyvenv_config(env_root)
+    if cfg is None:
+        return [], True                      # not a venv: there is only one layer
+    if cfg.get("include-system-site-packages", "false").strip().lower() != "true":
+        return [], True                      # a layer of its own, by construction
+    base = cfg.get("base-prefix") or cfg.get("home")
+    if not base:
+        return [], False
+    prefix = Path(base)
+    if prefix.name.lower() in {"bin", "scripts"}:
+        prefix = prefix.parent               # ``home`` names the interpreter's folder
+    if not prefix.is_dir():
+        return [], False
+    series = ".".join((cfg.get("version") or cfg.get("version_info") or "").split(".")[:2])
+    patterns = [f"lib/python{series}/*-packages", f"lib64/python{series}/*-packages"] if series else []
+    patterns += ["lib/python*/*-packages", "lib64/python*/*-packages", "Lib/*-packages"]
+    found: list[Path] = []
+    for pattern in patterns:
+        for candidate in sorted(prefix.glob(pattern)):
+            if candidate.is_dir() and candidate not in found:
+                found.append(candidate)
+        if found:
+            break
+    return found, True
+
+
 def check_tool_isolation(site_packages: Path | None = None) -> CheckResult:
     """Does renest have a Python environment of its own, or does it live with
     an application? Advice-level, never a reject (see _ADVICE_ONLY_CHECKS).
@@ -1434,6 +1521,15 @@ def check_tool_isolation(site_packages: Path | None = None) -> CheckResult:
     beyond renest and its own dependency closure, or it does not. A `uv tool` /
     `pipx` install passes by that same fact (nothing else lives there), without
     this code recognising either tool by name.
+
+    **Both layers count.** A venv made with ``--system-site-packages`` -- the
+    usual shape on a rented pod -- imports from its own folder *and* from the
+    base interpreter's, and the application's libraries are typically down in
+    the second one. Reading only the first made this check answer "renest has
+    this environment to itself" for the exact install it exists to catch
+    (measured 2026-09-10, `uv pip install renest` into a same-shape venv: nine
+    of the application's libraries had already been shadowed by ours, and the
+    verdict was still pass).
     """
     if site_packages is None:
         import importlib.metadata as _im
@@ -1459,22 +1555,54 @@ def check_tool_isolation(site_packages: Path | None = None) -> CheckResult:
             "view on whether it shares an environment with other software.",
             {"site_packages": str(site_packages)},
         )
+    # The environment can be two layers deep (see _inherited_site_packages);
+    # reading only the venv's own folder answers "is our folder tidy", which is
+    # not the question.
+    inherited_dirs, base_resolved = _inherited_site_packages(env_dir_of(site_packages))
+    inherited: dict[str, Path] = {}
+    for extra in inherited_dirs:
+        for name, info in installed_dist_infos(extra).items():
+            inherited.setdefault(name, info)
     # Everything renest itself drags in, transitively, judged among what is
-    # actually installed here.
+    # actually installed here -- **in either layer**. A dependency of ours that
+    # was already satisfied down below (pip honours that layer and skips it) is
+    # still a dependency of ours, and calling it an application's library would
+    # tell every pip user their environment is dirtier than it is.
+    everything = {**inherited, **installed}
     closure = {"renest"}
     frontier = ["renest"]
     while frontier:
-        for req in _requires_of(installed[frontier.pop()]):
-            if req in installed and req not in closure:
+        for req in _requires_of(everything[frontier.pop()]):
+            if req in everything and req not in closure:
                 closure.add(req)
                 frontier.append(req)
-    cohabitants = sorted(set(installed) - closure - _ENV_PLUMBING)
+    # Names we laid a second copy of on top of the layer underneath. Whatever
+    # the versions, the application below imports ours from here on -- and a
+    # pack of this environment records ours. Counting "cohabitants" alone can
+    # never see these: the libraries an app like ComfyUI shares with us are, by
+    # definition, inside our own dependency closure and get subtracted away.
+    shadowed = sorted((set(installed) & set(inherited)) - _ENV_PLUMBING)
+    cohabitants = sorted((set(installed) | set(inherited)) - closure - _ENV_PLUMBING)
     reading = {
         "site_packages": str(site_packages),
         "cohabitants": cohabitants[:20],
         "cohabitant_count": len(cohabitants),
+        "inherited_site_packages": [str(p) for p in inherited_dirs],
+        "shadowed": shadowed[:20],
+        "shadowed_count": len(shadowed),
     }
-    if not cohabitants:
+    if not base_resolved:
+        return CheckResult(
+            "tool_isolation",
+            LEVEL_UNKNOWN,
+            "This environment inherits a second layer of installed libraries "
+            "(its pyvenv.cfg says so) and that layer could not be found, so "
+            "there is no view on whether renest shares an environment with "
+            "other software. Reading only this environment's own folder would "
+            "answer a different question.",
+            reading,
+        )
+    if not cohabitants and not shadowed:
         return CheckResult(
             "tool_isolation",
             LEVEL_PASS,
@@ -1482,19 +1610,41 @@ def check_tool_isolation(site_packages: Path | None = None) -> CheckResult:
             "every application's libraries.",
             reading,
         )
-    names = ", ".join(cohabitants[:5]) + (
-        f" and {len(cohabitants) - 5} more" if len(cohabitants) > 5 else ""
-    )
+
+    def _listed(names: list[str]) -> str:
+        return ", ".join(names[:5]) + (
+            f" and {len(names) - 5} more" if len(names) > 5 else ""
+        )
+
+    # Two facts, either of which means this is not an environment of our own.
+    # The shadowing one goes first because it is the one already done: those
+    # imports resolve to our copies from now on, whatever the verdict says.
+    # Both are reported when both hold -- picking one drops the other silently.
+    if shadowed:
+        head = (
+            f"renest is installed into an environment that inherits another "
+            f"layer of libraries, and {len(shadowed)} of them "
+            f"({_listed(shadowed)}) now resolve to our copies instead of the "
+            f"ones that layer provides. The application here runs on our "
+            f"versions from now on, and a pack of this environment records "
+            f"ours, not the ones your workflow ran on."
+        )
+        if cohabitants:
+            head += f" It also holds software of its own ({_listed(cohabitants)})."
+    else:
+        head = (
+            f"renest is installed in the same Python environment as other "
+            f"software ({_listed(cohabitants)}), not in one of its own. "
+            f"Installing or upgrading it there can move versions of libraries "
+            f"that software was depending on — and a pack of that environment "
+            f"records the moved versions, not the ones your workflow ran on."
+        )
     return CheckResult(
         "tool_isolation",
         LEVEL_WARN,
-        f"renest is installed in the same Python environment as other software "
-        f"({names}), not in one of its own. Installing or upgrading it there "
-        f"can move versions of libraries that software was depending on — and a "
-        f"pack of that environment records the moved versions, not the ones "
-        f"your workflow ran on. Prefer `uv tool install renest`: it gives the "
-        f"tool an environment of its own, away from the ones it packs. Advice "
-        f"only — nothing is blocked, and the verdict does not change because of it.",
+        f"{head} Prefer `uv tool install renest`: it gives the tool an "
+        f"environment of its own, away from the ones it packs. Advice only — "
+        f"nothing is blocked, and the verdict does not change because of it.",
         reading,
     )
 
@@ -1935,7 +2085,19 @@ def check_system_layer(nest_runtime: dict | None, this_env: dict | None = None) 
     want_tag, got_tag = rt.get("platform_tag"), have.get("platform_tag")
     if want_tag and got_tag:
         reading["platform_tag"] = {"nest": want_tag, "this": got_tag}
-        if str(want_tag).split("-")[-1] != str(got_tag).split("-")[-1]:
+        # **Both ends of the tag, not just the last field.** `sysconfig.get_platform()`
+        # writes `linux-x86_64` and `macosx-10.13-x86_64`: the chip is the last field and
+        # **the operating system is the first**. Comparing only the last field said a
+        # Linux nest and a macOS machine were the same platform, because both end in
+        # `x86_64` -- the identical blind spot that, one module over, made pack record
+        # the macOS build's fingerprint for 11 packages and stop a restore at S3 with a
+        # hash mismatch (2026-09-09, fixed in `wheels.py`). Not the same function as
+        # `wheels.platform_tag_os`: that one reads *wheel* tags (`manylinux2014_x86_64`),
+        # these are sysconfig tags, and forcing one to parse the other would be a third
+        # way to get it wrong.
+        _os = lambda t: str(t).split("-")[0].lower()      # noqa: E731 - one expression
+        _chip = lambda t: str(t).split("-")[-1].lower()   # noqa: E731
+        if _chip(want_tag) != _chip(got_tag) or _os(want_tag) != _os(got_tag):
             level = LEVEL_WARN
             lines.append(
                 f"This machine's platform tag is {got_tag} and the nest's is {want_tag}. "

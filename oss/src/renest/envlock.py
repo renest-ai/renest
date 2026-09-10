@@ -234,8 +234,18 @@ def unreinstallable_manager_parts(site_packages: Path) -> set[str]:
 
     * :func:`package_manager_closure` — a structural fact off conda's own METADATA:
       is this distribution part of conda itself?
-    * :data:`CONDA_ONLY_PACKAGES` — a maintained list of names no package index
-      carries.
+    * :data:`CONDA_ONLY_PACKAGES` — a maintained list of names whose **conda builds**
+      are not published to PyPI at the same version.
+
+    **That second one is weaker than it used to say here, and the wording mattered.**
+    It read "names no package index carries", which is false for most of the list:
+    checked against PyPI on 2026-09-09, 9 of the 12 names exist there (``conda``,
+    ``menuinst``, ``mkl-service``, ``mkl_fft``, ``mkl_random`` and more). What is
+    absent is the *version* conda installed -- ``conda==24.1.2``, ``menuinst==2.1.1``
+    and ``libmambapy==1.5.8`` are each a 404 at that version. So the list is a proxy,
+    not a fact, and it earns its place only by being intersected with the closure
+    below: a name has to be conda's own machinery *as installed here* before the
+    proxy is allowed to decide anything.
 
     **Each covers the other's weakness, which is the whole point.** The list alone
     could name something an app legitimately depends on (drop it and the rebuild

@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
+import errno
 import hashlib
 import json
 import os
@@ -453,6 +454,130 @@ def _place_blob(
             exit_code=int(ExitCode.USAGE),
         )
     return {"sha256": h, "size_bytes": size}
+
+
+def hardlinks_refused(src_dir: Path, dest_dir: Path) -> OSError | None:
+    """Ask the disk **before** P1 whether it will hard-link into the nest.
+
+    Returns the refusal (an ``OSError``) when it will not, ``None`` when links
+    work. Comparing device numbers is a different, weaker question: the pack
+    that ran a 20 GB volume dry on 2026-07-13 was writing to the very
+    filesystem it was reading from, and the links were refused by a **quota**.
+    So this tries one real link and believes the answer.
+
+    A read-only source folder cannot hold a probe file; that is not a refusal,
+    so the device numbers decide (different disks can never be linked across).
+    """
+    try:
+        fd, probe_name = tempfile.mkstemp(dir=src_dir, prefix=".renest-link-probe-")
+    except OSError:
+        try:
+            same = os.stat(src_dir).st_dev == os.stat(dest_dir).st_dev
+        except OSError:
+            return None
+        if same:
+            return None
+        return OSError(errno.EXDEV, "the output folder is on a different disk")
+    os.close(fd)
+    probe = Path(probe_name)
+    link = Path(dest_dir) / (probe.name + ".link")
+    try:
+        os.link(probe, link)
+    except OSError as e:
+        return e
+    finally:
+        with contextlib.suppress(OSError):
+            link.unlink()
+        with contextlib.suppress(OSError):
+            probe.unlink()
+    return None
+
+
+def _declared_file_bytes(root: Path, spec: dict) -> int:
+    """Lower bound on what a copying pack has to write a second time.
+
+    Only the files the spec names: they are the bulk (model weights), and every
+    byte counted here is one we can point at on disk. Under-counting only costs
+    a warning that could have been a refusal; over-counting would refuse a pack
+    that would have fitted, so this leans low on purpose.
+    """
+    total = 0
+    seen: set[tuple[int, int]] = set()
+    for f in spec.get("files") or []:
+        if not isinstance(f, dict) or not f.get("path"):
+            continue
+        try:
+            if f.get("source_path"):
+                src = _spec_source(root, f, f["path"])
+            elif (f.get("root") or "env") == "env":
+                src = root / f["path"]
+            else:
+                src = resolve_file_root(f["root"], root) / f["path"]
+            st = src.stat()
+        except (OSError, ValueError):
+            continue
+        key = (st.st_dev, st.st_ino)
+        if key in seen:
+            continue
+        seen.add(key)
+        total += st.st_size
+    return total
+
+
+def _gb(n: int) -> str:
+    """Sizes a person can act on: a "0.0 GB" reading tells them nothing."""
+    return f"{n / 2**30:.1f} GB" if n >= 2**30 else f"{n / 2**20:.0f} MB"
+
+
+def second_copy_notice(
+    root: Path, out_blobs: Path, spec: dict, no_hardlink: bool
+) -> tuple[str, bool] | None:
+    """What to tell the user *before* any bytes move, when this pack will need
+    a second full-size copy of everything on disk.
+
+    Returns ``(message, fits)`` — ``fits`` is False when the copy provably does
+    not fit in the space left where the nest is being written. ``None`` means
+    hard links work and the nest costs no extra room.
+
+    Placing a file into the nest normally hard-links it, which costs nothing.
+    When linking is refused (a different disk, or a quota) every file is copied
+    instead, so packing a 64 GB run needs 128 GB free. That used to be said
+    only *after* P1 had finished copying — i.e. after the disk it warned about
+    had already filled up.
+    """
+    refusal = None if no_hardlink else hardlinks_refused(root, out_blobs)
+    if not no_hardlink and refusal is None:
+        return None
+    why = (
+        "--no-hardlink was asked for"
+        if no_hardlink
+        else f"this disk would not let us hard-link files into the nest ({refusal.strerror or refusal})"
+    )
+    needed = _declared_file_bytes(root, spec)
+    try:
+        free = shutil.disk_usage(out_blobs).free
+    except OSError:
+        free = -1
+    fits = free < 0 or needed <= free
+    if no_hardlink and fits:
+        # Asking for copies and getting copies is not news. Saying it every time
+        # trains people to skip the line that matters (test_pack.py:
+        # ``test_no_hardlink_on_purpose_says_nothing_about_copying``). What is
+        # still news — it will not fit — falls through below.
+        return None
+    room = (
+        f"This pack needs about {_gb(needed)} of it, and {_gb(free)} is free there."
+        if free >= 0
+        else f"This pack needs about {_gb(needed)} of it."
+    )
+    return (
+        f"Every file will be copied into the nest, because {why}. That means a "
+        f"second full-size copy of everything sits on disk before any of it is "
+        f"sent — plan for twice the space. {room} Put the output folder (--out) "
+        f"on the same disk as the files being packed to keep the copy, and the "
+        f"wait, out of it.",
+        fits,
+    )
 
 
 def _spec_source(root: Path, entry: dict, fallback: str) -> Path:
@@ -3132,6 +3257,9 @@ def pack(
     mine: set[str] | None = None,
     full_rehash: bool = False,
     hash_cache: HashCache | None = None,
+    # Said while the user can still act on it. The report's findings are read
+    # after the run is over, which is too late for "this needs twice the disk".
+    notice: Callable[[str], None] | None = None,
 ) -> PackReport:
     """Pack a working environment into a nest. Never raises for a pack failure —
     the report's ``exit_code`` carries the verdict.
@@ -3357,6 +3485,22 @@ def pack(
                 src, out_blobs, hardlink and not no_hardlink, cache=hash_cache,
                 on_copy_fallback=None if no_hardlink else _note_copy,
             )
+            # Said before a single byte is copied: a pack that has to copy
+            # needs the disk twice over, and the user has to hear that while
+            # they can still act on it (point --out somewhere else), not from a
+            # warning printed after P1 has already filled the disk up.
+            notice_pair = second_copy_notice(root, out_blobs, spec, no_hardlink)
+            if notice_pair is not None:
+                msg, fits = notice_pair
+                log(msg)
+                if notice is not None:
+                    notice(msg)
+                if not fits:
+                    # Refused, not attempted: the copy cannot fit, and finding
+                    # that out at 90% costs the whole pack.
+                    raise PackError(msg, exit_code=int(ExitCode.S0_DISK_INSUFFICIENT))
+                warnings.append(msg)
+
             # Per-stage announcements: whoever is watching needs to know whether
             # we are moving bytes (P1), writing the manifest (P2), or
             # reconciling (P4).
@@ -3435,6 +3579,19 @@ def pack(
         # instead of leaving ``failure: null`` next to ``ok: false``.
         report.failure = e.failure
         report.findings = warnings + [e.human]
+        # **A pack that stopped never earns "rebuildable elsewhere".** ``restorable``
+        # defaults to True and this branch used to leave it there, so a run that died
+        # mid-upload reported ``ok: false`` and ``restorable: true`` side by side.
+        # Measured 2026-09-09 (first LLaMA-Factory pack attempt): storage answered one part with 502,
+        # exit 14, ``hosted.nest_version_id: null`` -- nothing was registered, nothing
+        # could be rebuilt from it -- and the report still said the nest was restorable.
+        # Anything reading the JSON (hand-off, our own dashboards) reads that as a
+        # usable nest.
+        report.restorable = False
+        report.unrestorable_reasons = list(unrestorable) + [
+            "Packing stopped before it finished, so there is no complete nest to rebuild "
+            f"from: {e.human}"
+        ]
         return report
     except NestFailure as e:
         # The refusal gates inside packing (unresolved placeholders, and any
@@ -3859,6 +4016,9 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
         no_licence_lookup=_no_licence,
         mine=set(getattr(args, "mine", None) or ()),
         full_rehash=getattr(args, "full_rehash", False),
+        # Printed the moment it is known, not with the findings at the end: by
+        # then the second copy has either fitted or filled the disk.
+        notice=lambda m: print(f"⚠ {m}", file=sys.stderr, flush=True),
     )
     # Pack succeeded → record "this folder → this nest" in the target
     # directory's state area, so the next pack picks up where this one left off.

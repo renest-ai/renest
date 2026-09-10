@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .capture import CAPTURE_VERSION, CaptureResult
 from .roots import ROOT_PATH_PATTERNS, resolve_file_root
@@ -1001,18 +1001,7 @@ def capture_training(
         }
     )
 
-    # Read what is still missing off the spec we just built, instead of naming the same four
-    # fields every time. Everything above tries hard to fill these in, so a fixed list sends
-    # people to re-type values that are already there.
-    needs_manual = []
-    if str(base_image.get("ref", "")).startswith("<"):
-        needs_manual.append("base_image.ref")
-    if str(base_image.get("digest", "")).startswith(("<", "sha256:<")):
-        needs_manual.append("base_image.digest")
-    if str(runtime.get("python_version", "")).startswith("<"):
-        needs_manual.append("runtime.python_version")
-    if "python_lock" not in pack_spec:
-        needs_manual.append("python_lock.lockfile_path")
+    needs_manual = _needs_manual_from(base_image, runtime, "python_lock" in pack_spec, ep)
 
     report = {
         "capture_version": CAPTURE_VERSION,
@@ -1025,3 +1014,155 @@ def capture_training(
         "gaps": gaps,
     }
     return CaptureResult(pack_spec=pack_spec, report=report)
+
+
+# ------------------------------------------------- re-anchoring on rebuild --
+# A training config names where its results go, and a real one names it **absolutely**:
+# `output_dir: /workspace/train-root/out`. That path belongs to the machine it was packed
+# on. Measured 2026-09-09 (LLaMA-Factory leg, cells A8-LF-01/02): the rebuild put the nest
+# under `/workspace/glm/run`, the training ran to completion, wrote its adapter to
+# `/workspace/train-root/out` -- a folder outside the nest -- and S4 looked inside the nest,
+# found nothing, and stopped with exit 44. The words were right, the artifact was real, and
+# it was in the wrong place.
+#
+# The manifest already **names this spot**: `entrypoint.redactions` carries
+# `{"locator": {"file": ..., "key": ...}, "role": "output_dir", ...}`. Until now that was
+# only ever turned into a sentence (`restore.summarise_redactions`). Naming a spot and then
+# not moving it is how a nest restores "successfully" into something that cannot work.
+#
+# **Why the rebuild side and not the packing side.** The archive stays a byte-faithful copy
+# of the machine it came from: rewriting it there would hand the packer's own rebuild a file
+# they never wrote, and the recorded sha256 would stop describing the file they packed. The
+# same shape already exists one layer over -- the dependency lock is archived carrying
+# `__RENEST_ENV_ROOT__` and resolved at rebuild time (`roots.resolve_env_root_token`). A
+# config file holding a machine-specific path is that same problem. No manifest field is
+# added: this acts on data the format has recorded since 2.2.
+
+def _needs_manual_from(base_image: dict, runtime: dict, has_lock: bool,
+                       entrypoint: dict) -> list[str]:
+    """What this capture could not fill in, and what it filled in but cannot decide for you.
+
+    Read off the spec that was just built rather than named as a fixed list, so nobody is
+    sent to re-type a value that is already there.
+
+    **Every spot the capture itself named belongs on this list too.** Measured 2026-09-09
+    (LLaMA-Factory leg, cells A8-LF-01/02): the capture recorded a redaction for
+    ``sft.yaml -> output_dir`` -- correctly -- and still reported ``needs_manual_fill: []``.
+    Whoever read that report was told there was nothing left to deal with, while the one
+    thing that mattered sat three fields away; the rebuild later ran the training against
+    that other machine's folder and stopped with exit 44. A "what still needs you" list
+    that leaves out what we ourselves flagged is worse than no list: it is a clean bill of
+    health signed over a known problem.
+    """
+    out: list[str] = []
+    if str(base_image.get("ref", "")).startswith("<"):
+        out.append("base_image.ref")
+    if str(base_image.get("digest", "")).startswith(("<", "sha256:<")):
+        out.append("base_image.digest")
+    if str(runtime.get("python_version", "")).startswith("<"):
+        out.append("runtime.python_version")
+    if not has_lock:
+        out.append("python_lock.lockfile_path")
+    for r in ((entrypoint or {}).get("redactions") or []):
+        loc = r.get("locator") if isinstance(r, dict) else None
+        if isinstance(loc, dict) and loc.get("file") and loc.get("key"):
+            out.append(f"{loc['file']} \u2192 {loc['key']}")
+    return out
+
+
+def reanchor_target(old_value: str, expect_artifact: str | None, new_root: Path) -> Path | None:
+    """Where ``old_value`` should point on a machine whose nest sits at ``new_root``.
+
+    Returns None when it cannot be worked out **from recorded facts** -- and then nothing
+    is rewritten, because a made-up folder is worse than an honest sentence.
+
+    The arithmetic, with no guessing in it: ``expect_artifact`` is recorded relative to the
+    nest root (``out/adapter_model.safetensors``), so its parent is where the results went,
+    *as a location inside the nest*. If the absolute path ends with exactly that relative
+    folder, the two describe the same place from two sides, and re-anchoring it is
+    subtraction: strip the old machine's prefix, put the new root on instead.
+    """
+    if not old_value or not expect_artifact:
+        return None
+    rel = PurePosixPath(expect_artifact).parent
+    if str(rel) in (".", "", "/"):
+        return None
+    old = PurePosixPath(old_value.replace("\\", "/"))
+    if not old.is_absolute():
+        return None                      # already relative: it travels correctly as it is
+    if old.parts[-len(rel.parts):] != rel.parts:
+        return None                      # the two do not describe the same place
+    return Path(new_root) / Path(*rel.parts)
+
+
+#: `key: value` at the top level of a YAML file, with its own indentation and any trailing
+#: comment kept. Deliberately line-level rather than a parse-and-dump: a round trip through
+#: a YAML library rewrites the whole file -- comments gone, quoting changed, key order
+#: normalised -- and handing somebody back a reformatted copy of their own config is not
+#: what "we brought your files back" is supposed to mean.
+_TOP_LEVEL_KEY = "^(?P<key>{key})(?P<sep>:[ \\t]*)(?P<value>[^#\\n]*?)(?P<tail>[ \\t]*(?:#.*)?)$"
+
+
+def rewrite_top_level_value(text: str, key: str, value: str) -> tuple[str, str | None]:
+    """Replace one top-level ``key:``'s value. Returns ``(new text, the old value)``.
+
+    ``old value`` is None when the key is not there at the top level -- nested keys are
+    left alone rather than guessed at, because the locator this comes from records a key
+    and no path to it.
+    """
+    pattern = re.compile(_TOP_LEVEL_KEY.format(key=re.escape(key)), re.MULTILINE)
+    found: list[str] = []
+
+    def _sub(m: re.Match[str]) -> str:
+        if found:
+            return m.group(0)            # only the first; a duplicate key is not ours to pick
+        found.append(m.group("value").strip().strip("'\""))
+        return f"{m.group('key')}{m.group('sep')}{value}{m.group('tail')}"
+
+    out = pattern.sub(_sub, text)
+    return (out, found[0] if found else None)
+
+
+def reanchor_recorded_paths(manifest: dict, new_root: Path) -> list[str]:
+    """Re-anchor every recorded spot that still points at the packing machine.
+
+    Returns one plain sentence per file actually changed (empty when nothing was), so the
+    rebuild can say what it did. **Nothing is invented**: a spot is only moved when
+    :func:`reanchor_target` can work the new location out of what the manifest recorded,
+    and only when the value on disk really is an absolute path from somewhere else.
+    """
+    ep = manifest.get("entrypoint") or {}
+    expect = ((ep.get("success") or {}).get("expect_artifact")) or None
+    said: list[str] = []
+    for r in (ep.get("redactions") or []):
+        loc = r.get("locator") if isinstance(r, dict) else None
+        if not isinstance(loc, dict):
+            continue
+        rel, key = loc.get("file"), loc.get("key")
+        if not rel or not key:
+            continue
+        path = Path(new_root) / str(rel)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue                       # not here, or unreadable: say nothing, change nothing
+        _probe, old_value = rewrite_top_level_value(text, str(key), "")
+        if not old_value:
+            continue
+        want = reanchor_target(old_value, expect, new_root)
+        if want is None:
+            continue
+        new_text, _ = rewrite_top_level_value(text, str(key), str(want))
+        if new_text == text:
+            continue
+        try:
+            path.write_text(new_text, encoding="utf-8")
+        except OSError:
+            continue
+        said.append(
+            f"Pointed {rel}'s {key} back inside this rebuild: it still named "
+            f"{old_value}, a folder on the machine this was packed on, and results "
+            f"written there would land outside everything this rebuild checks. "
+            f"It now names {want}. Change it if you want them somewhere else."
+        )
+    return said

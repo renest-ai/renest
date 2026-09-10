@@ -55,6 +55,24 @@ MAX_PARALLEL_PUT = 4
 #: Timeout for storage calls (presigned part PUTs): a 64 MiB part takes a long
 #: time on a slow uplink, so read and write get a wide budget.
 _STORE_TIMEOUT = httpx.Timeout(connect=15.0, read=600.0, write=600.0, pool=15.0)
+#: How many times one part is attempted before the whole upload is given up on, and the
+#: exponential base between attempts (2s -> 4s). Same shape as the restore side's
+#: ``DEFAULT_RETRY_ROUNDS`` / ``DEFAULT_BACKOFF_BASE_S``; kept small because a presigned
+#: URL has a lifetime and sleeping through it helps nobody.
+#:
+#: **Why this exists** (measured 2026-09-09, A8-LF-pack): storage answered one part with
+#: HTTP 502 in the middle of a 15.2 GB upload. There was no retry, so pack stopped with
+#: exit 14, the version was never registered, and the whole 15.2 GB had to go up again
+#: from the start -- about $0.05 of rented GPU time and 20 minutes, to survive a blip
+#: that the very next request would have got past.
+_STORE_ATTEMPTS = 3
+_STORE_BACKOFF_BASE_S = 2.0
+#: Statuses worth another go: storage having a moment (5xx), asking us to slow down
+#: (429), or timing out its own request (408). **401/403/404 are deliberately absent** --
+#: a refused signature or a missing object answers the same way every time, and sleeping
+#: between identical refusals only spends rented minutes to arrive at the same verdict
+#: (the restore side learned this one first; see RETRYABLE_ERROR_CLASSES there).
+_RETRYABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 
 
 @dataclass
@@ -491,6 +509,11 @@ class HostedUploader:
         )
 
     def _upload_blob(self, client: httpx.Client, path: Path, plan: dict) -> int:
+        # The plan comes back from the server; the channel to speak on is ours, so it is
+        # attached here rather than asked of the API.
+        mp = plan.get("multipart")
+        if isinstance(mp, dict):
+            mp.setdefault("notice", self._log)
         return upload_blob_multipart(client, path, plan, max_parallel=MAX_PARALLEL_PUT)
 
     # -- Answering a byte spot check. Skipping an upload is **the server's
@@ -821,6 +844,8 @@ def store_put(
     *,
     resumable: bool = False,
     explain: Callable[[int, str], str] | None = None,
+    notice: Callable[[str], None] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> httpx.Response:
     """PUT one chunk of bytes to a presigned URL. A presigned URL carries its own
     authorization, so **no Authorization header may be added**.
@@ -830,28 +855,52 @@ def store_put(
     it stopped. The bring-your-own-storage path has no server-side session and
     running again only skips what is already in the bucket, so those users must
     not be promised that it "picks up where it stopped".
+
+    A part that fails on something transient (a 5xx, a 429, a dropped connection) is
+    attempted again with a short backoff -- ``_STORE_ATTEMPTS`` in total. PUT of a whole
+    part to a presigned URL is idempotent: the same bytes at the same URL, so a repeat
+    either replaces what half-landed or writes it for the first time. Refusals that mean
+    the same thing every time (401/403/404) are raised at once, unslept.
+
+    ``notice`` is where each retry is announced; ``sleep`` is a seam for tests only.
     """
-    try:
-        resp = client.put(url, content=content, timeout=_STORE_TIMEOUT)
-    except httpx.HTTPError as e:
-        tail = (
-            " The session is kept on the server, so running this again picks up where it "
-            "stopped."
-            if resumable
-            else " Run this again and it skips whatever already made it into the bucket."
-        )
-        raise PackError(
-            f"Upload interrupted: {type(e).__name__}.{tail}",
-            exit_code=int(ExitCode.S1_NETWORK_INTERRUPTED),
-        ) from e
-    if resp.status_code >= 300:
-        raise PackError(
-            f"Storage refused a part: HTTP {resp.status_code}"
-            + (" — that's a permissions/signature problem, not an outage."
-               if resp.status_code in (401, 403) else ""),
-            exit_code=storage_exit_code(resp.status_code),
-        )
-    return resp
+    last_error: PackError | None = None
+    for attempt in range(1, _STORE_ATTEMPTS + 1):
+        try:
+            resp = client.put(url, content=content, timeout=_STORE_TIMEOUT)
+        except httpx.HTTPError as e:
+            tail = (
+                " The session is kept on the server, so running this again picks up where it "
+                "stopped."
+                if resumable
+                else " Run this again and it skips whatever already made it into the bucket."
+            )
+            last_error = PackError(
+                f"Upload interrupted: {type(e).__name__}.{tail}",
+                exit_code=int(ExitCode.S1_NETWORK_INTERRUPTED),
+            )
+            last_error.__cause__ = e
+        else:
+            if resp.status_code < 300:
+                return resp
+            last_error = PackError(
+                f"Storage refused a part: HTTP {resp.status_code}"
+                + (" — that's a permissions/signature problem, not an outage."
+                   if resp.status_code in (401, 403) else ""),
+                exit_code=storage_exit_code(resp.status_code),
+            )
+            if resp.status_code not in _RETRYABLE_STATUSES:
+                raise last_error
+        if attempt < _STORE_ATTEMPTS:
+            wait = round(_STORE_BACKOFF_BASE_S * (2 ** (attempt - 1)), 3)
+            # **Say it.** A retry nobody is told about is the upload silently taking
+            # minutes longer than it should, with no way to tell that from a slow link.
+            if notice is not None:
+                notice(f"Storage did not take a part (attempt {attempt} of "
+                       f"{_STORE_ATTEMPTS}); trying that part again in {wait}s: {last_error}")
+            sleep(wait)
+    assert last_error is not None  # the loop cannot end without one
+    raise last_error
 
 
 def upload_blob_multipart(
@@ -879,6 +928,7 @@ def upload_blob_multipart(
     entries = sorted(mp["part_urls"], key=lambda e: int(e["part"]))
     total = path.stat().st_size
     explain = mp.get("explain")
+    notice = mp.get("notice")
     resumable = bool(mp.get("resumable"))
 
     def send(entry: dict) -> tuple[int, str, int]:
@@ -894,7 +944,8 @@ def upload_blob_multipart(
                 "changed while we were uploading?",
                 exit_code=int(ExitCode.S2_HASH_MISMATCH),
             )
-        resp = store_put(client, entry["url"], chunk, resumable=resumable, explain=explain)
+        resp = store_put(client, entry["url"], chunk, resumable=resumable, explain=explain,
+                         notice=notice)
         etag = resp.headers.get("ETag", "")
         if not etag:
             raise PackError(

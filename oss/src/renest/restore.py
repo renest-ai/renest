@@ -71,8 +71,9 @@ from .envlock import DISTRO_ONLY_PACKAGES
 from .errors import RETRYABLE_ERROR_CLASSES, NestFailure, ErrorClass, ExitCode
 from .events import EventEmitter, sanitise_terminal
 from .gated import GatedAsset, check_reach, fetch_from_origin, find_token, gated_assets, summarise
-from .integrity import probe_model_bytes
+from .integrity import looks_like_lfs_pointer, probe_model_bytes
 from .report import maybe_report_sink
+from .training import reanchor_recorded_paths
 from .roots import (
     ENV_ROOT_TOKEN,
     MAX_MANIFEST_FILES,
@@ -103,6 +104,9 @@ __all__ = [
     "OneshotRunner",
     "OneshotResult",
     "resolve_argv0",
+    "hf_offline_env",
+    "looks_like_a_file_the_nest_did_not_bring",
+    "HF_OFFLINE_SAY",
     "classify_deps_failure",
     "summarise_redactions",
     "LaunchHandle",
@@ -572,6 +576,43 @@ def _archive_emptiness_is_expected(dep: dict, manifest: dict) -> bool:
         for f in ((manifest or {}).get("files") or [])
     )
 
+#: How many pointer files one code folder may name before the rest are counted
+#: instead of listed -- a clone where ``git lfs pull`` never ran can hold
+#: hundreds of them, and a wall of identical lines hides the one sentence that
+#: says what to do.
+_LFS_REPORT_LIMIT = 5
+
+
+def _lfs_pointers_in_tree(root: Path, limit: int = _LFS_REPORT_LIMIT) -> tuple[list[str], int]:
+    """Files under ``root`` that are Git LFS pointer text instead of real content.
+
+    Packing already refuses a source tree in this state, but a nest packed before
+    that check existed (or by an older tool) carries the pointer text inside the
+    code archive, where **sha256 goes all green**: the bytes really are the bytes
+    that were packed. The asset probe above never sees them -- it walks
+    ``files[]``, and this text lives in the code folder -- so without this the
+    first sign is a model that will not load, on the far side of a restore that
+    reported success.
+
+    Same judgement as packing (:func:`renest.integrity.looks_like_lfs_pointer`),
+    deliberately the same function and not a second copy of the rule. Returns the
+    first ``limit`` paths relative to ``root`` plus the total count; never raises.
+    """
+    found: list[str] = []
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(root, onerror=lambda _e: None):
+        for fn in sorted(filenames):
+            p = Path(dirpath) / fn
+            if p.is_symlink():
+                continue
+            if looks_like_lfs_pointer(p):
+                total += 1
+                if len(found) < limit:
+                    with contextlib.suppress(ValueError):
+                        found.append(str(p.relative_to(root)))
+    return found, total
+
+
 def _tail(path: Path, n_chars: int = 600) -> str:
     try:
         text = path.read_text(errors="replace")
@@ -939,6 +980,66 @@ def resolve_argv0(argv0: str, env_root: Path, python_bin: Path) -> Path:
     return python_bin.parent / argv0
 
 
+#: What the person rebuilding is told the first time we start a run offline.
+HF_OFFLINE_SAY = (
+    "Starting this run offline (HF_HUB_OFFLINE=1): a nest carries the model files "
+    "its run needs, so it reads them from disk instead of asking huggingface.co. "
+    "If the run stops saying a model file is missing, that file did not travel with "
+    "this nest — re-run with HF_HUB_OFFLINE=0 in your environment to let it fetch."
+)
+
+#: Measured 2026-09-10 on a machine with no route to huggingface.co
+#: (fine-tuning leg A11-kohya-02 in the run-batch records, and reproduced locally
+#: against an unreachable `HF_ENDPOINT`): every byte the run needed was in the Hugging
+#: Face cache, and it still died. `transformers` 4.54.1
+#: (`utils/hub.py::list_repo_templates`) means to fall back to the local cache when
+#: the network is down, but it catches the **built-in** ``ConnectionError`` while
+#: `requests` raises its own class of that name — which is not a subclass of it —
+#: so the exception escapes to the top and the run exits 1.
+#:
+#: Telling the Hugging Face libraries up front that this run is offline skips that
+#: whole code path (`from_pretrained` logs "Offline mode: forcing
+#: local_files_only=True"). This is the honest setting for a nest either way: what
+#: a nest promises is that the files and dependencies come back and are checked,
+#: not that anything missing gets topped up over the network.
+#:
+#: **Only for the process we start**, and only when the person rebuilding has not
+#: already decided: an explicit ``HF_HUB_OFFLINE`` in their own environment wins,
+#: so ``HF_HUB_OFFLINE=0 renest restore …`` is the lever for a nest that really
+#: does need to fetch something. Nothing about the host's environment is changed.
+def hf_offline_env(base: Mapping[str, str]) -> dict[str, str]:
+    """The Hugging Face offline setting to add to a run's environment (or nothing).
+
+    Empty when the caller's environment already carries ``HF_HUB_OFFLINE``: their
+    choice is not ours to overrule.
+    """
+    if "HF_HUB_OFFLINE" in base:
+        return {}
+    return {"HF_HUB_OFFLINE": "1"}
+
+
+#: What the Hugging Face libraries say when a file is not in the cache and they
+#: are not allowed to go and get it. Kept as plain markers rather than one regex
+#: so a wording change upstream loses one line, not the whole check.
+_OFFLINE_CACHE_MISS_MARKS = (
+    "couldn't find them in the cached files",
+    "couldn't connect to 'https://huggingface.co'",
+    "outgoing traffic has been disabled",
+    "cannot find the requested files in the disk cache",
+    "localentrynotfounderror",
+    "offlinemodeisenabled",
+)
+
+
+def looks_like_a_file_the_nest_did_not_bring(text: str) -> bool:
+    """Does this log say the run wanted a model file that is not on this disk?
+
+    Used only to explain a failure better, never to decide one.
+    """
+    low = (text or "").lower()
+    return any(mark in low for mark in _OFFLINE_CACHE_MISS_MARKS)
+
+
 class OneshotRunner:
     """``entrypoint.kind == "oneshot"``: run to completion, verdict = exit code.
 
@@ -984,6 +1085,9 @@ class OneshotRunner:
         # The venv's bin must be on PATH: accelerate spawns an accelerate-launch
         # subcommand, so an absolute path alone gives FileNotFoundError.
         env["PATH"] = f"{python_bin.parent}{os.pathsep}{env.get('PATH', '')}"
+        # Read the run offline unless the person rebuilding said otherwise
+        # (see :func:`hf_offline_env`). Scoped to this subprocess.
+        env.update(hf_offline_env(env))
 
         log_path.parent.mkdir(parents=True, exist_ok=True)
         t0 = time.monotonic()
@@ -1365,6 +1469,16 @@ class RestoreReport:
     oneshot: dict | None = None  # kind=oneshot result (exit code / duration / log)
     #: Spots the user must point back at their own data after the rebuild
     redactions: list[str] = field(default_factory=list)
+    #: Recorded spots this rebuild **rewrote on disk**, one sentence each, naming the old
+    #: value and the new one. A rebuild that edits the user's config file and does not say
+    #: so leaves them holding a file they did not write and cannot tell apart from the one
+    #: they packed. Measured 2026-09-09 (A9-LF-01): ``sft.yaml``'s ``output_dir`` was
+    #: re-anchored correctly and the run passed, yet the whole restore output -- the JSON
+    #: report included -- carried no trace of the edit, because the sentence only went to
+    #: ``narrate`` and that prints solely under ``--verbose``. Same rule as
+    #: ``redactions``/``contested_modules`` right here: a fact only on the terminal, and
+    #: only for one flag, is invisible to everybody else.
+    reanchored: list[str] = field(default_factory=list)
     #: The CUDA version torch itself reports after dependency install, compared
     #: against what the nest declared
     checks_after_deps: dict = field(default_factory=dict)
@@ -1428,6 +1542,7 @@ class RestoreReport:
             "wheel_fallbacks": self.wheel_fallbacks,
             "oneshot": self.oneshot,
             "redactions": self.redactions,
+            "reanchored": self.reanchored,
             "checks_after_deps": self.checks_after_deps,
             "setup_skipped": self.setup_skipped,
             "gated": self.gated,
@@ -3671,6 +3786,24 @@ def restore(
                 raise NestFailure("S2", klass, f"Could not unpack {name}: {e}") from e
             except (tarfile.TarError, ValueError) as e:
                 raise NestFailure("S2", ErrorClass.UNKNOWN, f"Could not unpack {name}: {e}") from e
+            # Same bad-byte discipline as the assets above, on the other half of
+            # the nest: the code folder that just landed. Report, never block --
+            # the bytes match the nest exactly, so there is nothing this machine
+            # can do differently and stopping here leaves the user no way out.
+            pointers, n_pointers = _lfs_pointers_in_tree(install)
+            if pointers:
+                shown = ", ".join(pointers)
+                more = f" (and {n_pointers - len(pointers)} more)" if n_pointers > len(pointers) else ""
+                warning = (
+                    f"{n_pointers} file(s) in {name} are Git LFS pointer text, not the real "
+                    f"content: {shown}{more}. The machine this nest was packed from had a clone "
+                    f"where `git lfs pull` never ran, so the placeholders were packed instead of "
+                    f"the files. This is not a download problem — the bytes match the nest "
+                    f"exactly. Whoever packed it needs to pull the LFS content and pack again; "
+                    f"until then anything that reads those files will fail."
+                )
+                report.integrity_warnings.append(warning)
+                narrate(warning, stage="S2", level="warning")
             post = dep.get("post_install")
             if post and _setup_allowed(f"{name}'s setup commands", post):
                 r = runner(["bash", "-c", post], cwd=str(install))
@@ -3718,6 +3851,19 @@ def restore(
         # Which spots the user must point back at their own data, **said as soon
         # as the files land** instead of leaving them to guess once training says
         # "No data found".
+        # **Move what we named, before saying anything about it.** A training config
+        # names its output folder absolutely (`output_dir: /workspace/train-root/out`),
+        # and that folder belongs to the machine it was packed on. Measured 2026-09-09
+        # (LLaMA-Factory leg, A8-LF-01/02): the training ran to completion here and wrote
+        # its adapter to that other machine's path -- outside this nest -- so S4 looked
+        # inside the nest, found nothing, and stopped with exit 44. Every word printed was
+        # true; the file was simply somewhere nobody looked.
+        # Re-anchored from recorded facts only (see training.reanchor_target); when the
+        # arithmetic does not work out, nothing is touched and the sentence below stands
+        # on its own, exactly as before.
+        report.reanchored = reanchor_recorded_paths(mani, target)
+        for moved in report.reanchored:
+            narrate(moved, stage="S2")
         pointers = summarise_redactions(mani)
         if pointers:
             report.redactions = pointers
@@ -4042,6 +4188,11 @@ def restore(
         if _is_oneshot():
             ep = plan.entrypoint or {}
             want = int((ep.get("success") or {}).get("exit_code", 0))
+            # Say it before the run, not only when it goes wrong: the setting
+            # changes what "a missing model file" looks like, and the person
+            # watching should read that sentence first.
+            if hf_offline_env(os.environ):
+                narrate(HF_OFFLINE_SAY, stage="S4")
             res = (opts.oneshot_runner or OneshotRunner()).run(
                 target, ep, py, evidence / "entrypoint.log"
             )
@@ -4084,6 +4235,24 @@ def restore(
                         + f" The run's own log: {res.log_path}",
                         detail=_tail(res.log_path),
                         context={"gpu_has_no_kernels": True,
+                                 "exit_code": res.exit_code},
+                    )
+                # We started this run offline on purpose, so a model file that never
+                # travelled with the nest now reads as "could not connect". Say which
+                # of the two it is, and how to let this one run fetch — the setting is
+                # ours, so explaining it is ours too.
+                if hf_offline_env(os.environ) and looks_like_a_file_the_nest_did_not_bring(_log_tail):
+                    raise NestFailure(
+                        "S4",
+                        ErrorClass.STARTUP_CRASH,
+                        "This run asked for a model file from Hugging Face that this nest did "
+                        "not bring back, so there was nothing on disk to read it from. A nest "
+                        "is packed to run without the network, so the run was started offline "
+                        "and did not go looking for it. To let this one run fetch what is "
+                        "missing, set HF_HUB_OFFLINE=0 in your environment and run this again. "
+                        f"The run's own log: {res.log_path}",
+                        detail=_tail(res.log_path),
+                        context={"hf_file_not_in_nest": True,
                                  "exit_code": res.exit_code},
                     )
                 raise NestFailure(
@@ -4483,6 +4652,9 @@ def restore(
         # already been reworded once. Same reasoning as machine_libraries_missing above.
         recipe=report.recipe,
         redactions=report.redactions,
+        # Which recorded spots this rebuild rewrote, and from what to what. Editing a
+        # user's config silently is the one thing worse than not editing it at all.
+        reanchored=report.reanchored,
         # The CUDA version torch reports after install versus what the nest
         # declared. A check nobody can see is a check that does not exist, so it
         # goes on the stream too, not only onto the report object.

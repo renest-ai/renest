@@ -33,6 +33,7 @@ from . import update_rules as _update_rules
 from . import serve as _serve
 from . import support as _support
 from . import verify as _verify
+from . import watch as _watch
 from .errors import ExitCode
 from .events import EventEmitter
 
@@ -43,6 +44,7 @@ __all__ = ["build_parser", "main"]
 _SUMMARY = {
     "doctor": "check whether this machine can rebuild a nest",
     "pack": "pack up the setup you got working",
+    "watch": "run your training command and record what it really loaded",
     "restore": "rebuild a nest here",
     "verify": "check a rebuilt nest against what it should be",
     "lint": "check a nest file for problems",
@@ -58,6 +60,7 @@ _SUMMARY = {
 _HANDLERS = {
     "doctor": (_doctor.add_arguments, _doctor.run_from_args),
     "pack": (_pack.add_arguments, _pack.run_from_args),
+    "watch": (_watch.add_arguments, _watch.run_from_args),
     "restore": (_restore.add_arguments, _restore.run_from_args),
     "verify": (_verify.add_arguments, _verify.run_from_args),
     "lint": (_lint.add_arguments, _lint.run_from_args),

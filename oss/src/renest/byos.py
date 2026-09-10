@@ -302,6 +302,9 @@ class S3Uploader:
                 # When a part PUT fails, turn the status code into something
                 # the user can act on instead of echoing back "HTTP 403".
                 "explain": self._explain,
+                # And when a part is merely retried, say so — otherwise the only
+                # visible effect is the upload taking minutes longer.
+                "notice": self._log,
             },
         }
         try:
