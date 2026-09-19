@@ -76,6 +76,7 @@ from .syslibs import (
     collect_native_libs_with_layers,
     contested_winners,
     interpreter_site_packages,
+    node_declared_machine_libs,
     read_run_record,
     record_search_roots,
 )
@@ -1621,6 +1622,23 @@ def _foreign_env_kernel(root: Path, env_python: str | None) -> str | None:
     return kernel if kernel and kernel != here else None
 
 
+def _should_record_upstream_match(um: dict | None, entry: dict) -> bool:
+    """Record upstream_match only when it does not contradict the entry itself.
+
+    An archive-installed host (e.g. ComfyUI dropped in by comfy-cli) is not a
+    git repository, so upstream_match() honestly answers ``no_upstream`` — but
+    the entry still carries the repo_url/commit identity it was installed
+    from. Writing "no repository at all" next to a named repo/commit is the
+    upstream-contradiction lint error; per the docstring we never guess, so in
+    that case the block is left out entirely.
+    """
+    if not um:
+        return False
+    if um.get("state") == "no_upstream" and (entry.get("repo_url") or entry.get("commit")):
+        return False
+    return True
+
+
 def _utc_now() -> datetime.datetime:
     """The wall clock as an aware UTC datetime.
 
@@ -1679,7 +1697,7 @@ def _build_manifest(
     # from "hung".
     tracker = _ProgressTracker(emitter, root, spec) if (emitter and not dry_run) else None
     manifest: dict = {
-        "format_version": "2.11",
+        "format_version": "2.12",
         "id": nest_id,
         "created_at": _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "runtime": spec["runtime"],
@@ -1838,6 +1856,36 @@ def _build_manifest(
                     "it actually loaded."
                 )
 
+        # What each custom node's own compiled files declare they need from the
+        # machine (format 2.12). The list above says what the working run loaded; a
+        # workflow that never touches a node's compiled parts never loads theirs, so
+        # `native_libs` cannot cover them -- measured 2026-09-12, a plugin whose
+        # `import cv2` died on `libxcb.so.1` on the rebuild machine passed the machine
+        # check green. This list is read off the bytes being packed, so it covers nodes
+        # the run never touched. Declared-level all the way down: the restore side may
+        # only warn on it, never stop. Names the Python environment carries (torch/lib,
+        # the `*.libs` convention) are not machine requirements -- the rebuild
+        # reinstalls them from the lock. Node with no compiled files or no gaps → no
+        # entry: an empty object would read as "all nodes checked, none needed".
+        _sp = interpreter_site_packages(py) if py else None
+        _node_libs: dict[str, list[str]] = {}
+        for _d in (spec.get("code_deps") or []):
+            if not isinstance(_d, dict):
+                continue
+            _ip = str(_d.get("install_path") or "").strip("/")
+            if not _ip or "custom_nodes" not in _ip:
+                continue
+            _names = node_declared_machine_libs(
+                _spec_source(root, _d, _ip),
+                carried_dirs=(_sp,) if _sp else (),
+            )
+            if _names:
+                _node_libs[str(_d.get("name") or _ip)] = _names
+        if _node_libs:
+            rt = dict(manifest.get("runtime") or {})
+            rt.setdefault("node_native_libs", _node_libs)
+            manifest["runtime"] = rt
+
         # How much video memory the working run was seen using, out of that same
         # record. Only something inside the application can read it while the run is
         # alive, and by packing time the process is usually gone. Nothing read → write
@@ -1994,7 +2042,7 @@ def _build_manifest(
         # in the manifest, not just in a hint to the packer: "this extension has
         # been modified" is how a recipient spots a poisoned supply chain.
         um = upstream_match(src_dir)
-        if um:
+        if _should_record_upstream_match(um, entry):
             entry["upstream_match"] = um
         manifest["code_deps"].append(entry)
 
@@ -4059,11 +4107,20 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
                 f"{report.blob_count} items / {report.total_bytes} bytes",
                 file=sys.stderr,
             )
+        else:
+            print(
+                f"✗ Pack failed: nest {report.nest_id} "
+                f"({report.blob_count} items / {report.total_bytes} bytes)",
+                file=sys.stderr,
+            )
         # The one fact a hand-off or a restore decision hangs on, said at the
         # end where it cannot scroll away among the warnings. Deliberately
         # separate from the "renest inside the packed environment" advisory:
         # that one says the record may describe the wrong environment, this one
         # says the record cannot be rebuilt — mixing them buries both.
+        # Kept OUTSIDE the success/dry-run/failure chain above: nested into it,
+        # the chain's `else` once attached here and every restorable success
+        # ended with "Pack failed" (0.1.14).
         if report.ok and not report.restorable:
             print(
                 "■ Rebuildable elsewhere: NO — archived faithfully, but as packed "
@@ -4072,12 +4129,6 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
             )
             for _r in report.unrestorable_reasons:
                 print(f"  · {_r}", file=sys.stderr)
-        else:
-            print(
-                f"✗ Pack failed: nest {report.nest_id} "
-                f"({report.blob_count} items / {report.total_bytes} bytes)",
-                file=sys.stderr,
-            )
         if hosted_ok:
             hr = hosted_uploader.result
             human_version = f"version {hr.version_no}" if hr.version_no else "a new version"

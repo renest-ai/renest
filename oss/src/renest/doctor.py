@@ -79,6 +79,11 @@ __all__ = [
     "collect_gpu_name",
     "collect_gpu_compute_cap",
     "check_gpu_arch",
+    "check_gpu_alloc",
+    "collect_gpu_alloc",
+    "check_nvidia_smi_full",
+    "collect_nvidia_smi_full",
+    "GPU_ALLOC_PROBE_MIB",
     "split_arch_list",
     "gpu_coverage",
     "FingerprintVerdict",
@@ -123,7 +128,13 @@ REQUIRED_CPU_FLAGS: tuple[str, ...] = ("avx2",)
 #: That is this repository's most expensive class of bug (2026-08-08, five in one
 #: day): **"I don't recognise this, so it must be broken."** Without a nest these
 #: are notes, never a verdict -- unfit *for what*, when nothing was named?
-_NEST_FREE_CHECKS: frozenset[str] = frozenset({"cpu_flags", "local_disk", "ram", "egress", "proxy"})
+#: ``gpu_alloc`` belongs here for the same reason ``cpu_flags`` does: "can this
+#: card hand out memory" is a question about the machine alone, answerable with
+#: no nest in hand. It never rejects, so listing it cannot turn `renest doctor`
+#: into a gate.
+_NEST_FREE_CHECKS: frozenset[str] = frozenset(
+    {"cpu_flags", "local_disk", "ram", "egress", "proxy", "gpu_alloc", "nvidia_smi_full"}
+)
 
 #: The ``--lock`` checks. They read the lockfile the caller named plus this
 #: machine's driver and need nothing from a nest, so unlike the checks above
@@ -1972,6 +1983,336 @@ def check_observed_vram(nest_gpu: dict | None, local_bytes: int | None = None) -
                        f"using {seen}.", reading)
 
 
+# --------------------------------------------------------------------------
+# The one question no other check asks: can this card actually hand out memory?
+# --------------------------------------------------------------------------
+# Every GPU row above this one is *reported* information. `nvidia-smi` answers
+# the driver version, the card's name, its compute capability and its total
+# memory from the driver's own bookkeeping, and it keeps answering all of them
+# on a machine where nothing can run: video memory already taken by another
+# tenant, the card put in exclusive-process mode by whoever booted it, a card
+# sliced into MIG partitions this process has no access to, ECC errors that
+# retire the card on its next context creation, a driver present but paired
+# with a broken runtime. Reported facts and "it works right now" are two
+# different questions, and until this check existed we only ever asked the
+# first one — and then told the user their machine had passed.
+#
+# So: ask for a block of video memory, write to it, give it back.
+
+#: How much to ask for. Large enough that the driver has to really create a
+#: context and hand over device memory; small enough that on any card worth
+#: renting the request itself cannot be what tips it over.
+GPU_ALLOC_PROBE_MIB = 64
+
+#: Wall-clock ceiling. A first `import torch` off a cold page cache is slow, and
+#: a wedged driver never returns at all — so the probe must be able to give up.
+#: A check that hangs is worse than one that says "could not find out".
+GPU_ALLOC_PROBE_TIMEOUT_S = 90.0
+
+#: Run inside the **target** interpreter (same arrangement as fingerprint's
+#: probe). Two rules it must never break:
+#:   1. it always prints one JSON line and exits 0 — every outcome, including
+#:      every failure, is *data* for the verdict function, never an exception
+#:      that takes the precheck down with it;
+#:   2. it never leaves the memory it took. `del` + `empty_cache` before it
+#:      prints, and the process exits straight after, which is what actually
+#:      guarantees the release.
+_GPU_ALLOC_PROBE_SRC = r"""
+import json, time
+out = {"size_mib": __SIZE_MIB__}
+try:
+    import torch
+except BaseException as exc:
+    out["outcome"] = "cannot_probe"
+    out["why"] = "no_torch"
+    out["error"] = type(exc).__name__ + ": " + str(exc)[:200]
+    print(json.dumps(out))
+    raise SystemExit(0)
+try:
+    if not torch.cuda.is_available():
+        out["outcome"] = "cannot_probe"
+        out["why"] = "no_cuda_device"
+        print(json.dumps(out))
+        raise SystemExit(0)
+    index = torch.cuda.current_device()
+    out["device_index"] = int(index)
+    out["device_name"] = torch.cuda.get_device_name(index)
+    free, total = torch.cuda.mem_get_info(index)
+    out["free_bytes"] = int(free)
+    out["total_bytes"] = int(total)
+    started = time.monotonic()
+    buf = torch.empty(__SIZE_MIB__ * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    # Write to it. An allocation on its own can be booked out of a pool the
+    # runtime already holds without a single page being touched, and a card
+    # that is failing touches is still a card that fails.
+    buf.fill_(1)
+    torch.cuda.synchronize()
+    out["elapsed_ms"] = round((time.monotonic() - started) * 1000, 1)
+    del buf
+    torch.cuda.empty_cache()
+    out["outcome"] = "allocated"
+except SystemExit:
+    raise
+except BaseException as exc:
+    out["outcome"] = "failed"
+    out["error"] = type(exc).__name__ + ": " + str(exc)[:300]
+print(json.dumps(out))
+"""
+
+
+def collect_gpu_alloc(
+    python_path: str | None = None,
+    *,
+    size_mib: int = GPU_ALLOC_PROBE_MIB,
+    timeout: float = GPU_ALLOC_PROBE_TIMEOUT_S,
+) -> dict:
+    """Really ask this machine for video memory, in a throwaway subprocess.
+
+    A subprocess and not this one, for three reasons: the interpreter that has
+    torch is usually **not** the one running this tool (installed with `uv tool`,
+    it lives in its own isolated environment with nothing in it); a CUDA context
+    created here would stay for the rest of the command; and a driver that takes
+    its process down with it must not take the precheck down too.
+
+    Returns a reading, never raises. ``outcome`` is one of ``allocated`` /
+    ``failed`` / ``timeout`` / ``cannot_probe``.
+    """
+    reading: dict = {"size_mib": int(size_mib)}
+    # Non-Linux is a "cannot probe", decided before spending anything: this
+    # product's GPU subject is NVIDIA on Linux, and a Mac answering "no CUDA
+    # here" after a five-second torch import has told us nothing we did not know.
+    if platform.system() != "Linux":
+        return reading | {"outcome": "cannot_probe", "why": "not_linux",
+                          "platform": platform.system()}
+    exe = python_path or sys.executable
+    reading["python"] = exe
+    src = _GPU_ALLOC_PROBE_SRC.replace("__SIZE_MIB__", str(int(size_mib)))
+    try:
+        proc = subprocess.run(  # noqa: S603 - fixed program, caller-chosen interpreter
+            [exe, "-c", src], capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        return reading | {"outcome": "timeout", "why": "timeout", "timeout_s": timeout}
+    except (OSError, subprocess.SubprocessError) as exc:
+        # The interpreter itself could not be started — that is us not being able
+        # to ask, not the card failing to answer.
+        return reading | {"outcome": "cannot_probe", "why": "probe_did_not_run",
+                          "error": f"{type(exc).__name__}: {exc}"[:200]}
+    for line in reversed((proc.stdout or "").strip().splitlines()):
+        try:
+            parsed = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict) and parsed.get("outcome"):
+            return reading | parsed
+        break
+    # No JSON came back, so the program above did not reach its own print: the
+    # interpreter died. It is written so that nothing short of the process being
+    # killed can do that, which on this program means the driver or the CUDA
+    # runtime took it down — a failure, not an unreadable machine.
+    return reading | {"outcome": "failed", "why": "probe_crashed",
+                      "returncode": proc.returncode,
+                      "error": (proc.stderr or "").strip()[-300:]}
+
+
+def check_gpu_alloc(probe: dict | None) -> CheckResult:
+    """Did a real request for video memory succeed on this machine?
+
+    **Why each of the three buckets lands where it does** — this is the whole
+    check, the allocation itself is six lines:
+
+    *Allocated → pass.* It is the only pass in the GPU rows that was earned by
+    doing the thing rather than by reading a report. The numbers travel with it
+    (how much, how long, how much the card had free), because "it worked" with
+    no figures is the kind of green tick this file exists to argue against.
+
+    *Failed (or timed out) → **warn**, never reject.* Tempting to reject: the
+    charter does put "refuse a CUDA that does not line up, refuse a missing
+    native library" inside the blade. But those two are refusals on a **named
+    mismatch** — two versions compared, a library looked for and not found, and
+    the answer does not change if you ask again in a minute. A failed allocation
+    is a *symptom with many causes*, and the probe cannot tell them apart: a
+    card that is broken and a card that is merely busy this second produce the
+    same OOM. Several of the causes clear on their own — another tenant's job
+    finishing, a compute-mode lock released when its holder exits. Rejecting
+    costs the user a machine they are paying for and a re-rent of another one,
+    on a reading we know to be sometimes wrong; admitting costs a rebuild that
+    would have failed a few minutes later anyway, where the framework itself
+    says so in its own words. Being wrong in the cheap direction is the whole
+    reason this is yellow. **This is also a brand-new instrument with no field
+    evidence behind it** — nothing in this repository has yet measured how often
+    it is wrong — and a gate that can refuse a machine does not get to be built
+    on a guess. Raising it to a reject later is one line and a ruling; a
+    false reject shipped today is a user out of pocket.
+
+    *Could not probe → `unknown`, and never `pass`.* No torch in the interpreter
+    we could reach (the normal case for `renest doctor` installed as an isolated
+    tool), no CUDA device, not Linux. A green tick that means "I could not read
+    it" is the failure this project keeps paying for; `unknown` is non-blocking
+    but it is honest, and it reads differently in the table.
+    """
+    if not probe or not probe.get("outcome"):
+        return CheckResult("gpu_alloc", LEVEL_UNKNOWN,
+                           "Nothing asked this machine for video memory, so whether it "
+                           "can hand any out is unknown. Not a pass.",
+                           {"outcome": "cannot_probe", "why": "not_run"})
+    reading = dict(probe)
+    outcome = reading.get("outcome")
+    size = reading.get("size_mib", GPU_ALLOC_PROBE_MIB)
+
+    if outcome == "allocated":
+        took = reading.get("elapsed_ms")
+        free = reading.get("free_bytes")
+        name = reading.get("device_name") or "this card"
+        detail = f" in {took:.0f} ms" if isinstance(took, (int, float)) else ""
+        spare = (f", with {free / 2**30:.1f} GiB free on it at the time"
+                 if isinstance(free, int) and free > 0 else "")
+        return CheckResult("gpu_alloc", LEVEL_PASS,
+                           f"Asked {name} for {size} MiB of video memory, wrote to it and "
+                           f"gave it back{detail}{spare}. This is the only check here that "
+                           f"used the card rather than reading a report about it.",
+                           reading)
+
+    if outcome == "timeout":
+        secs = reading.get("timeout_s", GPU_ALLOC_PROBE_TIMEOUT_S)
+        return CheckResult("gpu_alloc", LEVEL_WARN,
+                           f"Asking this machine for {size} MiB of video memory got no "
+                           f"answer within {secs:.0f}s and was given up on. That can be a "
+                           f"driver that has stopped responding, or just a very slow first "
+                           f"start. Not a reason on its own to stop — but if the rebuild "
+                           f"hangs at start-up, this line is why.",
+                           reading)
+
+    if outcome == "failed":
+        err = reading.get("error") or "no detail"
+        return CheckResult("gpu_alloc", LEVEL_WARN,
+                           f"Asking this machine for {size} MiB of video memory failed: "
+                           f"{err}. Everything else here only read what the driver reports, "
+                           f"and the driver reports the same on a card that is already full, "
+                           f"locked to one process, or failing. This does not stop the "
+                           f"rebuild — the card may simply be busy this minute — but expect "
+                           f"the run to fail the same way unless it frees up.",
+                           reading)
+
+    why = reading.get("why") or "unknown"
+    excuse = {
+        "no_torch": "the interpreter we could reach has no torch in it, which is "
+                    "normal when this tool is installed on its own",
+        "no_cuda_device": "torch reports no usable CUDA device here",
+        "not_linux": "this is not a Linux machine",
+        "probe_did_not_run": "the probe interpreter would not start",
+    }.get(str(why), f"the probe could not run ({why})")
+    return CheckResult("gpu_alloc", LEVEL_UNKNOWN,
+                       f"Whether this machine can actually hand out video memory is "
+                       f"unknown: {excuse}. Nothing here was verified, and this is not a "
+                       f"pass — it only means the question went unanswered.",
+                       reading)
+
+
+# --------------------------------------------------------------------------
+# The full nvidia-smi, not just a single-query answer (B10)
+# --------------------------------------------------------------------------
+# Measured 2026-09-13 (first outside user walking a hand-off end to end):
+# a wedged RunPod node answered `--query-gpu=driver_version` like a healthy one, so
+# every reported-fact row above was green — and the app died at start-up with
+# "No CUDA GPUs are available", because plain `nvidia-smi` had been failing all
+# along with "Failed to initialize NVML: Unknown Error". The single-query answers
+# and the full tool can disagree; only the full tool asks the runtime to actually
+# bring the card up. Same honesty edge as gpu_alloc: a node can flip between this
+# probe and the launch, so this narrows the window — it does not promise.
+
+#: Markers a wedged driver prints instead of a table. Plain text (lowercased before
+#: matching), because NVIDIA's exact wording has been seen to vary across drivers.
+_NVIDIA_SMI_DISTRESS_MARKS = (
+    "failed to initialize nvml",
+    "driver/library version mismatch",
+    "unable to determine the device handle",
+)
+
+#: Full nvidia-smi run with the process table, as the check needs it.
+def collect_nvidia_smi_full(timeout: float = 30.0) -> dict:
+    """Run plain ``nvidia-smi`` and keep the exit code, which :func:`_run_cmd` throws away.
+
+    The single-query collectors above are still fine for their facts; this one
+    exists because *its* exit code is the signal that the node is wedged.
+    Returns a reading, never raises.
+    """
+    try:
+        proc = subprocess.run(  # noqa: S603 - fixed program, no shell
+            ["nvidia-smi"], capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        return {"rc": None, "outcome": "timeout", "timeout_s": timeout}
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"rc": None, "outcome": "no_binary",
+                "error": f"{type(exc).__name__}: {exc}"[:200]}
+    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    reading: dict = {"rc": proc.returncode}
+    if proc.returncode != 0:
+        reading["outcome"] = "failed"
+        reading["tail"] = out[-200:]
+        return reading
+    low = out.lower()
+    if any(mark in low for mark in _NVIDIA_SMI_DISTRESS_MARKS):
+        # Exit 0 but the distress text: seen on half-initialised drivers.
+        reading["outcome"] = "failed"
+        reading["tail"] = out[-200:]
+        return reading
+    reading["outcome"] = "ran"
+    return reading
+
+
+def check_nvidia_smi_full(reading: dict | None) -> CheckResult:
+    """Did the full ``nvidia-smi`` — process table and all — actually run?
+
+    *Ran → pass.* Every fact row above was answered by a narrower query; this is
+    the one that makes the driver initialise the tool fully. Cheap, and the only
+    row that catches the wedged-node shape where single queries still answer.
+
+    *Failed (or timed out) → **warn**, never reject.* Same argument as
+    check_gpu_alloc: a symptom with many causes, no field evidence that it is
+    always fatal, and a false reject costs a machine the user is paying for.
+    The message says what to do when the app dies later, because that is the
+    moment this warning becomes the explanation.
+
+    *No nvidia-smi at all → unknown.* A machine without the binary is not
+    thereby broken (CPU-only hosts exist), and no green tick may stand for
+    "could not ask".
+    """
+    if not reading or not reading.get("outcome"):
+        return CheckResult("nvidia_smi_full", LEVEL_UNKNOWN,
+                           "nvidia-smi did not run here, so the one check that makes the "
+                           "driver bring the card up fully went unasked. Not a pass.",
+                           {"outcome": "not_run"})
+    outcome = reading["outcome"]
+    if outcome == "ran":
+        return CheckResult("nvidia_smi_full", LEVEL_PASS,
+                           "Full nvidia-smi ran: the driver brought the card up, not just "
+                           "answered queries about it.",
+                           reading)
+    if outcome == "failed":
+        tail = (reading.get("tail") or "").replace("\n", " ").strip()
+        return CheckResult(
+            "nvidia_smi_full", LEVEL_WARN,
+            "Full nvidia-smi failed here"
+            + (f" ({tail[:120]})" if tail else "")
+            + ", while the single-fact queries above still answer — that is the shape of a "
+              "wedged GPU node. Not stopping you: it sometimes clears on its own or after a "
+              "reboot. But if the app later dies saying no GPUs are available, this line is "
+              "why — replace the machine rather than re-downloading.",
+            reading)
+    if outcome == "timeout":
+        return CheckResult("nvidia_smi_full", LEVEL_WARN,
+                           "Full nvidia-smi did not answer in time — often a driver that "
+                           "has stopped responding. If the rebuild hangs at start-up, this "
+                           "line is why.",
+                           reading)
+    return CheckResult("nvidia_smi_full", LEVEL_UNKNOWN,
+                       f"nvidia-smi could not be run here ({reading.get('error') or 'no detail'}), "
+                       f"so this question went unanswered. Not a pass.",
+                       reading)
+
+
 def _binary_runs_here(sm_list: list[int], cap: int) -> bool:
     """Can card generation ``cap`` run a binary built for these targets?
 
@@ -2134,6 +2475,35 @@ def check_system_layer(nest_runtime: dict | None, this_env: dict | None = None) 
                 f"rather than off the working run, so it names libraries that may never be "
                 f"used — come back to this only if something fails to load later.")
 
+    # Format 2.12: what each custom node's own compiled files declare they need.
+    # Declared-level all the way down (see syslibs): warn only, never stop -- the
+    # workflow that packed this nest may never touch these nodes at all. But it is
+    # exactly the half `native_libs` cannot see: a node the run never loaded still
+    # dies on `libxcb.so.1` the first time the user drags it into a workflow,
+    # measured 2026-09-12 -- and the fix (install the library or start from the
+    # recorded image) is one command **before** any bytes are downloaded.
+    node_decl = {
+        str(k): [n for n in v if isinstance(n, str)]
+        for k, v in (rt.get("node_native_libs") or {}).items() if isinstance(v, list)
+    }
+    if node_decl and machine_libs_checkable(tag):
+        node_gaps = {
+            k: gone for k in node_decl if (gone := missing_native_libs(node_decl[k], tag))
+        }
+        # Recorded even when empty: a gap-free read is a fact ("checked, nothing
+        # missing"), not the same as the field being absent ("never collected").
+        reading["node_native_libs"] = node_gaps
+        if node_gaps:
+            level = LEVEL_WARN
+            _total = sorted({n for g in node_gaps.values() for n in g})
+            lines.append(
+                f"{len(node_gaps)} custom node package(s) ship binaries whose needs this "
+                f"machine is short of ({', '.join(_total[:5])}"
+                f"{'…' if len(_total) > 5 else ''}); the heaviest is "
+                f"`{max(node_gaps, key=lambda k: len(node_gaps[k]))}`. This list was read "
+                f"off what those binaries declare, not off the working run -- your workflow "
+                f"may never load them -- but if it does, those nodes will fail to import.")
+
     if not reading:
         return CheckResult(
             "system_layer", "skip",
@@ -2280,6 +2650,10 @@ def run_precheck(
     #: switches on a gate that can refuse the machine. A caller that wants advice
     #: without the gate passes this alone.
     nest_captured_on: dict | None = None,
+    #: Which interpreter to ask for video memory (see collect_gpu_alloc). None =
+    #: this process's own, which for a `uv tool` install has no torch in it and
+    #: therefore answers ``unknown`` — honest, and never a green tick.
+    gpu_probe_python: str | None = None,
 ) -> PrecheckReport:
     """Collect on this machine and verdict each check. ``force`` changes no
     verdict — it only allows continuation after a reject.
@@ -2304,6 +2678,14 @@ def run_precheck(
     # once it fails, the verdicts of all the later checks are meaningless — that
     # machine cannot install this nest's dependencies at all.
     report.checks.append(check_chip_family(nest_arch, platform.machine()))
+    # **The only row here that uses the card instead of reading a report about
+    # it.** Everything else asks the driver what it says about itself, and the
+    # driver keeps saying it on a machine where nothing can run. Never rejects
+    # (see check_gpu_alloc for the argument), so its position is free.
+    report.checks.append(check_gpu_alloc(collect_gpu_alloc(gpu_probe_python)))
+    # The full nvidia-smi (B10): single-fact queries above still answer on a
+    # wedged node; the full run does not. Warn-only, same argument.
+    report.checks.append(check_nvidia_smi_full(collect_nvidia_smi_full()))
     # GPU architecture gate, also blocking. A nest with no gpu block (legal for
     # older nests) skips the whole check rather than inventing a warning.
     if nest_gpu:
@@ -2626,8 +3008,32 @@ def compare_fingerprint(local: Fingerprint | dict, required: dict,
     # Saying "check you booted the right image" without saying which one leaves the
     # reader to go dig the nest out. The name is in the manifest -- print it. Booting
     # that image is also how the system libraries a nest cannot carry all arrive at once.
-    if base_image and level in (LEVEL_WARNING, LEVEL_BLOCKING):
-        summary += f" — this nest was packed on `{base_image}`"
+    if level in (LEVEL_WARNING, LEVEL_BLOCKING):
+        if base_image:
+            summary += f" — this nest was packed on `{base_image}`"
+        else:
+            # **The nest does not say which image it ran on, and until 2026-09-11 this
+            # branch did not exist**: the verdict told people to "rent a machine that
+            # matches" and then named nothing to match. Being asked to match something
+            # nobody will name is worse than being told we don't know -- the reader
+            # cannot act, and cannot tell whether the omission is theirs or ours.
+            # `base_image` is optional from format 2.3 on, so an older nest legitimately
+            # has none; say that, and hand over the readings this check *does* have, so
+            # the choice can be made on facts instead of on a guess. Same shape the chip
+            # and generation rows use a few hundred lines up: name both sides, then let
+            # the reader decide.
+            wanted = ", ".join(
+                f"{r['field'].rsplit('.', 1)[-1]} {r['required']}"
+                for r in rows
+                if r["verdict"] in (LEVEL_WARNING, LEVEL_BLOCKING) and r.get("required")
+            )
+            summary += (
+                " — this nest does not record the image it ran on (nests packed before "
+                "format 2.3 often do not), so there is no image name to give you"
+                + (f". Match these instead: {wanted}" if wanted else
+                   ". Nothing here names a version to match either, so this verdict "
+                   "cannot tell you what to change")
+            )
     return FingerprintVerdict(
         level=level, error_class=error_class, rows=rows, summary=summary
     )
@@ -2879,7 +3285,8 @@ def doctor(
         # that provably cannot install our wheels: it got a clean bill of health.
         # A check that answers "fine" on an unusable machine is worse than absent.
         precheck = _precheck if _precheck is not None else (
-            run_precheck(skip_net=skip_net, force=force, lock_text=lock_text)
+            run_precheck(skip_net=skip_net, force=force, lock_text=lock_text,
+                         gpu_probe_python=python_path)
             if with_host_checks else None
         )
         # "Is my lockfile self-consistent, and can this driver carry it" is a
@@ -2958,6 +3365,10 @@ def doctor(
                 # where they belong, in restore's own pre-flight.
                 nest_captured_on=(manifest.get("gpu") or {}).get("captured_on"),
                 nest_runtime=runtime,
+                # Same interpreter the fingerprint was collected from: that is the
+                # one that would run the rebuild, so it is the one whose ability to
+                # get video memory is the question.
+                gpu_probe_python=python_path,
             )
     precheck = precheck or PrecheckReport(forced=force)
     if iso is not None:

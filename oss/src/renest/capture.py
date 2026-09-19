@@ -383,6 +383,20 @@ def _clean_asset_name(value: str) -> str:
     return value
 
 
+def _names_a_file(path: Path) -> bool:
+    """``is_file()`` for names that came straight out of a workflow's inputs.
+
+    Some nodes hand us the whole prompt text where a file name belongs; a name
+    longer than one filesystem component (255 B on ext4) makes ``stat()`` raise
+    ``OSError: [Errno 36] File name too long`` instead of returning False.
+    A value that cannot even be stat'ed simply does not name a file here
+    (BACKLOG 22, R3 floor-batch 2026-09-12)."""
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
 def _expand_path_vars(value: str) -> str:
     """``~/shared`` and ``$MODELS/loras`` the way ComfyUI expands them when it reads
     the same file.
@@ -942,7 +956,7 @@ def capture(workflow: dict, comfyui_dir: Path,
                     # really sitting in input/, list it as the user's own material.
                     # That is not a guess about an unknown node -- we looked, and it
                     # is there. Anything else stays reported-verbatim as before.
-                    if (comfyui_dir / "input" / _clean_asset_name(value)).is_file():
+                    if _names_a_file(comfyui_dir / "input" / _clean_asset_name(value)):
                         refs.append({"node_id": node_id, "class_type": cls,
                                      "input": input_name, "value": value,
                                      "category": "input_asset"})
@@ -1090,7 +1104,7 @@ def capture(workflow: dict, comfyui_dir: Path,
         _raw = str(m["value"])
         _ann = _raw.rsplit(" [", 1)[1][:-1] if _raw.endswith("]") and " [" in _raw else ""
         _base = _clean_asset_name(_raw)
-        if _ann in ("output", "temp") and (comfyui_dir / _ann / _base).is_file():
+        if _ann in ("output", "temp") and _names_a_file(comfyui_dir / _ann / _base):
             gaps.append(
                 f"{m['class_type']}.{m['input']} = {_raw} reads a picture out of "
                 f"{prefix}/{_ann}/, not {prefix}/input/. Finished pictures and scratch files "
@@ -1107,7 +1121,7 @@ def capture(workflow: dict, comfyui_dir: Path,
         if outside:
             base = Path(str(m["value"]).replace("\\", "/")).name
             for sub in (CATEGORIES.get(str(m.get("category")), ((), ""))[0] or ()):
-                if (comfyui_dir / sub / base).is_file():
+                if _names_a_file(comfyui_dir / sub / base):
                     here = f"{sub}/{base}"
                     break
         if outside:
@@ -1132,7 +1146,7 @@ def capture(workflow: dict, comfyui_dir: Path,
     # ComfyUI finds them without reproducing the external paths or carrying the yaml.
     # What follows is only the fallback warning for when that could not be done.
     _emp_yaml = next((y for y in ("extra_model_paths.yaml", "extra_model_paths.yml")
-                      if (comfyui_dir / y).is_file()), None)
+                      if _names_a_file(comfyui_dir / y)), None)
     # There is a yaml file, but no usable external directory came out of it:
     # pyyaml missing, parse failure, or the directory does not exist.
     if _emp_yaml and not emp:

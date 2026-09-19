@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "renest"
-version = "0.1.14"
+version = "0.1.15"
 readme = "README.md"
 description = "Renest agent CLI: pack a working GPU setup — an image workflow or a fine-tuning run — into an open-format nest and restore it byte-identical anywhere."
 requires-python = ">=3.11"
@@ -105,6 +105,15 @@ dev = [
 # dropped, that test goes red before anything reaches the index.
 exclude = [
     "/tests",
+    # The floor image's build directory. It lives under oss/ because the detailed
+    # design puts it there, but hatchling ships everything under the project root
+    # by default, so without this line the Dockerfile, both boot scripts and a
+    # 45 KB local build log full of internal notes travel inside every published
+    # source archive. Measured 2026-09-12: right after the move from the repo root,
+    # `uv build --sdist` put all six files in renest-0.1.14.tar.gz.
+    # The image is published as image bytes from our own registry, never as part of
+    # the Python package. Guarded by tests/consistency/test_shipped_surface.py.
+    "/floor-image",
     # Superseded drafts and our own change-control paperwork. The format spec is
     # published so an outsider can write their own reader; three obsolete drafts
     # of it and an internal checklist do not help with that, they just make the

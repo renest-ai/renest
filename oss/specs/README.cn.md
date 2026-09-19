@@ -12,7 +12,7 @@
 
 | 组件 | 版本 | 状态 | 文档 |
 |---|---|---|---|
-| manifest 格式 | 2.11 | **当前版本** | [`manifest.md`](manifest.md) + [`manifest.schema.json`](manifest.schema.json) |
+| manifest 格式 | 2.12 | **当前版本** | [`manifest.md`](manifest.md) + [`manifest.schema.json`](manifest.schema.json) |
 | 退出码 / `error_class` | — | 冻结基线 | [`restore-protocol.md`](restore-protocol.md) |
 
 本目录每份文档都有一份中文对照本与它并排,文件名为 `*.cn.md`。不带后缀的

@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -31,7 +32,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -94,6 +95,9 @@ __all__ = [
     "SUPPORTED_FORMAT_VERSIONS",
     "GRANT_VERSION",
     "STATE_DIR_REL",
+    "host_bind",
+    "loopback_bind",
+    "rebind_argv",
     "FILE_ROOTS",
     "ROOT_PATH_PATTERNS",
     "resolve_file_root",
@@ -119,13 +123,13 @@ __all__ = [
     "restore",
 ]
 
-FORMAT_VERSION = "2.11"
+FORMAT_VERSION = "2.12"
 # 2.0 made `code_deps[].role` mandatory and dropped 1.3, so that the consumer
 # side need not sniff /custom_nodes/ paths forever. 2.1 through 2.11 only added
 # fields or relaxed required ones, so **every 2.x package still reads** —
 # nothing here may tighten without a version bump.
 SUPPORTED_FORMAT_VERSIONS = ("2.0", "2.1", "2.2", "2.3", "2.4", "2.5", "2.6", "2.7", "2.8",
-                             "2.9", "2.10", "2.11")
+                             "2.9", "2.10", "2.11", "2.12")
 
 
 def _highest_version(versions: tuple[str, ...]) -> str:
@@ -153,6 +157,7 @@ EVIDENCE_REL = ".renest/evidence"  # one evidence dir per run
 ARCHIVES_REL = f"{STAGING_REL}/archives"
 LOCK_REL = f"{STAGING_REL}/requirements.lock"  # working copy uv sync reads from
 RECIPE_REL = f"{STAGING_REL}/workflow.json"  # the recipe of the run that worked
+START_REL = ".renest/start.json"  # facts `renest start` re-runs the entrypoint from
 
 #: Which adapters keep a re-runnable recipe, and where its bytes land. The core
 #: layer names no tool, so the pairing lives in one table instead of in the stage
@@ -375,6 +380,205 @@ def cache_landing_line(
     if not landed:
         return f"Everything is under {target}"
     return f"Everything is under {target}, apart from " + ", ".join(landed)
+
+
+#: The flags an application uses to say **which address it listens on**. Only a
+#: flag the recorded command already carries is ever touched: an app that takes
+#: no such flag gets none invented for it -- guessing one turns a start that
+#: works into a crash, and this whole area exists to stop guessing.
+_HOST_FLAGS = ("--listen", "--host", "--bind")
+
+#: Addresses that answer only from the box itself. A bare ``--listen`` with no
+#: value is **not** here on purpose: ComfyUI reads that as every interface, so
+#: the command is already reachable and rewriting it would break what is right.
+_LOOPBACK_ADDRS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+
+def host_bind(argv: Sequence[str]) -> tuple[int, str, bool] | None:
+    """``(index, address, joined)`` of the address this command binds to.
+
+    ``joined`` tells the two spellings apart: ``--listen 127.0.0.1`` keeps the
+    address in the next slot, ``--listen=127.0.0.1`` in the flag's own. None when
+    the command says nothing about an address -- which is a different fact from
+    "binds everywhere", and the caller must not collapse the two.
+    """
+    for i, a in enumerate(argv):
+        tok = str(a)
+        for flag in _HOST_FLAGS:
+            if tok == flag and i + 1 < len(argv) and not str(argv[i + 1]).startswith("-"):
+                return i + 1, str(argv[i + 1]), False
+            if tok.startswith(f"{flag}="):
+                return i, tok.split("=", 1)[1], True
+    return None
+
+
+def loopback_bind(argv: Sequence[str]) -> str | None:
+    """The loopback address this command binds to, or None.
+
+    Why this is asked at all: measured 2026-09-13 with the first outside user,
+    the entrypoint a real ComfyUI nest carries is ``--listen 127.0.0.1``. That is
+    right for the rebuild's own check -- it runs on the same box -- and wrong for
+    the person afterwards, whose browser is somewhere else entirely. They expose
+    the port in their provider's panel, as everything on screen tells them to,
+    and reach nothing: the port is open and the application behind it is only
+    answering itself. Nothing in the tool said so; a person had to.
+    """
+    found = host_bind(argv)
+    return found[1] if found and found[1].lower() in _LOOPBACK_ADDRS else None
+
+
+def rebind_argv(argv: Sequence[str], address: str) -> list[str]:
+    """``argv`` with its address flag pointed at ``address``; refuses to invent one."""
+    found = host_bind(argv)
+    if found is None:
+        raise ValueError(
+            "this nest's start command names no address to listen on, so there is "
+            "nothing to change -- adding a flag it may not accept would break a start "
+            "that works"
+        )
+    i, _addr, joined = found
+    out = [str(a) for a in argv]
+    out[i] = f"{out[i].split('=', 1)[0]}={address}" if joined else address
+    return out
+
+
+def whats_next_lines(
+    manifest: dict,
+    plan_app_dir: Path,
+    target: Path,
+    entrypoint: dict | None,
+    *,
+    oneshot: dict | None = None,
+    port: int | None = None,
+    recipe_path: Path | None = None,
+) -> list[str]:
+    """What a person who just got a working environment does with it (B12).
+
+    Measured 2026-09-13, first outside user: five gates green, and his first two
+    questions were "where is my image" and "how do I reach my ComfyUI". The
+    closing lines named folders; nothing named an **entry point into his own
+    work**. Every line below is assembled from facts the nest already carries —
+    no guessed commands, no invented paths; anything unknown is simply not said.
+    """
+    lines: list[str] = ["What's next:"]
+    ep = entrypoint if isinstance(entrypoint, dict) else None
+    venv_py = target / ".venv" / "bin" / "python"
+    # The start command, only when it can be reconstructed faithfully: argv[0]
+    # resolved the same way S4 resolved it, the rest verbatim from the manifest.
+    cmd = None
+    if ep and isinstance(ep.get("argv"), list) and ep["argv"]:
+        try:
+            exe = resolve_argv0(str(ep["argv"][0]), target, venv_py)
+            cmd = shlex.join([str(exe), *[str(a) for a in ep["argv"][1:]]])
+        except NestFailure:
+            cmd = None  # S4 would have refused too; no command is invented here
+    cwd = plan_app_dir if plan_app_dir != target else target
+    env_note = ""
+    if ep and ep.get("env"):
+        try:
+            kvs = materialise_entrypoint_env(ep.get("env"), target)
+            env_note = " (with " + ", ".join(f"{k}={v}" for k, v in kvs.items()) + " set)"
+        except ValueError:
+            env_note = ""  # S4's own refusal names the problem; don't paraphrase it
+
+    if oneshot is not None:
+        # A fine-tuning nest: the run finished; the person's work starts from
+        # its output, and "again" means the same command.
+        art = oneshot.get("expect_artifact")
+        if isinstance(art, str) and art:
+            lines.append(
+                f"  · Your run's output is at {target / art} (the file this nest was "
+                f"packed to produce)."
+            )
+        else:
+            lines.append(
+                "  · Your run's output went wherever this tool always writes it — "
+                "the run's own log, kept with this restore's evidence, says where."
+            )
+        if cmd:
+            lines.append(
+                f"  · To run it again (another epoch, a changed config): "
+                f"cd {cwd} && {cmd}{env_note}."
+            )
+    else:
+        # A service nest: the app was started for the check and then stopped;
+        # the person's work starts by starting it themselves.
+        if cmd:
+            lines.append(f"  · Start it yourself: cd {cwd} && {cmd}{env_note}.")
+        # The command above is the one that worked — and it worked from this box.
+        # When it binds to loopback, saying "expose the port" and stopping there
+        # sends the person to a panel, an open port, and nothing behind it
+        # (measured 2026-09-13: the first outside user needed a human to tell him
+        # the one word that command was missing). Say which word, and where.
+        _lb = loopback_bind(ep["argv"]) if (cmd and ep and ep.get("argv")) else None
+        if _lb:
+            lines.append(
+                f"  · That command listens on {_lb}, which answers this machine only — "
+                f"right for the check that just ran, not for your browser. To reach it "
+                f"from outside, change that one value to 0.0.0.0 (or run "
+                f"`renest start --dir {target} --listen 0.0.0.0`, which does it for you)."
+            )
+        if port and _lb:
+            lines.append(
+                f"  · It was answering on port {port} during the check. On a rented GPU "
+                f"box, reaching it from your own browser also means exposing that port in "
+                f"your provider's panel — the check never did that for you."
+            )
+        elif port:
+            # The command names no address at all, so what it binds to is the
+            # application's own default and we do not know it. Say the condition
+            # without pretending to know which half is already true.
+            lines.append(
+                f"  · It was answering on port {port} during the check. On a rented GPU "
+                f"box, reaching it from your own browser means it has to be listening on "
+                f"0.0.0.0 and that port exposed in your provider's panel — the check "
+                f"never did either for you."
+            )
+        if (manifest.get("adapters") or {}).get("comfyui") is not None:
+            lines.append(f"  · Images render into {cwd / 'output'} — that is where yours is.")
+        if recipe_path is not None and recipe_path.is_file():
+            lines.append(
+                f"  · The workflow that produced the test render: {recipe_path}. "
+                f"Drop it into the app to start from what worked."
+            )
+    lines.append(
+        "  · Moving to another machine? The same restore command works there too — "
+        "it reuses what is already fetched and carries on."
+    )
+    return lines
+
+
+def write_start_facts(
+    plan: RestorePlan,
+    target: Path,
+    oneshot: dict | None,
+    port: int | None,
+) -> Path | None:
+    """Leave behind what ``renest start`` needs to re-run the entrypoint.
+
+    Measured 2026-09-13, first outside user: the closing lines name the start
+    command, and the follow-up question was "where do I even paste that?" The
+    answer is a command of our own — and it must not re-derive anything at run
+    time: it reads exactly the facts below, all of which the successful rebuild
+    already proved. A nest with no entrypoint (legacy format) writes nothing and
+    ``renest start`` says so; a fact that is not here is never guessed later.
+    """
+    ep = plan.entrypoint if isinstance(plan.entrypoint, dict) else None
+    if not (ep and isinstance(ep.get("argv"), list) and ep["argv"]):
+        return None
+    facts = {
+        "app_dir": os.path.relpath(plan.app_dir, target),
+        "entrypoint": ep,
+        "oneshot": oneshot is not None,
+        "port": port,
+    }
+    p = target / START_REL
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(facts, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        return None  # the closing lines still carry the command in plain sight
+    return p
 
 
 def _land_recipe(
@@ -749,6 +953,10 @@ class RestorePlan:
     #: `packages_from`). A missing-library message prefers the package names the
     #: packing machine measured over the small built-in table.
     native_libs: dict | None = None
+    #: v2.12 `runtime.node_native_libs`: for each custom node whose compiled files
+    #: declare machine libraries, `{node: [names]}`. Declared-level -- a consumer
+    #: may only warn on it, never refuse (the working run may never touch the node).
+    node_native_libs: dict[str, list[str]] = field(default_factory=dict)
     #: v2.8 `runtime.contested_modules`: for each folder several packages write,
     #: which one the working run's copy came from and that file's fingerprint as
     #: installed. Read after the dependency install; absent = older nest, no-op.
@@ -904,6 +1112,11 @@ class RestorePlan:
             entrypoint=entrypoint if isinstance(entrypoint, dict) else None,
             base_image_ref=(manifest.get("base_image") or {}).get("ref") or None,
             native_libs=(manifest.get("runtime") or {}).get("native_libs") or None,
+            node_native_libs={
+                str(k): [n for n in v if isinstance(n, str)]
+                for k, v in ((manifest.get("runtime") or {}).get("node_native_libs") or {}).items()
+                if isinstance(v, list)
+            },
             contested_modules=[
                 e for e in ((manifest.get("runtime") or {}).get("contested_modules") or [])
                 if isinstance(e, dict)
@@ -1523,6 +1736,20 @@ class RestoreReport:
     #: half of the answer; the human half is narrated. Report layer only — it is
     #: derived from the manifest, and adds no field to it.
     plan: dict | None = None
+    #: Plugins that failed to import **after a successful S4 launch** because this
+    #: machine lacks a shared library (BACKLOG ㉗, 2026-09-13: RES4LYF on five
+    #: restore machines died on ``libxcb.so.1`` while every gate stayed green —
+    #: ComfyUI tolerates a failed plugin import and starts anyway, so the app being
+    #: "up" says nothing about the plugins). One entry per plugin:
+    #: ``{"module": ..., "missing_libs": [...]}``. Warn-only: the packed workflow
+    #: may never touch those nodes — but the reader must be told, not left with a
+    #: green tick and a quietly degraded environment.
+    plugins_degraded: list[dict] = field(default_factory=list)
+    #: End-of-run words ("Done", where things landed, what's next). Collected
+    #: here and printed by the CLI **after** the json document: printed inside
+    #: restore() they landed above it and scrolled away under it (2026-09-13,
+    #: first outside user watched the "now what" lines drown under the report).
+    closing_lines: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -1552,6 +1779,8 @@ class RestoreReport:
             "fingerprint_verdict": self.fingerprint_verdict,
             "check_only": self.check_only,
             "plan": self.plan,
+            "plugins_degraded": self.plugins_degraded,
+            "closing_lines": self.closing_lines,
         }
 
 
@@ -2259,6 +2488,40 @@ def missing_system_library(text: str | None) -> str | None:
     return libs[0] if libs else None
 
 
+#: ComfyUI's own words when a custom node fails to import. Kept broad — “Cannot import
+#: … module for custom node” is ComfyUI-Manager's phrasing, newer cores sometimes say
+#: “Failed to import module”.
+_IMPORT_FAILED_HEAD = re.compile(r"(?:Cannot import|Failed to import)\s+(\S+)", re.IGNORECASE)
+
+
+def import_failed_plugins(text: str | None) -> list[dict]:
+    """Custom-node plugins that failed to import **because of a missing shared library**.
+
+    ComfyUI starts fine while a plugin is dead — it prints “Cannot import … module for
+    custom node: libxcb.so.1: cannot open shared object file” into its log and carries
+    on. That exact shape sailed five restores through every gate with RES4LYF silently
+    gone (BACKLOG ㉗, 2026-09-13), so the launch being “up” is not the whole story.
+
+    Only import failures that name a missing shared library count: a plugin failing on
+    a plain Python error is not this machine being short — that is the plugin's own
+    bug, and crying wolf about it would bury the signal.
+    """
+    if not text:
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for m in _IMPORT_FAILED_HEAD.finditer(text):
+        module = m.group(1).rstrip(":'\",")
+        # The loader's complaint sits on the same line or the few after it
+        window = text[m.start():m.start() + 600]
+        libs = missing_system_libraries(window)
+        if not libs or module in seen:
+            continue
+        seen.add(module)
+        out.append({"module": module, "missing_libs": libs})
+    return out
+
+
 def _libs_the_working_run_used_but_this_machine_lacks(precheck: dict | None) -> list[str]:
     """Machine libraries the packed run really loaded and this machine does not have.
 
@@ -2748,6 +3011,16 @@ def restore(
             # or this one lands on top of half a progress bar and both become unreadable.
             em.clear_live()
             print(f"[restore] {sanitise_terminal(message)}", file=sys.stderr, flush=True)
+        em.log(message, stage=stage, level=level, **extra)
+
+    def closing(message: str, *, stage: str | None = None, level: str = "info", **extra: Any) -> None:
+        """End-of-run words: logged to the event stream here, but **not printed
+        to the terminal** — the CLI prints them after the json report, so they
+        end up as the last thing on a person's screen instead of the thing the
+        report buried (2026-09-13, first outside user: "Done" + "what's next"
+        scrolled away under the report dump; a rebuild that ends in apparent
+        silence reads as "it hung")."""
+        report.closing_lines.append(message)
         em.log(message, stage=stage, level=level, **extra)
 
     run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
@@ -4347,6 +4620,27 @@ def restore(
                         "this nest carries no record of this recipe ever having produced "
                         "anything, so there is nothing confirmed to reproduce."
                     )
+        # A plugin can die on a missing shared library while the app itself starts
+        # fine — five restores went green that way with RES4LYF gone (BACKLOG ㉗,
+        # 2026-09-13). The launch being “up” is therefore not the whole story:
+        # say it in the report, warn-only, because the packed workflow may never
+        # touch those nodes.
+        _alog = evidence / "app-launch.log"
+        if _alog.exists():
+            try:
+                _degraded = import_failed_plugins(
+                    _alog.read_text(errors="replace")[:_SYSLIB_SCAN_CHARS])
+            except OSError:
+                _degraded = []
+            if _degraded:
+                report.plugins_degraded = _degraded
+                for _d in _degraded:
+                    narrate(
+                        f"⚠ plugin {_d['module']} failed to import: this machine is missing "
+                        f"{', '.join(_d['missing_libs'][:4])}. The app started anyway — "
+                        f"ComfyUI tolerates a dead plugin — so anything that uses its "
+                        f"nodes will not work until that library is installed.",
+                        stage="S4", level="warning")
         return "The app started and is answering"
 
     # -- S5 smoke --
@@ -4560,7 +4854,7 @@ def restore(
         # machine OK?"), restore is an action ("did the rebuild succeed?"); they answer
         # different questions.
         report.environment_warning = "missing_libs" if short_libs else "other"
-        narrate(
+        closing(
             "Rebuilt successfully, but this machine isn't identical to the one this nest "
             "was packed on"
             + (" (it's missing a system library the packed run used)" if short_libs
@@ -4582,14 +4876,35 @@ def restore(
             )
 
     if report.ok:
-        narrate(
+        closing(
             f"✅ Done: {report.blobs_downloaded} files downloaded, {report.blobs_cached} already here. "
             f"Took {report.metrics['total_seconds']}s. Logs and evidence: {evidence}"
         )
-        narrate(cache_landing_line(mani, target))
-        narrate(toolchain_landing_line(target))
+        closing(cache_landing_line(mani, target))
+        closing(toolchain_landing_line(target))
+        # The entry points into the user's own work (B12): start command, where
+        # output lands, how to reach the app from their browser, how to move
+        # machines. Facts from the manifest only; said here because "Done" is
+        # where every user so far has stopped reading and started asking.
+        for _line in whats_next_lines(
+            mani,
+            plan.app_dir,
+            target,
+            plan.entrypoint,
+            oneshot=report.oneshot,
+            port=getattr(handle_box.get("h"), "port", None),
+            recipe_path=target / RECIPE_REL,
+        ):
+            closing(_line)
+        # `renest start` runs the same command for the person who would otherwise
+        # copy it out of these lines and paste it back (2026-09-13 ruling). The
+        # facts it needs land next to the state file; the hint names the command.
+        if write_start_facts(
+            plan, target, report.oneshot, getattr(handle_box.get("h"), "port", None)
+        ) is not None:
+            closing(f"  · Or let the tool do it for you: renest start --dir {target}")
         if report.redactions:
-            narrate(
+            closing(
                 f"One thing still needs you: {len(report.redactions)} place(s) in this nest "
                 f"point at your own files. Everything else is back."
             )
@@ -4603,7 +4918,7 @@ def restore(
         # (2026-07-15 ruling: this leg informs, it does not block).
         _short = short_libs  # computed above: it also decides the exit code
         if _short:
-            narrate(
+            closing(
                 f"Read this before you call it done: every byte is back, but this machine is "
                 f"missing {len(_short)} library file(s) the working run used "
                 f"({', '.join(_short[:5])}). Your files are fine — these belong to the machine's "
@@ -4615,7 +4930,7 @@ def restore(
             )
     else:
         assert failure is not None
-        narrate(
+        closing(
             f"[{failure.stage}/{failure.error_class}] {failure.human}"
             f"(exit {failure.exit_code}. Run the same command again to carry on where it stopped. Logs and evidence: {evidence})",
             level="error",
@@ -4624,7 +4939,7 @@ def restore(
         # while the thing itself stays on their own machine.
         # No email address and no link appears in this sentence — either would
         # read as "send us your logs".
-        narrate(
+        closing(
             f"To ask us about this: `renest support --dir {target}` prints a readable, "
             f"redacted summary you can check and then paste into a ticket. "
             f"It stays on this machine until you paste it.",
@@ -4802,6 +5117,13 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
     report = restore(source, args.dir, opts)
     if not args.json:
         print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+    # The closing words print **after** the json document, not before it: printed
+    # inside restore() they scrolled away under the report and a finished rebuild
+    # read as "it hung, then went quiet" (2026-09-13, first outside user). These
+    # lines say what to do next — they are the last thing on screen, always,
+    # terminal or pipe, --json included (stdout stays machine-clean).
+    for _line in report.closing_lines:
+        print(f"[restore] {sanitise_terminal(_line)}", file=sys.stderr, flush=True)
     # Stale facts are how a rebuild gets refused on a machine that would have worked, so
     # the one place worth saying it is right where the rebuild just ended. On stderr, and
     # it never blocks -- reading a date must not be able to fail a restore.

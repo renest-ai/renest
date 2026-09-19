@@ -29,6 +29,7 @@ from . import listing as _listing
 from . import pack as _pack
 from . import presign as _presign
 from . import restore as _restore
+from . import start as _start
 from . import update_rules as _update_rules
 from . import serve as _serve
 from . import support as _support
@@ -46,6 +47,7 @@ _SUMMARY = {
     "pack": "pack up the setup you got working",
     "watch": "run your training command and record what it really loaded",
     "restore": "rebuild a nest here",
+    "start": "run what your restore rebuilt — the start command, run for you",
     "verify": "check a rebuilt nest against what it should be",
     "lint": "check a nest file for problems",
     "serve": "run the local agent ComfyUI talks to",
@@ -62,6 +64,7 @@ _HANDLERS = {
     "pack": (_pack.add_arguments, _pack.run_from_args),
     "watch": (_watch.add_arguments, _watch.run_from_args),
     "restore": (_restore.add_arguments, _restore.run_from_args),
+    "start": (_start.add_arguments, _start.run_from_args),
     "verify": (_verify.add_arguments, _verify.run_from_args),
     "lint": (_lint.add_arguments, _lint.run_from_args),
     "serve": (_serve.add_arguments, _serve.run_from_args),

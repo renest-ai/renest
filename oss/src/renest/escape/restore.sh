@@ -2,10 +2,10 @@
 # =============================================================================
 # Renest restore.sh — the escape hatch
 #
-# Nest formats this copy reads: 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11  (and, with a warning,
+# Nest formats this copy reads: 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12  (and, with a warning,
 #   any later 2.x — a higher minor version only ever adds optional fields, and
 #   refusing one would turn a nest whose bytes restore perfectly into a brick).
-#   Written for format 2.11, 2026-09-07. Keep this line: from format 2.3 on a
+#   Written for format 2.12, 2026-09-13. Keep this line: from format 2.3 on a
 #   copy of this script travels inside every nest at .renest/escape/restore.sh,
 #   and this comment is how you tell which copy you are holding — there is no
 #   version field anywhere else.
@@ -344,10 +344,17 @@ FV=$(jq -r '.format_version' "$MANIFEST")
 #     not loosen that on a nest's say-so.
 # The third (`adapters.comfyui.verified_run.evidence_source`) is disclosure a reader
 # looks at. Every 2.0–2.10 nest restores unchanged: all three are absent there.
+# 2.12 (2026-09-13) adds one optional field this script does not use:
+# runtime.node_native_libs, the machine libraries each custom node's own compiled
+# files declare they need. The agent side reads it before a rebuild to warn when
+# this machine is short of one — it covers nodes the working run never loaded,
+# which the loaded list cannot see. This script only gets the bytes back and does
+# not start the application or import any node, so there is nothing here to act
+# on. Every 2.0–2.11 nest restores unchanged: the field is absent there.
 case "$FV" in
-  2.0|2.1|2.2|2.3|2.4|2.5|2.6|2.7|2.8|2.9|2.10|2.11) ;;
+  2.0|2.1|2.2|2.3|2.4|2.5|2.6|2.7|2.8|2.9|2.10|2.11|2.12) ;;
   2.*)
-    warn "This nest says format $FV; this script knows up to 2.11. Same major version, so it only adds optional fields this script does not use — carrying on. A newer Renest will make full use of them." ;;
+    warn "This nest says format $FV; this script knows up to 2.12. Same major version, so it only adds optional fields this script does not use — carrying on. A newer Renest will make full use of them." ;;
   *)
     # Same three facts the agent side gives, in the same order: how old this nest is,
     # that there is no upgrade path and why, and that the files themselves are fine.
@@ -355,7 +362,7 @@ case "$FV" in
     # is not (the manifest still lists every one of them, with fingerprints).
     _WHEN=$(jq -r '.created_at // empty' "$MANIFEST" 2>/dev/null | cut -c1-10)
     _NFILES=$(jq -r '(.files // []) | length' "$MANIFEST" 2>/dev/null)
-    die FORMAT-VERSION "Unrecognised nest format version: $FV — this script reads format 2.x (knows 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10 and 2.11).${_WHEN:+ This nest was packed on ${_WHEN}.} Nests in the older 1.x format cannot be read here, and **there is no upgrade path**: format 2.0 made it compulsory to say which parts of a nest are the application and which are your own code, and nobody can work that out after the fact.${_NFILES:+ **Your files are not lost** — this nest still lists all ${_NFILES} of them with their fingerprints, so they can be fetched one by one even though the environment cannot be rebuilt automatically.} If you still have the environment, pack it again with a current Renest." ;;
+    die FORMAT-VERSION "Unrecognised nest format version: $FV — this script reads format 2.x (knows 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11 and 2.12).${_WHEN:+ This nest was packed on ${_WHEN}.} Nests in the older 1.x format cannot be read here, and **there is no upgrade path**: format 2.0 made it compulsory to say which parts of a nest are the application and which are your own code, and nobody can work that out after the fact.${_NFILES:+ **Your files are not lost** — this nest still lists all ${_NFILES} of them with their fingerprints, so they can be fetched one by one even though the environment cannot be rebuilt automatically.} If you still have the environment, pack it again with a current Renest." ;;
 esac
 
 # ---- Where the files may land ------------------------------------------------
@@ -1424,7 +1431,23 @@ uv venv --python "$PYVER" "$TARGET/.venv" || die DEPS-VENV "uv could not create 
 # for every package: wrong bytes stop the rebuild instead of quietly landing.
 # No new dependency — it is just an environment variable uv already reads.
 if [ -n "${PACKAGE_SOURCE:-}" ]; then
-  log "Installing dependencies from $PACKAGE_SOURCE instead of the default. Every package is still checked against the fingerprint recorded in this nest."
+  # **Do not promise what this cannot check.** Until 2026-09-11 this line said
+  # "Every package is still checked against the fingerprint recorded in this nest",
+  # which is false exactly where it is read: a lock records a fingerprint for a
+  # package only when packing could look one up, and the lines without one arrive
+  # from whichever index was just named, compared against nothing. The agent side
+  # stopped claiming it on 2026-08-30 (restore.py, the `unfingerprinted_packages`
+  # branch); this copy kept saying it for twelve days because the gate that reads
+  # those sentences only globs `*.py` and never opened this file.
+  # Counted with grep, not with a new dependency: `--hash=` is what a fingerprinted
+  # line carries.
+  _PINNED=$(grep -c -- "--hash=" "$TARGET/.renest/requirements.lock" 2>/dev/null || echo 0)
+  _LINES=$(grep -cE "^[A-Za-z0-9]" "$TARGET/.renest/requirements.lock" 2>/dev/null || echo 0)
+  if [ "$_PINNED" -lt "$_LINES" ]; then
+    log "Installing dependencies from $PACKAGE_SOURCE instead of the default. $((_LINES - _PINNED)) package(s) in this nest carry no recorded fingerprint, so their bytes are not compared against anything — they arrive from whichever index you named. Point this only at an index you trust."
+  else
+    log "Installing dependencies from $PACKAGE_SOURCE instead of the default. Every package in this nest carries a recorded fingerprint, and each one is checked on arrival."
+  fi
   export UV_DEFAULT_INDEX="$PACKAGE_SOURCE"
 fi
 # Where the vendor-only pins came from (format 2.11), for the lines that were never

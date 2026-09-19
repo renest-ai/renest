@@ -49,6 +49,7 @@ __all__ = [
     "looks_like_the_working_run",
     "machine_libs_checkable",
     "missing_native_libs",
+    "node_declared_machine_libs",
     "split_by_layer",
     "this_platform_tag",
 ]
@@ -846,6 +847,72 @@ def contested_module_missing_libs(site_packages: Path) -> dict[str, list[str]]:
         gaps = missing_native_libs(sorted(n for n in needed if _is_lib(n)))
         if gaps:
             out[mod] = gaps
+    return out
+
+
+def node_declared_machine_libs(
+    node_dir: Path, carried_dirs: Sequence[Path] = ()
+) -> list[str]:
+    """Machine libraries the compiled files inside one custom node's folder declare
+    they need (format 2.12). Sorted, deduplicated, possibly empty.
+
+    Why this exists when ``native_libs`` already does: the authoritative list is what
+    the working run **loaded**, and a workflow that never touches a node's compiled
+    parts never loads their dependencies -- measured 2026-09-12, a plugin whose
+    ``import cv2`` died on ``libxcb.so.1`` on the rebuild machine passed the machine
+    check green, because the verified run had never imported it. The bytes were right,
+    the machine was wrong, and nothing in the nest could say so. This list is read off
+    what the node's own binaries **declare**, so it covers nodes the run never touched.
+
+    A declared-method statement (see module docstring): it names libraries that may
+    never be loaded, so a consumer may **only ever warn** on it -- never refuse.
+
+    Names are walked **through** the libraries the node folder carries itself, exactly
+    as :func:`contested_module_missing_libs` does: the top binary asks for a bundled
+    library and it is the bundled one that asks the machine for ``libxcb.so.1``. Names
+    satisfied by a file in ``carried_dirs`` (the Python environment's own folders --
+    ``torch/lib`` and the ``*.libs`` convention wheels use) are also not machine
+    requirements: the rebuild reinstalls them from the lock, so they will be there
+    again. Those are **not** descended into -- their own needs are the environment's
+    business, recorded on the ``native_libs`` list when the run used them.
+
+    Names the packing machine itself provides are dropped (asked the same way
+    :func:`missing_native_libs` asks): a name like ``libc.so.6`` that every real
+    target carries would only be noise. A name the packing machine itself lacked
+    stays -- the node never ran there either, and a target short of it will hit
+    exactly the failure this list exists to predict.
+    """
+    if not node_dir.is_dir():
+        return []
+    # Everything that could parse as a shared object: extension modules included,
+    # since a node's compiled Python extension is exactly where ``import cv2``-class
+    # failures live. The ``_EXT_MODULE`` filter is about *names on the list*, not
+    # about files worth reading.
+    inside = {
+        p.name: p for p in node_dir.rglob("*")
+        if p.is_file() and ".so" in p.name
+    }
+    carried = set(inside)
+    for d in carried_dirs:
+        if not d.is_dir():
+            continue
+        carried.update(p.name for p in d.rglob("*.so*") if p.is_file())
+    seen: set[str] = set()
+    needed: set[str] = set()
+    queue = list(inside.values())
+    while queue:
+        so = queue.pop()
+        for name in elf_needed(so):
+            if name in seen:
+                continue
+            seen.add(name)
+            if name in inside:
+                queue.append(inside[name])
+            elif name not in carried:
+                needed.add(name)
+    out = sorted(n for n in needed if _is_lib(n))
+    if machine_libs_checkable():
+        out = missing_native_libs(out)
     return out
 
 

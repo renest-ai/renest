@@ -1,4 +1,4 @@
-# manifest v2.11 · Nest manifest specification
+# manifest v2.12 · Nest manifest specification
 
 <!-- Version tripwire: the line "current version **x.y**" below is parsed by
      oss/tests/consistency/test_format_version_pinned.py and must agree with
@@ -6,11 +6,11 @@
      top line of the change log. This is the fifth place the version appears --
      the prose is not allowed to drift from the other four. -->
 
-> Status: **current version 2.11** (2026-09-07). Any field change is a format
+> Status: **current version 2.12** (2026-09-13). Any field change is a format
 > change: bump the version and update `manifest.schema.json`, `restore.sh` and
 > `renest lint` in the same change.
 >
-> **Readable versions**: `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` / `2.10` / `2.11`, plus **any future minor
+> **Readable versions**: `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` / `2.10` / `2.11` / `2.12`, plus **any future minor
 > version of the same major** (a reader meeting a newer minor number warns and
 > continues; it does not reject the nest -- see §2).
 > **1.x is refused outright** (a one-time clean break taken while there were no
@@ -26,7 +26,8 @@
 > module the working run used when several packages write the same folder),
 > 2.10 in §17 (how much system memory the packing machine could use),
 > 2.11 in §18 (where a recorded claim came from, and whether anyone ever saw
-> this nest work).
+> this nest work), 2.12 in §19 (what each custom node's own compiled files
+> need the machine to provide).
 > **Every 2.x nest still reads**: no version after 2.0 tightened anything.
 >
 > This document is the **frozen description** of the format: written field by
@@ -72,7 +73,7 @@ have restored perfectly into a brick.
 
 | Field | Required | Type | One line |
 |---|---|---|---|
-| `format_version` | ✔ | enum `2.0` … `2.11` | Format version (the schema enum is the only source of truth) |
+| `format_version` | ✔ | enum `2.0` … `2.12` | Format version (the schema enum is the only source of truth) |
 | `id` | ✔ | string (ULID) | Nest identifier, 26-character Crockford base32 |
 | `created_at` | ✔ | date-time | When it was packed |
 | `name` | | string ≤120 | Human-chosen name |
@@ -116,7 +117,7 @@ of truth.
 
 ## 2. Identity and metadata
 
-### `format_version` — enum `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` / `2.10` / `2.11` `[schema]`
+### `format_version` — enum `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` / `2.10` / `2.11` / `2.12` `[schema]`
 
 **The `enum` in the schema is the only source of truth.** Everywhere else,
 including this document, is a restatement. Changing the version means changing
@@ -227,6 +228,7 @@ Bare-metal and container-less packing: see §9. Since 2.3 that case has an answe
 | `native_libs` | | **Added in 2.6**: which operating-system libraries the working run needed the machine to provide |
 | `contested_modules` | | **Added in 2.8**: for every folder several installed packages write into, which package the working run's copy came from |
 | `system_memory` | | **Added in 2.10**: how much system memory the machine that packed the nest could use, so a rebuild onto a lower ceiling can warn before it loads |
+| `node_native_libs` | | **Added in 2.12**: machine libraries each custom node package's own compiled files declare they need -- covers nodes the working run never loaded. Warn only, never refuse |
 
 `gpu_model` is explicitly marked as not a rebuild constraint -- rebuilding on a
 different card is legitimate.
@@ -256,6 +258,22 @@ this field, each of them the result of a measurement that went the other way:
 | Names are **copied exactly as the program asked for them**, normalised in neither direction | Most entries name a file that does not exist under that name -- the driver library is asked for as `libcuda.so.1` while the file on disk carries the driver version, and one package asks for a name that already carries a minor version `[measured]` |
 | **Machine-provided is decided by where the library actually loaded from at pack time**, never by looking the name up | A common compression library sits under the same name inside an installed package while the run loads the machine's copy; the name lookup got it wrong on both chip families tested `[measured]` |
 | `method: "loaded"` may block a rebuild; **`method: "declared"` may only ever warn** | `declared` is the fallback used when no running application could be found, and it covers only part of what is really loaded while also listing libraries never loaded at all -- one machine was missing four of them while producing images perfectly well `[measured]` |
+
+**`node_native_libs` (2.12)** -- `{ "node-name": ["libxcb.so.1", …] }`. The half
+`native_libs` cannot see: that list records what the **working run loaded**, and a
+workflow that never touches a node's compiled parts never loads their
+dependencies -- measured 2026-09-12, a plugin whose `import cv2` died on
+`libxcb.so.1` on the rebuild machine passed the machine check green. The bytes
+were right, the machine was wrong, and nothing in the nest could say so. This
+list is read off the bytes being packed (the `NEEDED` entries of the shared
+objects inside each custom node's folder, walked through the libraries the node
+carries itself, with anything the Python environment provides excluded because
+the rebuild reinstalls it from the lock), so it covers nodes the run never
+touched. The price is that it is a declared-level statement all the way down: a
+consumer **may only warn on it, never refuse** -- the user's workflow may never
+load these nodes at all. Absent means nothing was collected (nest older than
+2.12, no compiled files, or nothing the machine must provide), never "needs
+none".
 
 **`contested_modules` (2.8)** -- an array; each entry describes one top-level
 module that several packages in the lock all write into:
@@ -1695,3 +1713,26 @@ account.
 | No `local_version_sources` route that reads the index back from the `+cuNNN` suffix | It is a table someone must keep matching a vendor's URL layout, it is right until the vendor moves a path, and in the manifest it would be indistinguishable from a measurement |
 | No automatic `--extra-index-url` from `local_version_sources` | Resolving one package name across two indexes is what dependency-confusion attacks are made of. The installer's refusal to do it is a defence, not an inconvenience, and must not be loosened on a nest's say-so |
 | No new exit code, and no new refusal in the escape hatch | The exit-code table is a frozen contract, and the 2026-07-15 ruling puts every refusal on the agent side: the escape hatch informs, it does not block |
+
+## 19. What 2.12 changed (2026-09-13)
+
+One optional field: `runtime.node_native_libs`. Purely additive -- every 2.0–2.11
+nest reads unchanged, and old nests simply carry nothing for the new reader to
+read.
+
+| What | Breaking? | Why |
+|---|---|---|
+| `runtime.node_native_libs` -- machine libraries each custom node package's own compiled files declare they need | No (additive, optional) | `native_libs` answers for the run that worked; a workflow that never loads a node's compiled parts leaves that node's needs invisible -- measured 2026-09-12, a nest restored green onto a machine short of `libxcb.so.1` and the plugin died on first import, with nothing in the nest that could have warned before the download was paid for |
+
+**Reading rule, unchanged in kind:** this is a declared-level list (see
+`$defs.evidence_source`): names copied exactly as the binaries asked for them,
+and **warn only, never refuse** -- the list names libraries the user's workflow
+may never load, and refusing on it would turn a working restore away.
+
+### Explicitly not done (2.12)
+
+| Not done | Why |
+|---|---|
+| No merge into `native_libs.names` | The two lists are different kinds of statement: one says what the working run loaded (may block), the other what a node's bytes declare (may only warn). Merging them would either strip the first of its authority or hand the second a power its evidence does not carry |
+| No `apt`/package-name mapping for these names | The package a soname belongs to differs per distribution and per release; `native_libs.packages` records the answer measured on the packing machine, and the same rule applies here |
+| No refusal, no new exit code, no change in the escape hatch | Same as every declared-level fact: the escape hatch informs, it does not block (2026-07-15 ruling) |
