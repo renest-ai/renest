@@ -4,9 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "renest"
-version = "0.1.15"
+version = "0.1.16"
 readme = "README.md"
-description = "Renest agent CLI: pack a working GPU setup — an image workflow or a fine-tuning run — into an open-format nest and restore it byte-identical anywhere."
+description = "Save a ComfyUI or fine-tuning setup that already worked on a rented GPU - models, custom nodes, exact package versions, workflow - and bring it back on another Linux GPU machine, every file checked against its SHA-256."
 requires-python = ">=3.11"
 # The CLI is source-available: readable, but not licensed for building a
 # competing hosted service on. It is not an open-source licence, so this is not

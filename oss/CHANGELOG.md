@@ -2,6 +2,31 @@
 
 What changed for the person using `renest`. Dates are the release date.
 
+## 0.1.16 — 2026-09-19 (not yet published; accumulating fixes before release)
+
+### `renest restore --json` now carries the boot-time health check report on the result event
+
+- Measured on a real rented machine (batch 15, 2026-09-25): the precheck report —
+  including the gpu_alloc probe that really touches the card — lived only on the
+  internal report object. The machine-readable `result` event omitted it, so any
+  `--json` reader saw "nothing measured" on machines that had measured plenty.
+- The whole precheck report now rides the `result` event, same rule as
+  `machine_libraries_missing`: a fact that only lives on the report object is
+  invisible to `--json`. Machine facts only — no user files, no redaction needed.
+
+### A plugin whose own files are pure Python no longer slips past the machine check
+
+- Measured on a real rented machine: a plugin with no compiled file of its own
+  shipped a `requirements.txt` naming opencv-python, and it was that wheel's
+  `cv2` binary that asked the machine for `libxcb.so.1`. The plugin folder scan
+  had nothing to read, so the rebuilt machine sailed through the check green and
+  the plugin died on import anyway.
+- The pack-time scan now also reads the binaries of the Python packages a
+  plugin's `requirements.txt` names — installed where the working run installed
+  them, walked through their own bundled libraries the same way. The restore
+  side's before-download warning names these too: still a warning, never a
+  refusal, exactly as before.
+
 ## 0.1.15 — 2026-09-19
 
 The first release shaped by watching somebody outside the team use this from

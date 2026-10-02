@@ -77,6 +77,7 @@ from .syslibs import (
     contested_winners,
     interpreter_site_packages,
     node_declared_machine_libs,
+    node_requirement_names,
     read_run_record,
     record_search_roots,
 )
@@ -1878,6 +1879,10 @@ def _build_manifest(
             _names = node_declared_machine_libs(
                 _spec_source(root, _d, _ip),
                 carried_dirs=(_sp,) if _sp else (),
+                # The declared-dependency leg (batch 14, 2026-09-19): a node with no
+                # compiled file of its own still dies through its pip deps' binaries.
+                dep_site_packages=_sp,
+                dep_names=node_requirement_names(_spec_source(root, _d, _ip)),
             )
             if _names:
                 _node_libs[str(_d.get("name") or _ip)] = _names

@@ -850,11 +850,77 @@ def contested_module_missing_libs(site_packages: Path) -> dict[str, list[str]]:
     return out
 
 
+#: Requirement-name line of a ``requirements*.txt``: project name, optional extras,
+#: then a version spec or nothing. Comments and ``--`` options are not names.
+_NODE_REQ_NAME = re.compile(
+    r"^\s*([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)\s*(?:\[[^\]]*\])?\s*(?:[<>=!~]|$)"
+)
+
+
+def node_requirement_names(node_dir: Path) -> list[str]:
+    """Distribution names one custom node's ``requirements*.txt`` files ask for.
+
+    The R12 lesson (2026-09-19, batch 14): a plugin whose own folder carries no
+    compiled file at all can still die on a missing machine library, because its
+    *declared pip dependency* (opencv-python) brings an ``.so`` that asks the
+    machine for ``libxcb.so.1``. Scanning only the node folder misses exactly the
+    case that started this. Names, not imports: ``opencv-python`` installs
+    ``cv2``, and the dist-info folder is named after the *distribution*.
+    """
+    out: list[str] = []
+    for req in sorted(node_dir.glob("requirements*.txt")):
+        try:
+            text = req.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.split("#", 1)[0].strip()
+            if not line or line.startswith("-"):
+                continue
+            m = _NODE_REQ_NAME.match(line)
+            if m:
+                out.append(m.group(1))
+    return out
+
+
+def _dist_so_files(site_packages: Path, names: Sequence[str]) -> list[Path]:
+    """Compiled files of the named installed distributions, straight off RECORD.
+
+    RECORD is the installer's own manifest, so every file it lists is exactly
+    what packing that dependency would carry -- no guessing from import names,
+    no walking the whole (torch-sized) site-packages.
+    """
+    files: list[Path] = []
+    for n in names:
+        prefix = re.sub(r"[-_.]+", "_", n.strip()).lower()
+        if not prefix:
+            continue
+        for dist_info in sorted(site_packages.glob(f"{prefix}-*.dist-info")):
+            rec = dist_info / "RECORD"
+            try:
+                with rec.open(encoding="utf-8", errors="replace", newline="") as fh:
+                    rows = list(csv.reader(fh))
+            except OSError:
+                continue
+            for row in rows:
+                if not row or ".so" not in row[0]:
+                    continue
+                p = site_packages / row[0].split(",")[0]
+                try:
+                    if p.is_file():
+                        files.append(p)
+                except OSError:
+                    continue
+    return files
+
+
 def node_declared_machine_libs(
-    node_dir: Path, carried_dirs: Sequence[Path] = ()
+    node_dir: Path, carried_dirs: Sequence[Path] = (),
+    dep_site_packages: Path | None = None, dep_names: Sequence[str] = (),
 ) -> list[str]:
     """Machine libraries the compiled files inside one custom node's folder declare
-    they need (format 2.12). Sorted, deduplicated, possibly empty.
+    they need (format 2.12), plus those of the node's declared pip dependencies.
+    Sorted, deduplicated, possibly empty.
 
     Why this exists when ``native_libs`` already does: the authoritative list is what
     the working run **loaded**, and a workflow that never touches a node's compiled
@@ -892,22 +958,32 @@ def node_declared_machine_libs(
         p.name: p for p in node_dir.rglob("*")
         if p.is_file() and ".so" in p.name
     }
-    carried = set(inside)
+    # The node's declared pip dependencies carry their own compiled files inside
+    # the Python environment -- same treatment as the node folder itself: their
+    # declared needs are read, and names they or the environment provide are not
+    # machine requirements (a rebuild reinstalls them from the lock).
+    dep_files: list[Path] = []
+    if dep_site_packages is not None and dep_site_packages.is_dir() and dep_names:
+        dep_files = _dist_so_files(dep_site_packages, dep_names)
+    readable = dict(inside)
+    for p in dep_files:
+        readable.setdefault(p.name, p)
+    carried = set(readable)
     for d in carried_dirs:
         if not d.is_dir():
             continue
         carried.update(p.name for p in d.rglob("*.so*") if p.is_file())
     seen: set[str] = set()
     needed: set[str] = set()
-    queue = list(inside.values())
+    queue = list(readable.values())
     while queue:
         so = queue.pop()
         for name in elf_needed(so):
             if name in seen:
                 continue
             seen.add(name)
-            if name in inside:
-                queue.append(inside[name])
+            if name in readable:
+                queue.append(readable[name])
             elif name not in carried:
                 needed.add(name)
     out = sorted(n for n in needed if _is_lib(n))

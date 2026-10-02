@@ -98,11 +98,12 @@ if [[ -n "$GRANT" ]]; then
     _EX_URL="$(jq -r '.exchange_url // empty' "$_GRANT_RAW")"
     [[ -n "$_EX_URL" ]] || { echo "[renest] this restore code has no exchange_url" >&2; exit 1; }
     echo "[renest] Redeeming your restore code… (expired or revoked? sign a new one from your drive)"
-    # A restore code binds to the first machine that redeems it, so the machine has to
-    # say who it is. We send a hash, never the raw values -- the server has no business
-    # knowing what this box is called. Only things that survive a reboot go in, because
-    # the same hash has to come back when a dropped transfer resumes.
-    # No new dependency: sha256sum (or shasum on a stock macOS) is already required.
+    # A restore code is not tied to a machine: it is short-lived and revocable
+    # instead, and the server ignores the X-Renest-Machine header below. The header
+    # is still sent, unchanged, so this copy behaves the same against any server.
+    # It is a hash, never the raw values -- the server has no business knowing what
+    # this box is called. No new dependency: sha256sum (or shasum on a stock macOS)
+    # is already required.
     _MFP=""
     _MRAW="$(hostname 2>/dev/null)|$(cat /etc/machine-id 2>/dev/null || cat /var/lib/dbus/machine-id 2>/dev/null)"
     if command -v sha256sum >/dev/null 2>&1; then
@@ -110,10 +111,9 @@ if [[ -n "$GRANT" ]]; then
     elif command -v shasum >/dev/null 2>&1; then
       _MFP="$(printf '%s' "$_MRAW" | shasum -a 256 | cut -d' ' -f1)"
     fi
-    # Cannot compute one? Send nothing. The code then simply never binds, which is the
-    # documented behaviour -- better than locking out someone who legitimately holds it.
+    # Cannot compute one? Send nothing -- the code works the same either way.
     if [[ -n "$_MFP" ]]; then
-      curl -fsS -X POST -H "X-Renest-Machine: $_MFP" "$_EX_URL" -o "$TARGET/.renest/grant-exchanged.json"       || { echo "[renest] Redeem failed: expired, revoked, or already used on another machine. Sign a new one — your nest is still in your account." >&2; exit 1; }
+      curl -fsS -X POST -H "X-Renest-Machine: $_MFP" "$_EX_URL" -o "$TARGET/.renest/grant-exchanged.json"       || { echo "[renest] Redeem failed: the code has expired or been revoked. Sign a new one — your nest is still in your account." >&2; exit 1; }
     else
       curl -fsS -X POST "$_EX_URL" -o "$TARGET/.renest/grant-exchanged.json"       || { echo "[renest] Redeem failed: the code has expired or been revoked. Sign a new one — your nest is still in your account." >&2; exit 1; }
     fi

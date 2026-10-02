@@ -442,6 +442,38 @@ def rebind_argv(argv: Sequence[str], address: str) -> list[str]:
     return out
 
 
+#: The port an application listens on when its command names none. Adapter-layer
+#: knowledge, and only for the apps we actually take: ComfyUI's ``--port`` defaults
+#: to 8188. Anything not listed here has no number said for it -- never a guess.
+_APP_DEFAULT_PORT = {"comfyui": 8188}
+
+
+def start_listen_port(argv: Sequence[str], adapters: dict | None) -> int | None:
+    """The port the **recorded** start command listens on -- not the check's.
+
+    The rebuild's own check appends a spare ``--port`` when the command names
+    none (it has to: something may already hold the default), then stops the app.
+    ``renest start`` and "Start it yourself" run the command as recorded, so they
+    land on whatever it says, or on the app's own default. Measured 2026-09-30:
+    a real ComfyUI nest records ``--listen 127.0.0.1`` and no port; the closing
+    lines and ``renest start`` both named the check's spare port, and ComfyUI came
+    up on 8188.
+    """
+    args = [str(a) for a in argv]
+    for i, tok in enumerate(args):
+        val = None
+        if tok == "--port" and i + 1 < len(args):
+            val = args[i + 1]
+        elif tok.startswith("--port="):
+            val = tok.split("=", 1)[1]
+        if val is not None:
+            return int(val) if val.isdigit() else None
+    for name in (adapters or {}):
+        if name in _APP_DEFAULT_PORT:
+            return _APP_DEFAULT_PORT[name]
+    return None
+
+
 def whats_next_lines(
     manifest: dict,
     plan_app_dir: Path,
@@ -449,7 +481,6 @@ def whats_next_lines(
     entrypoint: dict | None,
     *,
     oneshot: dict | None = None,
-    port: int | None = None,
     recipe_path: Path | None = None,
 ) -> list[str]:
     """What a person who just got a working environment does with it (B12).
@@ -518,18 +549,23 @@ def whats_next_lines(
                 f"from outside, change that one value to 0.0.0.0 (or run "
                 f"`renest start --dir {target} --listen 0.0.0.0`, which does it for you)."
             )
-        if port and _lb:
+        # The port the command above listens on -- never the spare one the check
+        # borrowed (see start_listen_port); unknown means no number is said.
+        port = (start_listen_port(ep["argv"], manifest.get("adapters"))
+                if (cmd and ep and ep.get("argv")) else None)
+        _where = f"port {port}" if port else "the port it listens on (this nest does not record which)"
+        if cmd and _lb:
             lines.append(
-                f"  · It was answering on port {port} during the check. On a rented GPU "
+                f"  · Started that way it listens on {_where}. On a rented GPU "
                 f"box, reaching it from your own browser also means exposing that port in "
                 f"your provider's panel — the check never did that for you."
             )
-        elif port:
+        elif cmd:
             # The command names no address at all, so what it binds to is the
             # application's own default and we do not know it. Say the condition
             # without pretending to know which half is already true.
             lines.append(
-                f"  · It was answering on port {port} during the check. On a rented GPU "
+                f"  · Started that way it listens on {_where}. On a rented GPU "
                 f"box, reaching it from your own browser means it has to be listening on "
                 f"0.0.0.0 and that port exposed in your provider's panel — the check "
                 f"never did either for you."
@@ -552,7 +588,7 @@ def write_start_facts(
     plan: RestorePlan,
     target: Path,
     oneshot: dict | None,
-    port: int | None,
+    listen_port: int | None,
 ) -> Path | None:
     """Leave behind what ``renest start`` needs to re-run the entrypoint.
 
@@ -570,7 +606,10 @@ def write_start_facts(
         "app_dir": os.path.relpath(plan.app_dir, target),
         "entrypoint": ep,
         "oneshot": oneshot is not None,
-        "port": port,
+        # What `renest start` will listen on (start_listen_port), not the check's
+        # spare port. Named apart from the old "port" key, which held the latter,
+        # so a start.json an older restore left behind is never read as this.
+        "listen_port": listen_port,
     }
     p = target / START_REL
     try:
@@ -1870,12 +1909,11 @@ def _source_failure(e: SourceError, source: str) -> NestFailure:
 def machine_fingerprint() -> str | None:
     """A stable id for this machine, hashed. None when nothing stable can be read.
 
-    A restore code binds to the first machine that redeems it, so the machine has to
-    say who it is. Two properties matter and both are easy to get wrong:
-    **stable across a reboot** (a resumed transfer has to present the same value, so
-    nothing random or boot-scoped goes in), and **the same value the escape hatch
-    computes** -- the two must agree or redeeming through one would lock out the other.
-    Only the hash leaves the machine; the server has no business knowing the hostname.
+    A restore code is not tied to a machine: it is short-lived and revocable instead,
+    and the server ignores this value. It is still sent, unchanged, and still computed
+    the same way the escape hatch computes it, so both legs behave identically against
+    any server. Only the hash leaves the machine; the server has no business knowing
+    the hostname.
     """
     machine_id = ""
     for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
@@ -1891,6 +1929,17 @@ def machine_fingerprint() -> str | None:
     if not host and not machine_id:
         return None
     return hashlib.sha256(f"{host}|{machine_id}".encode()).hexdigest()
+
+
+def _server_error_message(r: httpx.Response) -> str:
+    """The plain-language ``error.message`` from a server error body, or ""."""
+    try:
+        body = r.json()
+    except ValueError:
+        return ""
+    err = body.get("error") if isinstance(body, dict) else None
+    msg = err.get("message") if isinstance(err, dict) else None
+    return msg.strip() if isinstance(msg, str) else ""
 
 
 def _exchange_envelope(env: dict, client: httpx.Client) -> dict:
@@ -1918,8 +1967,11 @@ def _exchange_envelope(env: dict, client: httpx.Client) -> dict:
         raise NestFailure("S1", ErrorClass.CREDENTIAL_EXPIRED,
                          "This restore code has expired or been revoked. Sign a new one from your drive — your nest is still there.")
     if r.status_code == 403:
+        # A code is not tied to a machine, so a refusal here is the server saying this
+        # archive cannot be handed out -- pass its own words on rather than guess.
         raise NestFailure("S1", ErrorClass.CREDENTIAL_EXPIRED,
-                         "This restore code was already used on a different machine. A code binds to the first machine that redeems it — sign a new one from your drive and it will work here.")
+                         _server_error_message(r) or "The server refused to redeem this restore code (HTTP 403).",
+                         detail=r.text[:300])
     if r.status_code != 200:
         raise NestFailure("S1", ErrorClass.CREDENTIAL_EXPIRED,
                          f"Redeeming the restore code was refused (HTTP {r.status_code})", detail=r.text[:300])
@@ -4892,15 +4944,17 @@ def restore(
             target,
             plan.entrypoint,
             oneshot=report.oneshot,
-            port=getattr(handle_box.get("h"), "port", None),
             recipe_path=target / RECIPE_REL,
         ):
             closing(_line)
         # `renest start` runs the same command for the person who would otherwise
         # copy it out of these lines and paste it back (2026-09-13 ruling). The
         # facts it needs land next to the state file; the hint names the command.
+        _ep_argv = (plan.entrypoint or {}).get("argv") if isinstance(plan.entrypoint, dict) else None
         if write_start_facts(
-            plan, target, report.oneshot, getattr(handle_box.get("h"), "port", None)
+            plan, target, report.oneshot,
+            start_listen_port(_ep_argv, mani.get("adapters"))
+            if (report.oneshot is None and isinstance(_ep_argv, list)) else None,
         ) is not None:
             closing(f"  · Or let the tool do it for you: renest start --dir {target}")
         if report.redactions:
@@ -4955,6 +5009,13 @@ def restore(
         # in ``exit_code`` (61) and in this list, which names the libraries outright so a
         # ``--json`` reader never has to parse the English sentence to find out.
         machine_libraries_missing=short_libs,
+        # The S0 precheck report (whole thing, checks included). It already lives on
+        # the report object, but a verdict only there is invisible to a --json reader
+        # -- same rule as checks_after_deps above. Measured 2026-09-25 (batch 15):
+        # the GPU-allocation gauge in our batch dashboards reads gpu_alloc from this event and got nothing, because the
+        # event used to omit precheck entirely. Machine facts only, no user files,
+        # so it needs no redaction pass.
+        precheck=report.precheck,
         nest_id=report.nest_id,
         stages={s.name: s.seconds for s in report.stages},
         metrics=report.metrics,

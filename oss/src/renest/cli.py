@@ -118,7 +118,7 @@ def _handle_placeholder(args: argparse.Namespace, emitter: EventEmitter) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="renest",
-        description="Pack up the setup you got working — an image workflow or a fine-tuning run — then rebuild it byte-for-byte anywhere.",
+        description="Pack up the setup you got working — an image workflow or a fine-tuning run — then bring its files and dependencies back on another machine, every file checked.",
     )
     parser.add_argument("--version", action="version", version=_version_string())
     parser.add_argument(

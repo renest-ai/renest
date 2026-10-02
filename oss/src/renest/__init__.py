@@ -1,7 +1,8 @@
 """Renest agent CLI (`renest`).
 
 Packs a working GPU setup (an image workflow, or a fine-tuning run) into an
-open-format nest and restores it byte-identical on any machine. The nest
+open-format nest, then brings its files and dependencies back on another
+machine with every file checked against its fingerprint. The nest
 format itself is open (Apache-2.0, see specs/), as is the escape hatch under
 ``escape/`` — this tool reads and writes an open format, but is not itself
 open-source software.
@@ -12,7 +13,7 @@ LICENSE-CLI and NOTICE files distributed with this package.
 
 from __future__ import annotations
 
-__version__ = "0.1.15"
+__version__ = "0.1.16"
 
 def _supported_manifest_versions() -> tuple[str, ...]:
     """Manifest versions this CLI can read — **derived, never copied by hand**.

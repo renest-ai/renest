@@ -1,24 +1,26 @@
 # renest
 
-Pack up a GPU setup you already got working — an image workflow or a fine-tuning
-run — and rebuild it on any other machine, every file byte for byte. Boot that machine
-from the image your nest recorded, and everything the app needs comes with it.
+Renest saves a ComfyUI or fine-tuning setup that already worked on a rented GPU — the model files, custom nodes, exact package versions and workflow — and brings it back on another Linux GPU machine, every file checked against its SHA-256. It promises that the files and dependencies come back verified; whether the app then runs is tested on every restore and reported, not promised.
 
-Renest is for the moment *after* something works. You got a ComfyUI workflow
-producing the image you wanted, or a fine-tuning run that finally trained. Renest
-captures everything that success depended on — models, custom nodes, code, the
-dependency lock, the recipe file, the environment fingerprint — into a single
-open-format archive called a **nest**. Later, on any machine, any cloud, any new
-pod, you rebuild it and check every file against its SHA-256. Same bytes or it
-tells you which ones differ.
+Renest is for the moment *after* something works: a ComfyUI workflow producing the image
+you wanted, or a fine-tuning run (kohya_ss, LLaMA-Factory) that finally trained. It captures
+what that success depended on — models, custom nodes pinned to their commits, the
+dependency lock, the workflow or training config, the system libraries the run loaded —
+into a single open-format archive called a **nest**. Later, on a fresh pod, another region
+or another cloud, `renest restore` checks the machine first, brings every file back and
+checks it against its SHA-256, reinstalls the locked package versions, then starts the app,
+runs the workflow once and tells you what passed and what didn't.
 
-Shared libraries belong to the machine, not to the nest — an archive cannot carry
-its operating system. That is why a nest records the image it ran on: boot the same
-one and they are already there. On a machine without them the rebuild still gets
-every byte back, and if the app then cannot start, Renest names the library that is
-missing and where to get it rather than leaving you to read a traceback.
+System libraries belong to the machine, not the nest. A nest records which ones the run
+loaded and which image it ran on; on a machine that lacks one, the restore names it and the
+command to install it.
 
 It does not try to make unfamiliar things work. It reproduces what already did.
+
+- Website and docs: https://renest.ai · Quick start: https://renest.ai/docs/quick-start
+- ComfyUI panel: https://github.com/renest-ai/comfyui-renest
+- Format spec and the standalone `restore.sh` escape hatch: Apache-2.0. The CLI itself is
+  source-available, not open-source software (see `LICENSE-CLI`).
 
 ## Install
 

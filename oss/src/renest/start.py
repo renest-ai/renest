@@ -168,9 +168,11 @@ def run_from_args(args: argparse.Namespace, emitter) -> int:  # noqa: ANN001
                 f"with --listen 0.0.0.0.",
                 file=sys.stderr, flush=True,
             )
-    if facts.get("port"):
+    # "listen_port", never the old "port" key: that one held the spare port the
+    # rebuild's check borrowed, which the command below does not use (2026-09-30).
+    if facts.get("listen_port"):
         print(
-            f"[start] It answers on port {facts['port']}. On a rented GPU box, reaching it "
+            f"[start] It answers on port {facts['listen_port']}. On a rented GPU box, reaching it "
             f"from your own browser also means exposing that port in your provider's panel.",
             file=sys.stderr, flush=True,
         )
