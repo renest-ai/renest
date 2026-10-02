@@ -66,7 +66,7 @@ __all__ = [
 DEFAULT_HOST = "127.0.0.1"  # loopback only — never bind a routable interface
 DEFAULT_PORT = 7799
 API_PREFIX = "/api/v1"
-ENV_TOKEN_FILE = "RENEST_TOKEN_FILE"  # frozen cross-module contract name (the plugin reads it)
+ENV_TOKEN_FILE = "RENEST_TOKEN_FILE"  # serve honours it; the panel stopped reading it in 0.1.7 (pointer file instead)
 LOG_TAIL_LINES = 100  # `logs_tail` returns the last N lines
 MAX_QUEUE = 8  # a POST over this cap gets 429
 
@@ -96,6 +96,14 @@ def _env_hints(body: dict) -> dict:
         if isinstance(value, str) and value:
             hints[key] = value
     return hints
+
+
+def _workflow_ui(body: dict) -> dict | None:
+    """The canvas as the panel sent it (``app.graphToPrompt().workflow``), so the
+    restored app's Workflows sidebar can open it. Inline only: a path here would let
+    a request have pack read any file on the machine into a nest."""
+    ui = body.get("workflow_ui")
+    return ui if isinstance(ui, dict) and ui else None
 
 
 def default_out_dir(target: str | os.PathLike[str], *, create: bool = True) -> Path:
@@ -169,6 +177,34 @@ def _leave_pointer(chosen: Path, default: Path) -> None:
     except OSError:
         # Never fail serving because the hint could not be written.
         pass
+
+
+#: Where the panel reads the pointer, spelled the way the panel spells it
+#: (comfyui-renest/__init__.py, ``_token_candidates``): built from the home folder
+#: on every system, never from the environment.
+PANEL_POINTER = Path(".config") / "renest" / POINTER_REL
+
+
+def token_notice(token_path: Path) -> str:
+    """The startup line about the token, matching how the panel finds it today.
+
+    It used to say "or point it there with RENEST_TOKEN_FILE"; the panel has not read
+    that variable since 0.1.7 (a Registry scanner flags any such read), and finds a
+    token kept elsewhere through the pointer file instead (2026-10-03, Spark).
+    """
+    default = Path(platformdirs.user_config_dir(APP_NAME)) / "serve.token"
+    if token_path == default:
+        return (f"Token file: {token_path} (0600). The Renest panel in ComfyUI reads it "
+                f"from there.")
+    pointer = default.parent / POINTER_REL
+    if pointer == Path.home() / PANEL_POINTER:
+        return (f"Token file: {token_path} (0600). Its location is written to {pointer}, "
+                f"which is where the Renest panel in ComfyUI looks for a token kept "
+                f"outside the default place.")
+    return (f"Token file: {token_path} (0600). The Renest panel in ComfyUI looks for it "
+            f"at {default}, or wherever {Path.home() / PANEL_POINTER} names; on this "
+            f"system neither points here, so start serve without --token-file for the "
+            f"panel to find it.")
 
 
 def read_token_file(path: Path) -> str | None:
@@ -502,6 +538,7 @@ class ServeApp:
         with tempfile.TemporaryDirectory() as tmp:
             report = self._pack_fn(
                 target, spec, tmp, dry_run=True, no_fingerprint=True, workflow=workflow,
+                workflow_ui=_workflow_ui(body),
                 hash_cache=self._read_record_for(target),
                 **_env_hints(body),
             )
@@ -644,6 +681,10 @@ class ServeApp:
             dest,
             no_fingerprint=bool(body.get("no_fingerprint", False)),
             workflow=workflow,
+            workflow_ui=_workflow_ui(body),
+            # The name typed in the panel, so the restored app's Workflows sidebar
+            # shows it instead of "renest-workflow".
+            workflow_name=body.get("name") if isinstance(body.get("name"), str) else None,
             emitter=emitter,
             # Explicit, not inherited (decided 2026-09-06): the panel path always
             # pins vendor-only versions to direct addresses. A pod that just ran
@@ -918,11 +959,7 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
         f"(loopback only)",
         file=sys.stderr,
     )
-    print(
-        f"Token file: {token_path} (0600). The plugin reads the same file, "
-        f"or point it there with {ENV_TOKEN_FILE}.",
-        file=sys.stderr,
-    )
+    print(token_notice(token_path), file=sys.stderr)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

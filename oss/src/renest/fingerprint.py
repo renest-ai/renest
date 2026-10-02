@@ -36,6 +36,7 @@ __all__ = [
     "build_gpu_block",
     "collect",
     "collect_gpu",
+    "collect_rebuilt",
 ]
 
 #: const "1", matching manifest.schema.json (fingerprint.fingerprint_version).
@@ -333,6 +334,30 @@ def collect(
     fingerprint reflects the tool's env, not the nest's.
     """
     probe = _probe_in_process() if python_path is None else _probe_subprocess(python_path)
+    return build_fingerprint(probe, _read_os_release(os_release_path))
+
+
+def collect_rebuilt(
+    python_path: str | Path,
+    *,
+    os_release_path: str | Path = "/etc/os-release",
+) -> Fingerprint | None:
+    """This machine's fingerprint as the **rebuilt** environment's interpreter sees it.
+
+    ``None`` when that interpreter could not be asked at all. Unlike :func:`collect`,
+    which falls back to the version of the Python running renest, an interpreter that
+    did not answer yields no fingerprint: filling the gap with renest's own Python
+    would be a reading of the wrong environment presented as this one.
+
+    Why restore needs it (2026-10-03, Spark, same machine for pack and restore): the
+    check before the download can only read renest's own environment -- a
+    ``uv tool install`` with no torch in it -- so torch and every critical package
+    read as null there, and the closing words said the machine "differs". Once the
+    environment is rebuilt, its own interpreter is the one that will run the app.
+    """
+    probe = _probe_subprocess(str(python_path))
+    if not probe.get("__python__"):
+        return None
     return build_fingerprint(probe, _read_os_release(os_release_path))
 
 

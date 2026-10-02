@@ -21,7 +21,16 @@ import sys
 from pathlib import Path
 
 from .errors import ExitCode
-from .restore import START_REL, loopback_bind, rebind_argv, resolve_argv0
+from .restore import (
+    RECIPE_REL,
+    START_REL,
+    loopback_bind,
+    place_sidebar_workflow,
+    rebind_argv,
+    resolve_argv0,
+    start_listen_port,
+    system_dir_refusal,
+)
 from .roots import materialise_entrypoint_env
 
 __all__ = [
@@ -67,8 +76,50 @@ def load_start_facts(target: Path) -> dict:
     return facts
 
 
+def parse_port(value: str) -> int | None:
+    """``value`` as a TCP port (1-65535), or None."""
+    v = str(value).strip()
+    if not (v.isascii() and v.isdigit()):
+        return None
+    n = int(v)
+    return n if 1 <= n <= 65535 else None
+
+
+def _report_argv(argv: list[str], port: int, *, known: bool) -> list[str]:
+    """``argv`` listening on ``port``: the recorded ``--port N`` / ``--port=N``
+    rewritten (the spellings ``start_listen_port`` reads), else one appended --
+    but only when the app's port was known at restore; never a guessed flag."""
+    out = list(argv)
+    for i, tok in enumerate(out):
+        if tok == "--port" and i + 1 < len(out):
+            out[i + 1] = str(port)
+            break
+        if tok.startswith("--port="):
+            out[i] = f"--port={port}"
+            break
+    else:
+        if not known:
+            raise StartFailure(
+                f"Cannot move this nest to port {port}: its start command names no port "
+                f"and the port this application listens on is not known, so there is "
+                f"nothing to change -- adding a flag it may not accept would break a "
+                f"start that works. Start it by hand with whatever flag this application "
+                f"uses for its port."
+            )
+        if out and out[-1] == "--port":
+            out.append(str(port))
+        else:
+            out += ["--port", str(port)]
+    if start_listen_port(out, None) != port:  # same reading as the closing lines
+        raise StartFailure(
+            f"Cannot move this nest to port {port}: its recorded --port is not in a "
+            f"form this tool can change. Start it by hand with --port {port}."
+        )
+    return out
+
+
 def start_command(
-    facts: dict, target: Path, *, listen: str | None = None,
+    facts: dict, target: Path, *, listen: str | None = None, port: int | None = None,
 ) -> tuple[list[str], Path, dict[str, str]]:
     """Rebuild the exact command the closing lines printed — or refuse.
 
@@ -82,6 +133,12 @@ def start_command(
     there. Changing it rewrites **the value of an address flag the command
     already has** — never adds one, so an application that takes no such flag
     gets a refusal with the reason, not a crash.
+
+    ``port`` is the other: on a box where something already holds the recorded
+    port (a provider's own ComfyUI on 8188), the start collides. It rewrites the
+    ``--port`` the command has, or adds one only when the restore knew which port
+    the app listens on (``listen_port``: ComfyUI's own default) -- the same
+    spellings ``start_listen_port`` reads, so the number said afterwards is this one.
     """
     ep = facts.get("entrypoint") if isinstance(facts.get("entrypoint"), dict) else {}
     argv = ep.get("argv")
@@ -105,6 +162,8 @@ def start_command(
                 f"Cannot point this nest at {listen}: {e}. Start it by hand with whatever "
                 f"flag this application uses for its address."
             ) from e
+    if port is not None:
+        rest = _report_argv(rest, port, known=bool(facts.get("listen_port")))
     cmd = [str(exe), *rest]
     app_rel = facts.get("app_dir") or "."
     cwd = target / str(app_rel)
@@ -135,12 +194,32 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
              "reach it from your own browser on a rented box)",
     )
     parser.add_argument(
+        "--port", metavar="PORT",
+        help="listen on this port instead of the one recorded (use it when something "
+             "else on this box already holds that port)",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="print the command that would run, then stop",
     )
 
 
 def run_from_args(args: argparse.Namespace, emitter) -> int:  # noqa: ANN001
+    # Same refusal as restore: an app started inside a system folder writes its
+    # outputs there (into memory, for /run).
+    _why = system_dir_refusal(args.dir)
+    if _why:
+        print(f"[start] ✗ {_why} Restore into it, then start it from there.",
+              file=sys.stderr, flush=True)
+        return int(ExitCode.USAGE)
+    _port_arg = getattr(args, "port", None)
+    _port = None
+    if _port_arg is not None:
+        _port = parse_port(_port_arg)
+        if _port is None:
+            print(f"[start] ✗ --port takes a whole number from 1 to 65535, not {_port_arg!r}.",
+                  file=sys.stderr, flush=True)
+            return int(ExitCode.USAGE)
     target = Path(args.dir).expanduser().resolve()
     try:
         facts = load_start_facts(target)
@@ -148,12 +227,30 @@ def run_from_args(args: argparse.Namespace, emitter) -> int:  # noqa: ANN001
         # namespace in places that predate the flag, and a crash there would be
         # the tool falling over on its own new option.
         _listen = getattr(args, "listen", None)
-        cmd, cwd, env_extra = start_command(facts, target, listen=_listen)
+        cmd, cwd, env_extra = start_command(facts, target, listen=_listen, port=_port)
     except StartFailure as e:
         print(f"[start] {e.human}", file=sys.stderr, flush=True)
         return int(ExitCode.USAGE)
     env = dict(os.environ)
     env.update(env_extra)
+    # Put the recipe back in ComfyUI's Workflows sidebar if it went missing since the
+    # restore (idempotent: the same bytes already there are left as they are). Only
+    # when the restore recorded that it placed one -- never derived anew here.
+    _wf_name = facts.get("sidebar_workflow")
+    if isinstance(_wf_name, str) and _wf_name and not args.dry_run:
+        # The restored file it came from; a start.json from before that was recorded
+        # means the staged recipe. Never a path outside the restore folder.
+        _src = target / RECIPE_REL
+        _rec = facts.get("sidebar_workflow_source")
+        if isinstance(_rec, str) and _rec:
+            _cand = (target / _rec).resolve()
+            if _cand.is_relative_to(target):
+                _src = _cand
+        _placed = place_sidebar_workflow(cwd, _src, _wf_name, [str(a) for a in cmd])
+        if _placed is not None:
+            print(f"[start] In ComfyUI, open Workflows (left sidebar) → {_placed.stem} "
+                  f"for the workflow this nest was packed from.",
+                  file=sys.stderr, flush=True)
     print(f"[start] cd {cwd} && {shlex.join(cmd)}", file=sys.stderr, flush=True)
     # Said before it runs, not after: once the application has the terminal, its
     # own output buries anything printed later, and the person is already trying
@@ -170,9 +267,10 @@ def run_from_args(args: argparse.Namespace, emitter) -> int:  # noqa: ANN001
             )
     # "listen_port", never the old "port" key: that one held the spare port the
     # rebuild's check borrowed, which the command below does not use (2026-09-30).
-    if facts.get("listen_port"):
+    _answers = _port if _port is not None else facts.get("listen_port")
+    if _answers:
         print(
-            f"[start] It answers on port {facts['listen_port']}. On a rented GPU box, reaching it "
+            f"[start] It answers on port {_answers}. On a rented GPU box, reaching it "
             f"from your own browser also means exposing that port in your provider's panel.",
             file=sys.stderr, flush=True,
         )

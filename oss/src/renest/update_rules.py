@@ -36,7 +36,8 @@ from .rules import (
 )
 
 __all__ = ["RULE_NAMES", "OPTIONAL_IN_BUNDLE", "trusted_keys", "verify_and_install",
-           "update_all", "staleness_warning", "warn_if_stale", "in_effect"]
+           "update_all", "staleness_warning", "warn_if_stale", "in_effect",
+           "refresh_if_stale", "auto_refresh_consented"]
 
 #: Which rules files this channel refreshes.
 #:
@@ -252,7 +253,7 @@ def staleness_note(name: str, *, now=None) -> str | None:
     days = stale_days(name, now=now)
     if days is None or not _is_stale(days):
         return None
-    return _stale_text(days)
+    return _stale_text(days, _local_issued_at(name)[:10])
 
 
 def _is_stale(days: int) -> bool:
@@ -261,11 +262,18 @@ def _is_stale(days: int) -> bool:
     return days > STALE_AFTER_DAYS
 
 
-def _stale_text(days: int) -> str:
+def _stale_text(days: int, date: str = "") -> str:
+    """One short, neutral line -- old data is a fact worth stating, not an alarm.
+
+    It used to be a three-sentence warning with a ⚠ in front, printed as the very
+    last thing after a restore that had just succeeded (2026-10-02, the founder's
+    first restore on a fresh pod): the loudest line on screen was about something
+    that had not gone wrong.
+    """
+    since = f"from {date} " if date else ""
     return (
-        f"The compatibility facts on this machine are {days} days old. They go out of "
-        f"date as the world moves on, and out-of-date facts are how a perfectly good "
-        f"machine gets turned away. Refresh them with: renest update-rules"
+        f"Compatibility data here is {since}({days} days old); "
+        f"`renest update-rules` refreshes it."
     )
 
 
@@ -277,11 +285,31 @@ def staleness_warning(*, now=None) -> str | None:
     which is the case this whole warning exists for: installed once, left for six months,
     then turned away by facts that were already old on the day they arrived.
     """
-    ages = [d for d in (stale_days(n, now=now) for n in RULE_NAMES) if d is not None]
-    days = max(ages) if ages else _builtin_age_days(now=now)
-    if days is None or not _is_stale(days):
+    age = _oldest_age(now=now)
+    if age is None or not _is_stale(age[0]):
         return None
-    return _stale_text(days)
+    return _stale_text(*age)
+
+
+def _oldest_age(*, now=None) -> tuple[int, str] | None:
+    """``(days, "YYYY-MM-DD")`` of the oldest copy in use -- the one that decides.
+
+    Downloaded files are dated by when they were issued; with nothing downloaded,
+    the newest stamp among the files shipped inside the install. ``None`` when
+    nothing carries a date (unknown, and never guessed).
+    """
+    dated = []
+    for n in RULE_NAMES:
+        days = stale_days(n, now=now)
+        if days is not None:
+            dated.append((days, _local_issued_at(n)[:10]))
+    if dated:
+        return max(dated)
+    days = _builtin_age_days(now=now)
+    if days is None:
+        return None
+    stamps = [s for s in (_rules.builtin_stamp(n) for n in RULE_NAMES) if s]
+    return days, max(stamps)[:10]
 
 
 def _builtin_age_days(*, now=None) -> int | None:
@@ -309,7 +337,65 @@ def warn_if_stale(stream=None, *, now=None) -> None:
     except Exception:  # noqa: BLE001 - a side note must never break the real work
         return
     if note:
-        print(f"⚠ {note}", file=stream if stream is not None else sys.stderr)
+        print(note, file=stream if stream is not None else sys.stderr)
+
+
+#: Per-request timeout when a refresh runs on its own before doctor / restore. Short
+#: on purpose: it is a side errand in front of the real work, and every host it tries
+#: is allowed this long, so a machine with no way out loses seconds, not minutes.
+AUTO_REFRESH_TIMEOUT = 5.0
+
+
+def auto_refresh_consented(config=None) -> bool:
+    """Whether this person has said yes to keeping the facts fresh on their own.
+
+    **Only a yes counts** (config ``[rules] refresh = true`` or
+    ``RENEST_RULES_REFRESH=1``). The standing design (config.py, cli.py,
+    ``should_ask_refresh``): going online for this has to be the user's explicit
+    choice, so a refresh nobody agreed to is never made -- not even a "harmless"
+    one in front of a restore. Unreadable config means no.
+    """
+    try:
+        if config is None:
+            from .config import load_config
+
+            config = load_config()
+        return bool(getattr(config, "rules_refresh_enabled", False))
+    except Exception:  # noqa: BLE001 - a side errand must never break the real work
+        return False
+
+
+def refresh_if_stale(*, config=None, now=None, fetch=None,
+                     timeout: float = AUTO_REFRESH_TIMEOUT) -> str | None:
+    """Before doctor / restore read the facts: refresh them if they are stale **and**
+    the user agreed to automatic refreshes. Returns the one line to print once the
+    real work is done, or ``None`` for nothing to say.
+
+    - fresh (or undated): nothing happens, ``None``;
+    - stale, no consent: nothing is fetched; the short neutral line about their age;
+    - stale, consented: the exact ``update_all`` path ``renest update-rules`` takes
+      (same key ring, same signature and structure checks, same anti-downgrade,
+      same atomic landing) -- only the fetch is given a short timeout. Success is
+      silent; failure is one line saying which copy is still in use.
+
+    Never raises and never touches an exit code: stale facts are a reason to look,
+    never a reason to refuse (tests/unit/test_stale_rules_only_warn.py).
+    """
+    try:
+        age = _oldest_age(now=now)
+        if age is None or not _is_stale(age[0]):
+            return None
+        if not auto_refresh_consented(config):
+            return _stale_text(*age)
+        results = update_all(
+            fetch=fetch if fetch is not None else (lambda: _fetch_bundle(timeout=timeout))
+        )
+        _rules.clear_cache()
+        if results and all(r.get("ok") for r in results):
+            return None
+        return f"Couldn't refresh compatibility data (offline?); using the copy from {age[1]}."
+    except Exception:  # noqa: BLE001 - a side errand must never break the real work
+        return None
 
 
 #: Name of the file once everything is bundled together. **What is combined is transport,
@@ -382,7 +468,7 @@ def install_bundle(body: dict, *, keys: dict[str, bytes] | None = None) -> list[
     return out
 
 
-def _fetch_bundle() -> dict | None:
+def _fetch_bundle(timeout: float = 20) -> dict | None:
     """Fetch the bundled rules. **Every place is tried**: the two CDN hosts and the
     public repository.
 
@@ -405,7 +491,7 @@ def _fetch_bundle() -> dict | None:
     ]
     for url in [c for c in candidates if c]:
         try:
-            r = httpx.get(url, timeout=20)
+            r = httpx.get(url, timeout=timeout)
             r.raise_for_status()
             return r.json()
         except Exception:  # noqa: BLE001 - one source down, try the next one

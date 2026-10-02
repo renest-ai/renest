@@ -32,6 +32,27 @@ from .integrity import dirty_gap, git_identity, probe_model_bytes, registry_iden
 from .syslibs import read_run_record, record_search_roots
 from .verified import scan_comfyui_output
 
+#: The licence blocks capture writes **on its own** when nobody has said anything
+#: about a file. They are the tool's defaults, not anyone's statement, so pack must
+#: not record them as ``declared_by: "user"`` (2026-10-03, Spark: a panel nest said
+#: the user had declared a licence the user never saw). A block that differs from
+#: these in any way was written or edited by a person, and stays theirs.
+UNKNOWN_LICENCE_DEFAULT: dict = {
+    "shareable": False, "serving_scope": "gated", "tag": "unknown",
+    "note": "We couldn't confirm the license, so it defaults to gated "
+            "(restricted). Check the license and add origin_url before you pack.",
+}
+INPUT_ASSET_LICENCE_DEFAULT: dict = {
+    "shareable": True, "serving_scope": "private", "tag": "unknown",
+    "note": "Input material for the workflow, treated as yours. If it isn't "
+            "yours, change this entry by hand",
+}
+
+
+def is_tool_default_licence(block: object) -> bool:
+    """True when ``block`` is exactly one of capture's own defaults (nobody said so)."""
+    return block in (UNKNOWN_LICENCE_DEFAULT, INPUT_ASSET_LICENCE_DEFAULT)
+
 __all__ = [
     "api_forwarding_nodes",
     "recorded_node_owners",
@@ -351,7 +372,9 @@ def _normalize_workflow(raw: dict) -> dict[str, dict]:
     """
     if isinstance(raw.get("nodes"), list):
         raise ValueError("This workflow is the UI export format. Use the API format — "
-                         "in ComfyUI that's Export (API).")
+                         "in ComfyUI that's Export (API). Keep this file too: pass it as "
+                         "--workflow-ui, and after a restore it opens straight from "
+                         "ComfyUI's Workflows sidebar.")
     body = raw.get("prompt") if isinstance(raw.get("prompt"), dict) else raw
     nodes = {}
     for node_id, node in body.items():
@@ -1330,13 +1353,9 @@ def capture(workflow: dict, comfyui_dir: Path,
     files = []
     for r in recognized:
         if r["kind"] == "input_asset":
-            lic = {"shareable": True, "serving_scope": "private", "tag": "unknown",
-                   "note": "Input material for the workflow, treated as yours. If it isn't "
-                           "yours, change this entry by hand"}
+            lic = dict(INPUT_ASSET_LICENCE_DEFAULT)
         else:
-            lic = {"shareable": False, "serving_scope": "gated", "tag": "unknown",
-                   "note": "We couldn't confirm the license, so it defaults to gated "
-                           "(restricted). Check the license and add origin_url before you pack."}
+            lic = dict(UNKNOWN_LICENCE_DEFAULT)
             # The bytes ARE packed -- restricted only stops them being supplied to
             # somebody you hand the nest to (pack.py says the same thing in the same
             # words). Reading this as "not in the nest" sends people re-downloading

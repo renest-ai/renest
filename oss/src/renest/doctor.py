@@ -3671,6 +3671,12 @@ def run_from_args(args, emitter: EventEmitter) -> int:
             file=sys.stderr,
         )
         return int(ExitCode.USAGE)
+    # Refresh stale facts before the checks read them -- only for someone who agreed
+    # to automatic refreshes; otherwise one short line at the end (refresh_if_stale).
+    from .restore import quiet_config
+    from .update_rules import refresh_if_stale
+
+    rules_note = refresh_if_stale(config=quiet_config(args))
     manifest = None
     if args.nest_ref:
         try:
@@ -3743,7 +3749,6 @@ def run_from_args(args, emitter: EventEmitter) -> int:
     # Every verdict here was reached using the compatibility facts on this machine, so
     # say so when they have gone stale -- on stderr, so --json output stays one clean
     # document. A warning only: old facts are a reason to look, never a reason to block.
-    from .update_rules import warn_if_stale
-
-    warn_if_stale(sys.stderr)
+    if rules_note:
+        print(rules_note, file=sys.stderr)
     return result.exit_code

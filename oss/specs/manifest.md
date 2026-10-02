@@ -790,7 +790,7 @@ content-addressed**. An array; each entry:
 | `license` | ✔ | Licence annotation (§8) |
 | `origin_url` | | Original source; the only lead a recipient has when `serving_scope=gated` |
 | `sources` | | Ordered list of alternative sources (below) |
-| `kind` | | **Open string since 2.7** (lower case, digits, underscores, 64 chars max -- no list of permitted values). Only `clip` / `vae` / `tokenizer` / `input_asset` carry behaviour; see below |
+| `kind` | | **Open string since 2.7** (lower case, digits, underscores, 64 chars max -- no list of permitted values). Only `clip` / `vae` / `tokenizer` / `input_asset` / `workflow` carry behaviour; see below |
 | `serialization` | | **Added in 2.2**: whether loading this file executes code, enum `safetensors` / `pickle` / `other` |
 | `declared_base_model` | | **Added in 2.4**: what this file's own header says about the model it was trained on (below) |
 
@@ -835,7 +835,7 @@ the asset has no base model.**
 
 **`kind` (open string since 2.7) -- what kind of asset this is.**
 
-**Only four values mean anything to a program:**
+**Only five values mean anything to a program:**
 
 - `clip`, `vae`, `tokenizer` -- a **shared part**. One text encoder or VAE sits
   inside dozens of unrelated models, so a content-hash hit on such a file
@@ -843,6 +843,10 @@ the asset has no base model.**
   says nothing about this file. Licence adjudication therefore refuses to let a
   shared part's record speak for a base model (§8).
 - `input_asset` -- the user's own material: listed, never packed.
+- `workflow` -- the workflow as ComfyUI's editor saves it (JSON with a `nodes`
+  list), packed and restored like any file; after a restore the reference tool
+  also copies it into ComfyUI's Workflows sidebar folder. A reader that does not
+  know it loses nothing: it is still an ordinary file at its path.
 
 **Every other value is a label for people to read.** It is shown in listings and
 counted in summaries; nothing branches on it.
@@ -850,7 +854,7 @@ counted in summaries; nothing branches on it.
 **Consumer obligation: a value you do not recognise is an ordinary asset.**
 Never refuse a nest over it, never guess what it means, and display it exactly as
 written -- not blank, not "unknown". A reader that keys behaviour off any value
-other than the four above is reading a label as an instruction.
+other than the five above is reading a label as an instruction.
 
 **Why the closed list went away (2.7).** One enumerated list was chasing an open
 ecosystem, and every family it missed cost a whole version bump -- the eight-step

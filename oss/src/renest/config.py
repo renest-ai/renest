@@ -368,6 +368,10 @@ _ENV_TO_FIELD: dict[str, str] = {
     "RENEST_TELEMETRY": "telemetry_enabled",
     "RENEST_TELEMETRY_ENDPOINT": "telemetry_endpoint",
     "RENEST_TELEMETRY_INSTALL_ID": "telemetry_install_id",
+    # The answer to "keep the compatibility facts fresh?" given up front -- a pod
+    # image or a CI job sets it once. should_ask_refresh() already treated it as an
+    # answer (and stopped asking), but nothing read it, so a yes here did nothing.
+    "RENEST_RULES_REFRESH": "rules_refresh_enabled",
     "RENEST_SERVE_PORT": "serve_port",
     "RENEST_VERIFY_SSIM_THRESHOLD": "verify_ssim_threshold",
     "RENEST_PACK_DIR": "pack_dir",

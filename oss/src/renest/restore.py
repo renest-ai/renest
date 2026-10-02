@@ -60,12 +60,14 @@ from .doctor import (
     run_precheck,
 )
 from .fingerprint import collect as collect_fingerprint
+from .fingerprint import collect_rebuilt as collect_rebuilt_fingerprint
 from .download import (
     BlobSpec,
     ResolveReport,
     Source,
     SourcesExhausted,
     classify_source_failures,
+    local_path_of,
     resolve,
 )
 from .envlock import DISTRO_ONLY_PACKAGES
@@ -187,6 +189,151 @@ def recipe_landing_rel(manifest: dict, adapter: str) -> str | None:
     return _declared_relpath(((manifest.get("adapters") or {}).get(adapter) or {}).get(
         "workflow_path"
     ))
+
+
+def workflow_form(data: Any) -> str | None:
+    """``"ui"`` for a ComfyUI editor graph (``nodes`` + ``links``), ``"api"`` for the
+    ``/prompt`` form (node id -> ``{"class_type", "inputs"}``), ``None`` for neither.
+
+    The two are not interchangeable: the editor opens a graph; ``/prompt`` runs the
+    API form. S5 re-runs the recipe through ``/prompt``, so a recipe that rendered
+    in S5 is, by construction, the API form."""
+    if not isinstance(data, dict) or not data:
+        return None
+    if isinstance(data.get("nodes"), list):
+        return "ui"
+    if all(isinstance(v, dict) and "class_type" in v for v in data.values()):
+        return "api"
+    return None
+
+
+def comfyui_user_dir(app_dir: Path, argv: Sequence[str] = ()) -> Path:
+    """Where ComfyUI keeps per-user files when started with ``argv``.
+
+    ``--user-directory D`` wins, then ``--base-directory B`` (-> ``B/user``), else
+    ``<app>/user`` -- ComfyUI's own default. Relative values are taken from the app
+    folder, which is the working directory the start command runs in."""
+    args = [str(a) for a in argv]
+
+    def flag(name: str) -> str | None:
+        for i, tok in enumerate(args):
+            if tok == name and i + 1 < len(args):
+                return args[i + 1]
+            if tok.startswith(f"{name}="):
+                return tok.split("=", 1)[1]
+        return None
+
+    user = flag("--user-directory")
+    if user:
+        return app_dir / user
+    base = flag("--base-directory")
+    return (app_dir / base / "user") if base else app_dir / "user"
+
+
+def sidebar_workflow_name(manifest: dict) -> str:
+    """The name the recipe gets in ComfyUI's Workflows sidebar: the nest's own
+    workflow name, else the recipe's file name, else the nest name."""
+    cui = (manifest.get("adapters") or {}).get("comfyui") or {}
+    for cand in (cui.get("workflow_name"),
+                 PurePosixPath(str(cui.get("workflow_path") or "")).stem,
+                 manifest.get("name")):
+        safe = sidebar_safe_name(cand)
+        if safe:
+            return safe
+    return "renest-workflow"
+
+
+def sidebar_safe_name(cand: object) -> str:
+    """``cand`` cut down to what may name a file in the Workflows sidebar; ``""``
+    when nothing usable is left. Pack writes ``workflow_name`` through this same
+    rule, so the name stored is the name the sidebar shows."""
+    return re.sub(r"[^A-Za-z0-9._ -]+", "-", str(cand or "")).strip(" .-")[:80]
+
+
+def first_saved_image(outputs: dict) -> dict | None:
+    """``{"filename", "subfolder"}`` of the first image the app saved to its output
+    folder in a ``/history`` entry's outputs, or ``None``. Previews (``type`` temp)
+    are skipped: they are gone once the app stops."""
+    for node in (outputs or {}).values():
+        for img in (node or {}).get("images") or []:
+            if isinstance(img, dict) and img.get("type") == "output" and img.get("filename"):
+                return {"filename": str(img["filename"]),
+                        "subfolder": str(img.get("subfolder") or "")}
+    return None
+
+
+def recipe_file_form(recipe: Path) -> str | None:
+    """:func:`workflow_form` of a recipe file; ``None`` when unreadable."""
+    try:
+        return workflow_form(json.loads(recipe.read_bytes()))
+    except (OSError, ValueError):
+        return None
+
+
+def editor_workflow_file(manifest: dict, target: Path) -> Path | None:
+    """Where the nest's editor-form workflow landed: the files[] entry of kind
+    ``workflow`` (pack writes one when it had the canvas -- the panel, ``--auto``,
+    ``--workflow-ui``). ``None`` when the nest carries none or it did not land."""
+    for f in manifest.get("files") or []:
+        rel = f.get("path") if isinstance(f, dict) and f.get("kind") == "workflow" else None
+        if isinstance(rel, str) and rel:
+            p = resolve_file_root(str(f.get("root") or "env"), target) / rel
+            if p.is_file():
+                return p
+    return None
+
+
+def place_sidebar_workflow(
+    app_dir: Path, recipe: Path, name: str, argv: Sequence[str] = (),
+) -> Path | None:
+    """Put an editor-form (UI) recipe where ComfyUI's Workflows sidebar lists it.
+
+    Measured 2026-10-02 (founder, official starter nest): ComfyUI opened on an empty
+    canvas with "no workflows found" -- the recipe was restored next to the app, and
+    the sidebar lists ``<user>/default/workflows/`` only.
+
+    **Only the editor form goes there.** The sidebar opens a file through
+    ``loadGraphData``, which has no branch for the API form; ComfyUI converts the API
+    form only when a file or image is dropped onto the canvas (``loadApiJson``).
+    Read in comfyui-frontend-package 1.54.8, ``workflowService.openWorkflow`` and
+    ``scripts/metadata/json.ts``. An API-form file in the sidebar would open as an
+    empty canvas -- the very thing being fixed -- so it is not put there.
+
+    Never overwrites: the same bytes already there are reused; a different file with
+    that name is left alone and the next free name is taken. ``None`` when nothing
+    was placed (not the editor form, unreadable, or the folder is not writable).
+    """
+    # The sidebar folder is a fact about a ComfyUI tree, so there has to be one: with
+    # no ComfyUI main.py in the app folder there is no sidebar to fill, and a folder
+    # made up next to something else would be exactly the invented path the format
+    # forbids (tests/consistency/test_both_legs_agree_on_recipe_landing.py).
+    if not (app_dir / "main.py").is_file():
+        return None
+    try:
+        raw = recipe.read_bytes()
+        if workflow_form(json.loads(raw)) != "ui":
+            return None
+    except (OSError, ValueError):
+        return None
+    wf_dir = comfyui_user_dir(app_dir, argv) / "default" / "workflows"
+    for i in range(1, 100):
+        cand = wf_dir / (f"{name}.json" if i == 1 else f"{name}-{i}.json")
+        if cand.is_file():
+            try:
+                if cand.read_bytes() == raw:
+                    return cand
+            except OSError:
+                pass
+            continue
+        if cand.exists():
+            continue
+        try:
+            wf_dir.mkdir(parents=True, exist_ok=True)
+            cand.write_bytes(raw)
+        except OSError:
+            return None
+        return cand
+    return None
 
 
 #: A string that looks like a full path from some machine: a POSIX one with at least
@@ -358,6 +505,130 @@ def toolchain_landing_line(
     )
 
 
+def human_duration(seconds: float | int | None) -> str:
+    """``178.986`` -> ``"2 min 59 s"``: how long, the way a person says it.
+
+    The raw float stays in restore-metrics.json for anything that computes with it.
+    """
+    try:
+        total = int(round(float(seconds or 0)))
+    except (TypeError, ValueError):
+        return f"{seconds}s"
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h} h {m} min"
+    if m:
+        return f"{m} min {s} s" if s else f"{m} min"
+    return f"{s} s"
+
+
+def torch_merely_unmeasured(rows: Sequence[dict]) -> bool:
+    """True when the fingerprint's only warning is "torch could not be read here".
+
+    That is what every restore on our base image sees: renest lives in an
+    environment of its own with no torch in it. The verdict (and its level, and the
+    exit code) is left exactly as doctor reaches it; this only decides whether a
+    person is shown it before the install, which then reads the real torch anyway.
+    """
+    flagged = [r for r in rows if r.get("verdict") not in ("exact", "compatible")]
+    return bool(flagged) and all(
+        r.get("field") == "torch.cuda_version" and not r.get("local") for r in flagged
+    )
+
+
+_UNREAD_NAMES = {
+    "python.version": "Python",
+    "torch.version": "torch",
+    "torch.cuda_version": "torch's CUDA version",
+    "os": "the operating system",
+}
+
+
+def fingerprint_unread_and_differing(verdict: dict | None) -> tuple[list[str], list[str]]:
+    """Split the fingerprint rows that are not a match into (could not be read, differ).
+
+    A row whose value on this machine is null is a question nobody could answer, not
+    a difference: until 2026-10-03 both went into one "this machine differs" line,
+    and a restore onto the very machine that packed the nest said it differed
+    (Spark, plugin walk). Names are for people: ``critical_packages.numpy`` is
+    ``numpy``. The verdict itself -- level, rows, exit code -- is left as it is.
+    """
+    unread: list[str] = []
+    differ: list[str] = []
+    for r in (verdict or {}).get("rows") or []:
+        if r.get("verdict") in ("exact", "compatible"):
+            continue
+        field_name = str(r.get("field") or "")
+        name = _UNREAD_NAMES.get(field_name) or field_name.removeprefix("critical_packages.")
+        bucket = unread if r.get("local") is None else differ
+        if name not in bucket:
+            bucket.append(name)
+    return unread, differ
+
+
+def driver_drift_note(check: Any) -> str | None:
+    """A quiet line for "driver above the floor, just not the packing machine's one".
+
+    The check stays a warning (doctor's verdict, exit code, evidence unchanged). What
+    changes is the terminal: a different driver that clears the floor is the normal
+    state of a rented machine, and saying the nest "stays unverified until you run
+    the workflow" is wrong in the very run that goes on to render it (S5).
+    ``None`` for any other check, or when the reading does not carry both versions.
+    """
+    reading = getattr(check, "reading", None) or {}
+    got, packed = reading.get("driver_version"), reading.get("expected_driver")
+    if getattr(check, "name", None) != "driver" or not got or not packed:
+        return None
+    return (f"Note: GPU driver {got} here, {packed} on the machine this nest was packed "
+            f"on — both clear the floor, which is normal on rented machines.")
+
+
+#: Folders that belong to the operating system, never to a rebuild. Measured
+#: 2026-10-02, the founder's first restore on a fresh pod: ``--dir ./run`` typed from
+#: ``/`` became ``/run`` -- a tmpfs on most Linux boxes, so the whole nest went into
+#: memory and would vanish on the next reboot, with every gate green. The value says
+#: why, in words.
+_IN_MEMORY = "on many machines it lives in memory and is cleared on reboot"
+_OS_OWNED = "it belongs to the operating system, and your files would be mixed in with its own"
+_SYSTEM_DIRS: dict[str, str] = {
+    "/run": _IN_MEMORY, "/var/run": _IN_MEMORY, "/var/lock": _IN_MEMORY,
+    "/dev": _IN_MEMORY, "/proc": _IN_MEMORY, "/sys": _IN_MEMORY,
+    "/boot": _OS_OWNED, "/etc": _OS_OWNED, "/usr": _OS_OWNED,
+    "/bin": _OS_OWNED, "/sbin": _OS_OWNED, "/lib": _OS_OWNED,
+    "/lib32": _OS_OWNED, "/lib64": _OS_OWNED, "/libx32": _OS_OWNED,
+    # macOS spells some of the above through /private; resolving symlinks lands there.
+    "/private/etc": _OS_OWNED, "/private/var/run": _IN_MEMORY,
+}
+
+
+def system_dir_refusal(path: str | Path, flag: str = "--dir") -> str | None:
+    """Why ``path`` must not be used as a folder to write into, or ``None``.
+
+    Checked both as typed (made absolute) and with symlinks resolved, so neither
+    ``./run`` typed from ``/`` nor a link pointing into ``/etc`` slips through.
+    ``/tmp`` is deliberately not here: it is a legitimate scratch place.
+    """
+    raw = Path(os.path.abspath(os.path.expanduser(str(path))))
+    try:
+        real = Path(os.path.realpath(raw))
+    except OSError:
+        real = raw
+    name = raw.name or "nest"
+    advice = f"Pick a folder of your own, for example /workspace/{name} or ~/{name}."
+    for p in (raw, real):
+        if p == Path(p.anchor):
+            return (f"{flag} {path} is the root of the filesystem itself, so everything "
+                    f"would land loose among the system's own folders. {advice}")
+        for d, why in _SYSTEM_DIRS.items():
+            sd = Path(d)
+            if p == sd:
+                return f"{d} is a system directory ({why}). {advice}"
+            if sd in p.parents:
+                return f"{p} is inside {d}, a system directory ({why}). {advice}"
+    return None
+
+
 #: The closing line's two cache roots, in the order the escape hatch names them.
 _CACHE_LANDING_WORDS = (("hf_hub", "model-cache file(s)"), ("hf_home", "settings file(s)"))
 
@@ -482,8 +753,18 @@ def whats_next_lines(
     *,
     oneshot: dict | None = None,
     recipe_path: Path | None = None,
+    renest_start: bool = False,
+    sidebar: Path | None = None,
+    test_image: dict | None = None,
+    reported_to_drive: bool = False,
 ) -> list[str]:
     """What a person who just got a working environment does with it (B12).
+
+    ``reported_to_drive``: this run's progress went to the person's drive, so the
+    console's Restore page reached its done screen with the same next steps.
+
+    ``renest_start``: the facts ``renest start`` reads were written, so a service
+    nest's first line can be that one command instead of a hand-built one.
 
     Measured 2026-09-13, first outside user: five gates green, and his first two
     questions were "where is my image" and "how do I reach my ComfyUI". The
@@ -533,54 +814,90 @@ def whats_next_lines(
             )
     else:
         # A service nest: the app was started for the check and then stopped;
-        # the person's work starts by starting it themselves.
-        if cmd:
-            lines.append(f"  · Start it yourself: cd {cwd} && {cmd}{env_note}.")
-        # The command above is the one that worked — and it worked from this box.
-        # When it binds to loopback, saying "expose the port" and stopping there
-        # sends the person to a panel, an open port, and nothing behind it
-        # (measured 2026-09-13: the first outside user needed a human to tell him
-        # the one word that command was missing). Say which word, and where.
-        _lb = loopback_bind(ep["argv"]) if (cmd and ep and ep.get("argv")) else None
-        if _lb:
-            lines.append(
-                f"  · That command listens on {_lb}, which answers this machine only — "
-                f"right for the check that just ran, not for your browser. To reach it "
-                f"from outside, change that one value to 0.0.0.0 (or run "
-                f"`renest start --dir {target} --listen 0.0.0.0`, which does it for you)."
-            )
-        # The port the command above listens on -- never the spare one the check
-        # borrowed (see start_listen_port); unknown means no number is said.
-        port = (start_listen_port(ep["argv"], manifest.get("adapters"))
-                if (cmd and ep and ep.get("argv")) else None)
-        _where = f"port {port}" if port else "the port it listens on (this nest does not record which)"
-        if cmd and _lb:
-            lines.append(
-                f"  · Started that way it listens on {_where}. On a rented GPU "
-                f"box, reaching it from your own browser also means exposing that port in "
-                f"your provider's panel — the check never did that for you."
-            )
-        elif cmd:
-            # The command names no address at all, so what it binds to is the
-            # application's own default and we do not know it. Say the condition
-            # without pretending to know which half is already true.
-            lines.append(
-                f"  · Started that way it listens on {_where}. On a rented GPU "
-                f"box, reaching it from your own browser means it has to be listening on "
-                f"0.0.0.0 and that port exposed in your provider's panel — the check "
-                f"never did either for you."
-            )
+        # the person's work starts by starting it themselves -- one command first,
+        # then the same thing by hand (2026-10-02: the founder's first restore
+        # printed seven lines here, one of them sending him to expose the spare
+        # port the check had borrowed).
+        if cmd and ep:
+            argv = [str(a) for a in ep["argv"]]
+            # The recorded command is the one that worked -- from this box. When it
+            # binds to loopback, exposing the port reaches nothing (measured
+            # 2026-09-13: the first outside user needed a human to tell him the one
+            # word that command was missing), so both the one command and the
+            # by-hand one are given with that one value changed to 0.0.0.0.
+            _lb = loopback_bind(argv)
+            _bound = host_bind(argv)
+            open_argv = rebind_argv(argv, "0.0.0.0") if _lb else argv
+            by_hand = (f"cd {cwd} && "
+                       f"{shlex.join([str(exe), *open_argv[1:]])}{env_note}")
+            # The port the command listens on -- never the spare one the check
+            # borrowed (see start_listen_port); unknown means no number is said.
+            port = start_listen_port(argv, manifest.get("adapters"))
+            where = f"port {port}" if port else "the port its command names (this nest does not record which)"
+            expose = f"expose {port} (HTTP)" if port else "expose that port (HTTP)"
+            if _bound is None:
+                # The command names no address at all, so what it binds to is the
+                # application's own default and we do not know it -- and nothing
+                # can be changed without inventing a flag. Say the condition.
+                reach = (f"; on a rented box your browser reaches it only if it listens "
+                         f"on 0.0.0.0 and you {expose} in your provider's panel.")
+            else:
+                reach = f"; {expose} in your provider's panel to open it in your browser."
+            lb_note = (f" (The nest records {_lb}, which answers this machine only — "
+                       f"right for the check, not for your browser.)") if _lb else ""
+            if renest_start:
+                one = f"renest start --dir {target}" + (" --listen 0.0.0.0" if _lb else "")
+                lines.append(f"  · Start it: {one} — serves it on {where}{reach}")
+                lines.append(f"  · The same by hand: {by_hand}.{lb_note}")
+            else:
+                lines.append(f"  · Start it: {by_hand} — serves it on {where}{reach}{lb_note}")
         if (manifest.get("adapters") or {}).get("comfyui") is not None:
             lines.append(f"  · Images render into {cwd / 'output'} — that is where yours is.")
-        if recipe_path is not None and recipe_path.is_file():
+        if sidebar is not None:
             lines.append(
-                f"  · The workflow that produced the test render: {recipe_path}. "
-                f"Drop it into the app to start from what worked."
+                f"  · In ComfyUI, open Workflows (left sidebar) → {sidebar.stem}: the "
+                f"workflow this nest was packed from."
             )
+        elif recipe_path is not None and recipe_path.is_file():
+            # "Drop it into the app" was unreal on a remote pod (2026-10-02): the file
+            # is on the pod, the browser is on the person's computer.
+            if recipe_file_form(recipe_path) == "api":
+                img = ""
+                # ComfyUI writes the prompt it ran into every image it saves (unless
+                # started with --disable-metadata), and the canvas loads a dropped
+                # image's API-form prompt the same way it loads the file.
+                _no_meta = "--disable-metadata" in [str(a) for a in ((ep or {}).get("argv") or [])]
+                if test_image and not _no_meta and (
+                    manifest.get("adapters") or {}
+                ).get("comfyui") is not None:
+                    from urllib.parse import urlencode
+
+                    q = urlencode({"filename": test_image["filename"], "type": "output",
+                                   **({"subfolder": test_image["subfolder"]}
+                                      if test_image.get("subfolder") else {})})
+                    img = (f" Quickest way in: open <your ComfyUI address>/view?{q} in your "
+                           f"browser, save that test image, and drop it onto the canvas.")
+                lines.append(
+                    f"  · The workflow that produced the test render is {recipe_path}. This "
+                    f"nest recorded it in API form (what ComfyUI runs, not the editor's "
+                    f"layout), which ComfyUI's Workflows list cannot open; dropped onto the "
+                    f"canvas from your computer, it loads with the nodes laid out by ComfyUI."
+                    + img
+                )
+            else:
+                lines.append(f"  · The workflow that produced the test render: {recipe_path}.")
     lines.append(
         "  · Moving to another machine? The same restore command works there too — "
         "it reuses what is already fetched and carries on."
     )
+    if reported_to_drive:
+        # 2026-10-02: the restore wizard sends people between four places; the one
+        # who only watches this terminal should know the console page has these
+        # steps too. Only when the progress reached the drive -- with --no-report
+        # or a manifest restore that page never gets to its done screen.
+        lines.append(
+            "  · The same next steps are on this nest's Restore page in the Renest web console."
+        )
     return lines
 
 
@@ -589,8 +906,14 @@ def write_start_facts(
     target: Path,
     oneshot: dict | None,
     listen_port: int | None,
+    sidebar_workflow: str | None = None,
+    sidebar_source: Path | None = None,
 ) -> Path | None:
     """Leave behind what ``renest start`` needs to re-run the entrypoint.
+
+    ``sidebar_workflow``: the name the recipe was given in ComfyUI's Workflows
+    sidebar, so ``renest start`` can put it back if it went missing;
+    ``sidebar_source``: the restored file it was copied from.
 
     Measured 2026-09-13, first outside user: the closing lines name the start
     command, and the follow-up question was "where do I even paste that?" The
@@ -611,6 +934,10 @@ def write_start_facts(
         # so a start.json an older restore left behind is never read as this.
         "listen_port": listen_port,
     }
+    if sidebar_workflow:
+        facts["sidebar_workflow"] = sidebar_workflow
+        if sidebar_source is not None:
+            facts["sidebar_workflow_source"] = os.path.relpath(sidebar_source, target)
     p = target / START_REL
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -959,6 +1286,41 @@ def _is_local_url(url: str) -> bool:
         except (IndexError, ValueError):
             return False
     return False
+
+
+def blob_base_url(blob_base: str) -> str:
+    """``--blob-base`` as typed -> the URL the files are built from.
+
+    A plain folder (``/data/renest-nests/blobs/sha256``, ``./blobs/sha256``) means
+    that folder on this machine, so it becomes a ``file://`` address; anything that
+    already names a scheme is left as it is.
+    """
+    b = (blob_base or "").strip()
+    if not b or "://" in b:
+        return b
+    return Path(b).expanduser().resolve().as_uri()
+
+
+def local_nest_store(source: Any) -> Path | None:
+    """The ``blobs/sha256`` folder beside a manifest read off this disk, if there is one.
+
+    ``renest pack`` (and the panel, through ``renest serve``) writes
+    ``<out>/nests/<id>/manifest.json`` and puts every byte under
+    ``<out>/blobs/sha256/<xx>/<hash>`` beside it. The website hands people
+    ``renest restore --manifest <out>/nests/<id>/manifest.json``; such a manifest
+    lists no download addresses, and until 2026-10-03 that command stopped with
+    "Nowhere to download" while the bytes sat two folders up (Spark, plugin walk).
+    """
+    if not isinstance(source, (str, os.PathLike)) or "://" in str(source):
+        return None
+    try:
+        p = Path(source).expanduser().resolve()
+        if not p.is_file() or p.parent.parent.name != "nests":
+            return None
+        store = p.parent.parent.parent / "blobs" / "sha256"
+        return store if store.is_dir() else None
+    except OSError:
+        return None
 
 
 @dataclass
@@ -1486,7 +1848,7 @@ class ComfyUILauncher:
                                    "why": "the nest does not record the recipe ever working"}
             return (
                 f"The app answered and loaded {len(classes)} node types. "
-                f"**Skipped re-running the recipe** — {handle.unverified_note} Re-running it "
+                f"Skipped re-running the recipe — {handle.unverified_note} Re-running it "
                 f"would report a false failure, not a broken environment: everything else was "
                 f"restored byte-for-byte, exactly as it was."
             )
@@ -1502,14 +1864,14 @@ class ComfyUILauncher:
         if unnamed:
             why = "this nest never says which file is the recipe"
             said = (
-                f"**Nothing was rendered** — this nest never says which file is the "
+                f"Nothing was rendered — this nest never says which file is the "
                 f"recipe, so we will not guess. {_name_a_few(unnamed)} "
                 f"looks like a workflow; open it in the app yourself to re-run it."
             )
         else:
             why = "this nest carries no recipe"
             said = (
-                "**Nothing was rendered** — this nest carries no recipe to re-run, "
+                "Nothing was rendered — this nest carries no recipe to re-run, "
                 "so this is a liveness check, not proof that it still produces images."
             )
         self.recipe_outcome = {"reran": False, "images": None, "why": why}
@@ -1563,7 +1925,9 @@ class ComfyUILauncher:
                     # `outputs`/`by_kind` are the full, product-type-agnostic count.
                     self.recipe_outcome = {"reran": True, "outputs": total,
                                            "by_kind": dict(by_kind),
-                                           "images": by_kind.get("images", 0), "why": None}
+                                           "images": by_kind.get("images", 0), "why": None,
+                                           "first_image": first_saved_image(
+                                               entry.get("outputs") or {})}
                     return (f"Re-ran the packed recipe and it produced "
                             f"{describe_products(by_kind)} "
                             f"in {time.monotonic() - started:.0f}s")
@@ -3065,6 +3429,21 @@ def restore(
             print(f"[restore] {sanitise_terminal(message)}", file=sys.stderr, flush=True)
         em.log(message, stage=stage, level=level, **extra)
 
+    def tell(human: str | None, logged: str, *, stage: str | None = None,
+             level: str = "info") -> None:
+        """Like narrate, but the terminal gets ``human`` (or nothing, for None) while
+        the event stream and the evidence keep ``logged`` verbatim, level and all.
+
+        For a check whose verdict and level stay exactly as they are but whose words
+        alarm a person for no reason on a normal machine (2026-10-02, the founder's
+        first restore of the official starter nest: three ⚠ lines, none of them a
+        problem). ``--verbose`` prints ``logged`` as is."""
+        shown = logged if opts.verbose_explicit else human
+        if opts.verbose and shown:
+            em.clear_live()
+            print(f"[restore] {sanitise_terminal(shown)}", file=sys.stderr, flush=True)
+        em.log(logged, stage=stage, level=level)
+
     def closing(message: str, *, stage: str | None = None, level: str = "info", **extra: Any) -> None:
         """End-of-run words: logged to the event stream here, but **not printed
         to the terminal** — the CLI prints them after the json report, so they
@@ -3083,6 +3462,7 @@ def restore(
     journal: Journal | None = None
     handed_off_from: str | None = None  # sender the server attests; None = you packed it
     handed_off_relayed: bool | None = None  # the sender was themselves a relay (anti-laundering)
+    reported_to_drive = False  # progress goes to the drive, so the console page follows this run
     # Assets that do not travel with the nest (licence-restricted), sha256 ->
     # asset. Their absence from the grant's blobmap is not an accident: the
     # server only signs links for bytes you genuinely possess, and these you must
@@ -3268,9 +3648,10 @@ def restore(
 
     # -- prelude (no stage): load manifest / grant, make plan, build journal --
     def load_inputs() -> None:
-        nonlocal mani, plan, journal, handed_off_from, handed_off_relayed
+        nonlocal mani, plan, journal, handed_off_from, handed_off_relayed, reported_to_drive
         obj = _load_json_input(source, client)
         blobmap: dict[str, list[str]] = {}
+        _blob_base = blob_base_url(opts.blob_base)
         if "grant_version" in obj:
             if obj.get("grant_version") == GRANT_ENVELOPE_VERSION:
                 # Restore-code envelope: redeem first (the code is the
@@ -3290,6 +3671,7 @@ def restore(
                 )
             if rs is not None:
                 _extra_sinks.append(rs)
+                reported_to_drive = True
                 # Say exactly what is sent and what is not — "reporting
                 # progress" on its own says nothing. Print the full list right
                 # here (uplink.disclosure); do not turn it into "see our
@@ -3341,20 +3723,34 @@ def restore(
                     level="warning",
                 )
             if handed_off_from:
+                # One neutral line. It used to read as an alarm ("runs code from their
+                # setup on this machine ... held to a stricter standard") and, on the
+                # official starter nest, as a warning about us (2026-10-02, founder).
+                # The stricter handling itself is unchanged: setup commands and
+                # unrecognised sources still stop and ask (sender_named, below). The
+                # grant carries no server-attested "official" bit, and a display name
+                # is not one -- anyone can call themselves Renest -- so the line is
+                # calmed for every sender rather than silenced for one name.
                 narrate(
-                    f"{handed_off_from} handed you this nest. Restoring it runs code from "
-                    f"their setup on this machine, so anything unusual will be held to a "
-                    f"stricter standard from here on"
+                    f"Handed to you by {handed_off_from}. If it asks for anything unusual "
+                    f"(setup commands, unrecognised download sources), the restore stops "
+                    f"and asks you to confirm"
                     + (
-                        f". Note that {handed_off_from} was passing it on too — they did not pack it"
+                        f". {handed_off_from} was passing it on too — they did not pack it"
                         if handed_off_relayed
                         else ""
-                    ),
+                    )
+                    + ".",
                     stage="S1",
-                    level="warning",
                 )
         else:
             mani = obj
+            if not _blob_base:
+                _store = local_nest_store(source)
+                if _store is not None:
+                    _blob_base = _store.as_uri()
+                    narrate(f"Reading this nest's files from the folder it was packed into: "
+                            f"{_store}")
         _validate_manifest(mani, narrate=narrate)
         # The assets that do not travel with the nest: say it all **before the
         # run starts**, instead of discovering missing files at the very end.
@@ -3368,7 +3764,13 @@ def restore(
         # served straight from your drive as usual.
         # Only assets the manifest marks restricted **and** the drive will not
         # serve go down the "fetch from source with your own credentials" path.
-        _gated = [a for a in _gated if not (a.sha256 and a.sha256 in blobmap)]
+        # Bytes sitting in a folder on this disk that the restore was pointed at are
+        # the same case: you packed them, nobody has to fetch them from the source.
+        _local_base = local_path_of(_blob_base) if _blob_base else None
+        _gated = [a for a in _gated if not (a.sha256 and (
+            a.sha256 in blobmap
+            or (_local_base is not None
+                and (_local_base / a.sha256[:2] / a.sha256).is_file())))]
         gated_origin.update({a.sha256: a for a in _gated if a.sha256})
         if _gated:
             _tok = find_token()
@@ -3399,7 +3801,7 @@ def restore(
             ]
 
         report.nest_id = mani.get("id", "")
-        plan = RestorePlan.from_manifest(mani, target, opts.blob_base, blobmap)
+        plan = RestorePlan.from_manifest(mani, target, _blob_base, blobmap)
         journal = Journal(target, plan.nest_id)
         if opts.resume:
             journal.load_if_matching()
@@ -3507,7 +3909,12 @@ def restore(
                 )
                 report.fingerprint_verdict = _fpv.to_dict()
                 if _fpv.level == LEVEL_WARNING and _fpv.summary:
-                    narrate(f"\u26a0 {_fpv.summary}", stage="S0", level="warning")
+                    # When the only thing "wrong" is that torch could not be read from
+                    # renest's own environment -- the normal case on our base image --
+                    # the terminal says nothing: the rebuilt torch is read after S3 and
+                    # that line answers the question. Evidence and --verbose keep it.
+                    tell(None if torch_merely_unmeasured(_fpv.rows) else f"\u26a0 {_fpv.summary}",
+                         f"\u26a0 {_fpv.summary}", stage="S0", level="warning")
             except Exception as exc:  # noqa: BLE001 - never let a check failure look like a pass
                 narrate(
                     "\u26a0 Could not compare this machine against the one this nest was "
@@ -3525,7 +3932,8 @@ def restore(
         # libraries, and the two stopped for another reason said not one word of it.
         for _c in pr.checks:
             if _c.level == LEVEL_WARN and _c.reason:
-                narrate(f"⚠ {_c.reason}", stage="S0", level="warning")
+                tell(driver_drift_note(_c) or f"⚠ {_c.reason}", f"⚠ {_c.reason}",
+                     stage="S0", level="warning")
         if not pr.proceed:
             rejects = [c for c in pr.checks if c.level == "reject"]
             klass = (
@@ -4496,6 +4904,40 @@ def restore(
                if report.wheel_fallbacks else "")
         )
 
+    def reread_fingerprint_from_rebuild() -> None:
+        """Compare again, this time with the rebuilt environment's own interpreter.
+
+        S0 can only read the environment renest runs in; on a ``uv tool install``
+        that has no torch and none of the nest's packages, so every one of them read
+        as null and the closing words said this machine "differs" -- on the very
+        machine that packed it (2026-10-03, Spark). Only when S0 did compare (not
+        under --skip-precheck), and only when the rebuilt interpreter answers;
+        otherwise the S0 verdict stands as it was.
+        """
+        required = (mani or {}).get("fingerprint")
+        py = target / ".venv" / "bin" / "python"
+        if not required or report.fingerprint_verdict is None or not py.is_file():
+            return
+        try:
+            local = collect_rebuilt_fingerprint(py)
+            if local is None:
+                return
+            verdict = compare_fingerprint(
+                local,
+                required,
+                (mani.get("base_image") or {}).get("ref") or None,
+                python_obtainable=python_is_obtainable(
+                    (required.get("python") or {}).get("version")
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - the S0 verdict stands; say why
+            narrate(f"Could not read the rebuilt environment's versions ({exc}); the "
+                    f"comparison made before the download stands.", stage="S3")
+            return
+        report.fingerprint_verdict = verdict.to_dict() | {"read_from": str(py)}
+        narrate(f"Compared again with the rebuilt environment ({py}): {verdict.summary}",
+                stage="S3")
+
     # -- S4 launch --
     # Dispatch by entrypoint.kind: oneshot (runs to completion, verdict = exit
     # code) goes to OneshotRunner, service (long-running, verdict = probe) goes
@@ -4833,6 +5275,7 @@ def restore(
         run_stage("S1", s1_download, start_extra={"bytes_total": plan.total_bytes})
         run_stage("S2", s2_place)
         run_stage("S3", s3_deps)
+        reread_fingerprint_from_rebuild()
         run_stage("S4", s4_launch)
         run_stage("S5", s5_smoke)
     except NestFailure as e:
@@ -4891,9 +5334,13 @@ def restore(
     # treats it. The missing-library case above stays unconditional on purpose: it was
     # put there on 2026-08-19 off a real machine, and quietly weakening it under
     # --force is not part of this fix.
-    _warned = ((report.precheck or {}).get("overall") == LEVEL_WARN) or (
-        (report.fingerprint_verdict or {}).get("level") == LEVEL_WARNING
-    )
+    # A fingerprint row that could not be read is not a difference (2026-10-03):
+    # only rows with a value on this machine that does not match count here; the
+    # unread ones are named in a line of their own below.
+    _fp = report.fingerprint_verdict or {}
+    _unread, _differ = fingerprint_unread_and_differing(_fp)
+    _fp_differs = _fp.get("level") == LEVEL_WARNING and (bool(_differ) or not _unread)
+    _warned = ((report.precheck or {}).get("overall") == LEVEL_WARN) or _fp_differs
     if failure is None and (short_libs or (_warned and not opts.force)):
         # The rebuild finished and every file is fine -- this is a **success**, so the
         # exit code stays 0 (set above). The machine just is not identical to the one this
@@ -4907,14 +5354,22 @@ def restore(
         # different questions.
         report.environment_warning = "missing_libs" if short_libs else "other"
         closing(
-            "Rebuilt successfully, but this machine isn't identical to the one this nest "
-            "was packed on"
-            + (" (it's missing a system library the packed run used)" if short_libs
-               else " (some versions differ — normal on a rented machine)")
-            + " — the files are all correct; a render here may differ slightly from the "
-            "original. This is a success, not a failure.",
+            "Restored. "
+            + ("This machine lacks a system library the packed run used"
+               if short_libs else
+               "This machine differs a little from the one it was packed on "
+               "(normal for rented machines)")
+            + " — every file checked; a render may differ slightly.",
             stage="S5",
             level="warning",
+        )
+    elif failure is None and _unread and _fp.get("level") == LEVEL_WARNING:
+        _what = ", ".join(_unread)
+        closing(
+            f"Restored — every file checked. Could not read {_what} here, so "
+            f"{'that was' if len(_unread) == 1 else 'those were'} not compared with the "
+            f"machine it was packed on.",
+            stage="S5",
         )
 
     with contextlib.suppress(OSError):
@@ -4930,10 +5385,46 @@ def restore(
     if report.ok:
         closing(
             f"✅ Done: {report.blobs_downloaded} files downloaded, {report.blobs_cached} already here. "
-            f"Took {report.metrics['total_seconds']}s. Logs and evidence: {evidence}"
+            f"Took {human_duration(report.metrics['total_seconds'])}. "
+            f"Logs and evidence: {evidence}"
         )
         closing(cache_landing_line(mani, target))
-        closing(toolchain_landing_line(target))
+        # Where the toolchain went is kept in the event log (the evidence), not on
+        # screen: on 2026-10-02 it was the longest line of a successful restore and
+        # answered a question nobody had asked yet.
+        em.log(toolchain_landing_line(target), stage="S5")
+        # `renest start` runs the same command for the person who would otherwise
+        # copy it out of these lines and paste it back (2026-09-13 ruling). The
+        # facts it needs land next to the state file, written first so the lines
+        # below can lead with that one command.
+        _ep_argv = (plan.entrypoint or {}).get("argv") if isinstance(plan.entrypoint, dict) else None
+        # The recipe into ComfyUI's Workflows sidebar, so the app does not open on an
+        # empty canvas with "no workflows found" (2026-10-02). Editor form only -- see
+        # place_sidebar_workflow for why the API form is not put there.
+        # The nest's own editor-form file (files[] kind "workflow") comes first: the
+        # recipe the test render runs is usually the API form, which the sidebar
+        # cannot open.
+        _sidebar: Path | None = None
+        _sidebar_name: str | None = None
+        _sidebar_src: Path | None = None
+        if report.oneshot is None:
+            _sidebar_src = editor_workflow_file(mani, target)
+            if (_sidebar_src is None
+                    and (mani.get("adapters") or {}).get("comfyui") is not None
+                    and (target / RECIPE_REL).is_file()):
+                _sidebar_src = target / RECIPE_REL
+        if _sidebar_src is not None:
+            _sidebar_name = sidebar_workflow_name(mani)
+            _sidebar = place_sidebar_workflow(
+                plan.app_dir, _sidebar_src, _sidebar_name,
+                _ep_argv if isinstance(_ep_argv, list) else ())
+        _start_written = write_start_facts(
+            plan, target, report.oneshot,
+            start_listen_port(_ep_argv, mani.get("adapters"))
+            if (report.oneshot is None and isinstance(_ep_argv, list)) else None,
+            sidebar_workflow=_sidebar_name if _sidebar is not None else None,
+            sidebar_source=_sidebar_src if _sidebar is not None else None,
+        ) is not None
         # The entry points into the user's own work (B12): start command, where
         # output lands, how to reach the app from their browser, how to move
         # machines. Facts from the manifest only; said here because "Done" is
@@ -4945,17 +5436,14 @@ def restore(
             plan.entrypoint,
             oneshot=report.oneshot,
             recipe_path=target / RECIPE_REL,
+            renest_start=_start_written and report.oneshot is None,
+            sidebar=_sidebar,
+            test_image=(report.recipe or {}).get("first_image")
+            if isinstance(report.recipe, dict) else None,
+            reported_to_drive=reported_to_drive,
         ):
             closing(_line)
-        # `renest start` runs the same command for the person who would otherwise
-        # copy it out of these lines and paste it back (2026-09-13 ruling). The
-        # facts it needs land next to the state file; the hint names the command.
-        _ep_argv = (plan.entrypoint or {}).get("argv") if isinstance(plan.entrypoint, dict) else None
-        if write_start_facts(
-            plan, target, report.oneshot,
-            start_listen_port(_ep_argv, mani.get("adapters"))
-            if (report.oneshot is None and isinstance(_ep_argv, list)) else None,
-        ) is not None:
+        if _start_written and report.oneshot is not None:
             closing(f"  · Or let the tool do it for you: renest start --dir {target}")
         if report.redactions:
             closing(
@@ -5070,7 +5558,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
              "goes quiet and never affects the restore",
     )
     parser.add_argument("--dir", required=True, help="where to rebuild everything")
-    parser.add_argument("--blob-base", default="", help="base URL for the files, when the nest lists no sources and you have no restore code")
+    parser.add_argument("--blob-base", default="", help="where the files are, when the nest lists no sources and you have no restore code: a URL, or a blobs/sha256 folder on this machine (a manifest inside a nest folder needs none)")
     parser.add_argument(
         "--skip-precheck",
         action="store_true",
@@ -5145,6 +5633,18 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
+    # Before a single byte is fetched: a system folder as the target is refused here,
+    # not discovered after the whole nest has landed in memory (system_dir_refusal).
+    _why = system_dir_refusal(args.dir)
+    if _why:
+        print(f"[restore] ✗ {_why}", file=sys.stderr, flush=True)
+        return int(ExitCode.USAGE)
+    # Stale compatibility facts are refreshed before anything reads them -- but only
+    # for someone who said yes to that (update_rules.refresh_if_stale); everyone else
+    # gets one short line at the very end. The refresh can never fail a restore.
+    from .update_rules import refresh_if_stale
+
+    rules_note = refresh_if_stale(config=quiet_config(args))
     opts = RestoreOptions(
         skip_precheck=args.skip_precheck,
         force=args.force,
@@ -5159,7 +5659,10 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
         # reads as "broken", and the fix costs nothing: the narration already exists, it
         # was merely gated behind a flag nobody passes. `--json` keeps machine output
         # clean, and a pipe or redirect stays quiet as before.
-        verbose=args.verbose or (not args.json and sys.stderr.isatty()),
+        # --plan and --check-only exist to be read, and their answer is narrated; with
+        # no JSON on stdout any more (see below), a pipe would otherwise get nothing.
+        verbose=args.verbose or (not args.json and (
+            sys.stderr.isatty() or args.check_only or getattr(args, "plan_only", False))),
         verbose_explicit=args.verbose,
         skip_launch=args.skip_launch,
         trust_unsafe_urls=args.trust_unsafe_urls,
@@ -5176,9 +5679,21 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
     )
     source = args.manifest if args.manifest else args.grant
     report = restore(source, args.dir, opts)
+    # A person's run prints **no JSON**. Until 2026-10-02 the whole report (~300
+    # lines: stages, precheck, fingerprint...) went to stdout on every run without
+    # --json, and on a terminal it landed between the test render and the closing
+    # words (the founder's first restore). Machine readers have --json, whose
+    # NDJSON stream ends in the result event (specs/restore-protocol.md §4.10);
+    # the full report is kept with the evidence, where "Logs and evidence" points.
     if not args.json:
-        print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
-    # The closing words print **after** the json document, not before it: printed
+        with contextlib.suppress(OSError):
+            _ev = Path(getattr(report, "evidence_dir", "") or "")
+            if str(_ev) not in ("", ".") and _ev.is_dir():
+                (_ev / "restore-report.json").write_text(
+                    json.dumps(report.to_dict(), ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+    # The closing words print last: printed
     # inside restore() they scrolled away under the report and a finished rebuild
     # read as "it hung, then went quiet" (2026-09-13, first outside user). These
     # lines say what to do next — they are the last thing on screen, always,
@@ -5188,10 +5703,23 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
     # Stale facts are how a rebuild gets refused on a machine that would have worked, so
     # the one place worth saying it is right where the rebuild just ended. On stderr, and
     # it never blocks -- reading a date must not be able to fail a restore.
-    from .update_rules import warn_if_stale
-
-    warn_if_stale(sys.stderr)
+    if rules_note:
+        print(rules_note, file=sys.stderr)
     return report.exit_code
+
+
+def quiet_config(args: argparse.Namespace):
+    """The effective config -- or, when it cannot be read, one that says no to every
+    optional errand. A side errand (the rules refresh) must not stop a restore, and an
+    unreadable config is not a yes."""
+    try:
+        from .config import load_config
+
+        return load_config(config_path=getattr(args, "config", None))
+    except Exception:  # noqa: BLE001
+        from .config import Config
+
+        return Config()
 
 
 def _telemetry_sink():

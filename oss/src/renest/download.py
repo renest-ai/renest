@@ -25,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
+from urllib.request import url2pathname
 
 import httpx
 
@@ -44,6 +45,7 @@ __all__ = [
     "classify_source_failures",
     "probe",
     "expand_sources",
+    "local_path_of",
     "resolve",
 ]
 
@@ -109,7 +111,24 @@ class Source:
 
     @property
     def host(self) -> str:
+        if local_path_of(self.url) is not None:
+            return "this machine"
         return urlsplit(self.url).netloc or "<no host>"
+
+
+def local_path_of(url: str) -> Path | None:
+    """A ``file://`` address -> the path it names on this machine; anything else -> None.
+
+    A nest packed on this machine keeps its bytes in ``<out>/blobs/sha256/`` beside its
+    manifest, and a restore pointed there reads them straight off the disk. Until
+    2026-10-03 such an address was handed to the HTTP client, which cannot open it,
+    and the restore said "every source failed" and filed it as a network interruption
+    -- three retries and a wrong cause (Spark, the plugin walk).
+    """
+    parts = urlsplit(str(url))
+    if parts.scheme != "file" or parts.netloc not in ("", "localhost"):
+        return None
+    return Path(url2pathname(parts.path))
 
 
 @dataclass
@@ -202,6 +221,27 @@ def classify_source_failures(attribution: list[dict]) -> tuple[str, str]:
     if not attribution:
         return "NETWORK_INTERRUPTED", "every source failed"
 
+    # A file on this machine that is not there, or not the right bytes, says nothing
+    # about the network either, and no retry will make it appear. Judged apart from
+    # the remote sources; only when every source tried was local does it decide.
+    tried_local = [a for a in attribution if a.get("local")]
+    if tried_local and len(tried_local) == len(attribution):
+        missing = [a for a in tried_local if a.get("missing")]
+        where = str(missing[0].get("path") if missing else tried_local[0].get("path"))
+        if missing:
+            return (
+                "OBJECT_MISSING",
+                f"the file is not at {where}. This is not a network problem, so retrying "
+                "will not help — point --blob-base at the blobs/sha256 folder that sits "
+                "beside the nest's nests/ folder",
+            )
+        return (
+            "UNKNOWN",
+            f"the copy at {where} is not the file this nest names (its size or byte "
+            "check is wrong). This is not a network problem, so retrying will not help",
+        )
+    attribution = [a for a in attribution if not a.get("local")]
+
     # A source of an unsupported kind was never contacted, so it says nothing about
     # the network. It used to count as one: carrying no status, it read as "the
     # connection never happened", and a single magnet link next to a plain 404 was
@@ -268,6 +308,12 @@ def probe(client: httpx.Client, src: Source) -> ProbeResult:
     """``Range: 0-0`` probe: measures time-to-first-byte, confirms range
     support and total size along the way."""
     t0 = time.monotonic()
+    local = local_path_of(src.url)
+    if local is not None:
+        if not local.is_file():
+            return ProbeResult(src, ok=False, reason=f"not on disk: {local}")
+        return ProbeResult(src, ok=True, ttfb_s=0.0, ranges_ok=False,
+                           size=local.stat().st_size)
     try:
         r = client.get(src.url, headers={"Range": "bytes=0-0"}, timeout=PROBE_TIMEOUT_S)
     except httpx.HTTPError as e:
@@ -346,6 +392,21 @@ def _download_single(
                     )
                 f.write(chunk)
                 prog.add(len(chunk))
+
+
+def _copy_local(path: Path, dest: Path, prog: _Progress, limit: int) -> None:
+    """Copy a blob that already sits on this disk, with the same size stop as a stream."""
+    landed = 0
+    with path.open("rb") as src, dest.open("wb") as f:
+        while chunk := src.read(1 << 20):
+            landed += len(chunk)
+            if landed > limit:
+                raise ValueError(
+                    f"{path} is bigger than the {limit} bytes this nest records for the "
+                    f"file — it is not the file we asked for"
+                )
+            f.write(chunk)
+            prog.add(len(chunk))
 
 
 def _download_range8(
@@ -461,7 +522,11 @@ def resolve(
                 # claiming a different size is already serving something else, so it
                 # gets the single stream, which stops at the declared size instead of
                 # writing out whatever length that source asked us to reserve.
-                if p.ranges_ok and p.size == blob.size_bytes and p.size >= SINGLE_STREAM_MAX:
+                local = local_path_of(src.url)
+                if local is not None:
+                    mode = "local"
+                    _copy_local(local, dest, prog, blob.size_bytes)
+                elif p.ranges_ok and p.size == blob.size_bytes and p.size >= SINGLE_STREAM_MAX:
                     # Name the real segment count, not a fixed "range8": a
                     # concurrency comparison changes RANGE_WORKERS, and a label
                     # that never moves makes every run of the sweep look alike.
@@ -511,15 +576,17 @@ def resolve(
                     else f"{type(e).__name__}:{e}"
                 )
                 _log(f"✗ {src.host}({src.kind}): {reason}; trying the next source", level="warning")
-                attribution.append(
-                    {
-                        "host": src.host,
-                        "kind": src.kind,
-                        "url": _redact(src.url),
-                        "reason": str(reason)[:200],
-                        "status": p.status,
-                    }
-                )
+                entry = {
+                    "host": src.host,
+                    "kind": src.kind,
+                    "url": _redact(src.url),
+                    "reason": str(reason)[:200],
+                    "status": p.status,
+                }
+                local = local_path_of(src.url)
+                if local is not None:
+                    entry |= {"local": True, "path": str(local), "missing": not local.is_file()}
+                attribution.append(entry)
 
         raise SourcesExhausted(blob.sha256, attribution + skipped)
     finally:

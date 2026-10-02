@@ -38,7 +38,7 @@ from typing import Any, Callable
 
 import httpx
 
-from .capture import _parse_extra_model_paths, capture
+from .capture import _parse_extra_model_paths, capture, is_tool_default_licence
 from .envlock import (
     COMPILE_REQUIRED_VERDICT,
     LOCK_FROM_ENV_HEADER,
@@ -1053,15 +1053,18 @@ def _license_of(fspec: dict, warnings: list[str], license_lookup=None) -> dict:
     # fail because of it**.
     verdict = license_lookup(fspec) if license_lookup is not None else None
     raw = fspec.get("license")
+    # capture's own default block is nobody's statement: keep its tier, never call it
+    # the user's word (2026-10-03).
+    stated = not is_tool_default_licence(raw)
     if verdict is not None and not isinstance(raw, dict):
         return stricter_of(None, verdict)
     if verdict is not None:
-        return stricter_of(raw, verdict)
+        return stricter_of(raw, verdict, user_stated=stated)
     if isinstance(raw, dict) and license_lookup is not None:
         # We looked it up and found nothing — **this tier must be marked as
         # "the user's own claim"**. Without that mark, an unchecked claim looks
         # exactly like a checked conclusion, which is the old failure mode.
-        merged = stricter_of(raw, None)
+        merged = stricter_of(raw, None, user_stated=stated)
         if "serving_scope" not in raw:
             # The warning still goes out: the packer needs to know this tier came
             # from the default-deny rule, not from a lookup.
@@ -1334,6 +1337,68 @@ def _attach_recipes(manifest: dict, place, dry_run: bool, work: Path, recipes: l
         })
 
 
+#: Where the editor-form workflow sits in a nest. An ordinary files[] entry with
+#: kind "workflow" (open string since 2.7) -- restore finds it by that kind, so the
+#: path is only a name and changing it later costs old nests nothing.
+WORKFLOW_UI_REL = "RECIPES/workflow-ui.json"
+
+
+def is_editor_workflow(data: object) -> bool:
+    """The form ComfyUI's editor saves and its Workflows sidebar opens ("nodes": [...])."""
+    return isinstance(data, dict) and isinstance(data.get("nodes"), list)
+
+
+def _attach_workflow_ui(manifest: dict, place, dry_run: bool, work: Path, ui: dict) -> None:
+    """Carry the workflow as ComfyUI's editor saved it, so the restored app opens on
+    it instead of an empty canvas (2026-10-02, official starter nest).
+
+    The recipe a test render runs is the API form; the sidebar can only open this one
+    (see restore.place_sidebar_workflow). A few KB of the user's own graph, no images.
+    """
+    tmp = work / "workflow-ui.json"
+    tmp.write_text(json.dumps(ui, ensure_ascii=False, indent=2), encoding="utf-8")
+    if dry_run:
+        h, size = _sha256_stream(tmp)
+        blob = {"sha256": h, "size_bytes": size}
+    else:
+        blob = place(tmp, hardlink=False)
+    manifest["files"].append({
+        "path": WORKFLOW_UI_REL,
+        "blob": blob,
+        "kind": "workflow",
+        "license": {"shareable": True, "serving_scope": "private", "tag": "permissive",
+                    "note": "The workflow as ComfyUI's editor saved it — treated as yours."},
+    })
+
+
+def _editor_graph_of_newest_run(output_dir: Path, api: dict) -> dict | None:
+    """The editor-form graph ComfyUI wrote into the picture whose ``prompt`` block is
+    ``api`` -- the run ``--auto`` picked. Only the text block is read; the picture
+    itself never goes anywhere. Newest first, so the usual cost is one file.
+
+    ComfyUI writes ``workflow`` only when a person pressed Run in the browser; an
+    API-submitted run has ``prompt`` alone, and then there is nothing to carry.
+    """
+    from .verified import VIDEO_SUFFIXES, mp4_text_chunks, png_text_chunks
+
+    found = []
+    for p in output_dir.rglob("*"):
+        sfx = p.suffix.lower()
+        if p.is_file() and (sfx == ".png" or sfx in VIDEO_SUFFIXES):
+            with contextlib.suppress(OSError):
+                found.append((p.stat().st_mtime, p))
+    for _, p in sorted(found, key=lambda t: t[0], reverse=True):
+        chunks = (mp4_text_chunks if p.suffix.lower() in VIDEO_SUFFIXES else png_text_chunks)(p)
+        try:
+            if json.loads(chunks.get("prompt") or "null") != api:
+                continue
+            ui = json.loads(chunks.get("workflow") or "null")
+        except json.JSONDecodeError:
+            continue
+        return ui if is_editor_workflow(ui) else None
+    return None
+
+
 def _scan_spec_for_secrets(root: Path, spec: dict) -> tuple[list, list[str]]:
     """[SECURITY-REVIEW] Scan every **code directory** that is about to be packed.
 
@@ -1369,6 +1434,21 @@ def _scan_spec_for_secrets(root: Path, spec: dict) -> tuple[list, list[str]]:
     wf_rel = ((spec.get("adapters") or {}).get("comfyui") or {}).get("workflow_path") or ""
     if wf_rel:
         cfg_hits += scan_recipe_json(root / str(wf_rel), label=str(wf_rel))
+
+    # [SECURITY-REVIEW] The editor-form workflow travels as its own file, so it goes
+    # through the same scan. Its widget values carry no input names, so the scan that
+    # tells a credential by its *name* cannot see them there; the API form of the same
+    # graph names every input, and is scanned beside it for exactly that reason.
+    ui = spec.get("_workflow_ui")
+    if isinstance(ui, dict):
+        with tempfile.TemporaryDirectory() as td:
+            for label, data in (("the editor workflow", ui),
+                                ("the editor workflow (its API form)",
+                                 spec.get("_workflow_ui_twin"))):
+                if isinstance(data, dict):
+                    p = Path(td) / "w.json"
+                    p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+                    cfg_hits += scan_recipe_json(p, label=label)
 
     deps = [d for d in (spec.get("code_deps") or []) if isinstance(d, dict)]
     paths = [str(d.get("install_path") or "").strip("/") for d in deps]
@@ -2848,6 +2928,8 @@ def _build_manifest(
     # the check above: a few dozen run at a few KB each, so there is no reason
     # to make the caller pick one to keep.
     _attach_recipes(manifest, place, dry_run, work, spec.get("_extra_recipes") or [])
+    if is_editor_workflow(spec.get("_workflow_ui")):
+        _attach_workflow_ui(manifest, place, dry_run, work, spec["_workflow_ui"])
 
     # -- adapters.comfyui.workflow --
     _wf_json: dict | None = None  # the recipe's own JSON, for the invariant sweep below
@@ -3049,11 +3131,101 @@ def infer_spec(
     spec, report = result.pack_spec, result.report
     _fill_python_lock_and_version(spec, env_root, cdir, env_python)
 
-    wf_in_spec = spec.get("adapters", {}).get("comfyui", {}).get("workflow_path", "")
-    if wf_in_spec.startswith("<"):  # unresolved placeholder → drop, don't pack a non-file
-        spec.pop("adapters", None)
+    cui = spec.get("adapters", {}).get("comfyui")
+    if cui is not None and str(cui.get("workflow_path") or "").startswith("<"):
+        # No file inside the environment to point at -- the ComfyUI panel sends the
+        # recipe inline, and a --workflow file may sit outside the root. Until
+        # 2026-10-03 the whole adapter was dropped here, so a panel nest carried no
+        # recipe and its restore never re-rendered anything. Carry the recipe inline
+        # instead, as --auto does for one recovered from a picture.
+        _carry_recipe_inline(spec, cui, wf_json, cdir, report)
 
     return env_root, spec, report
+
+
+def _same_graph_but_whole_numbers(a: object, b: object) -> bool:
+    """Two API-form graphs that differ, if at all, only in whole-number input
+    values: same node ids, classes, links and every text/float/flag value.
+
+    ComfyUI's seed widgets default to "control after generate: randomize", so the
+    canvas holds a new seed the moment a run is queued; the canvas sent after a run
+    is that run's recipe with a different seed. File references are text, so a
+    graph equal under this rule needs exactly the same files."""
+    if not (isinstance(a, dict) and isinstance(b, dict)) or a.keys() != b.keys():
+        return False
+    for nid, na in a.items():
+        nb = b[nid]
+        if not (isinstance(na, dict) and isinstance(nb, dict)):
+            return False
+        if {k: v for k, v in na.items() if k != "inputs"} != {
+                k: v for k, v in nb.items() if k != "inputs"}:
+            return False
+        ia, ib = na.get("inputs") or {}, nb.get("inputs") or {}
+        if not (isinstance(ia, dict) and isinstance(ib, dict)) or ia.keys() != ib.keys():
+            return False
+        for k, va in ia.items():
+            vb = ib[k]
+            if va == vb or (type(va) is int and type(vb) is int):
+                continue
+            return False
+    return True
+
+
+def _carry_recipe_inline(spec: dict, cui: dict, wf_json: dict, cdir: Path, report: dict) -> None:
+    """Put a recipe with no file to point at into the nest inline, and judge
+    ``verified_run`` against **this** recipe rather than the environment as a whole.
+
+    Evidence is what :func:`renest.verified.scan_comfyui_output` already counts --
+    the recipe a finished run wrote into its own picture. The panel lets its button
+    be pressed whether or not the canvas ever ran, so the recipe it sends is not
+    evidence by itself: verified only when a finished run wrote this very recipe, or
+    this recipe with nothing but whole numbers changed (a reseeded canvas) -- and
+    then the recipe re-run on restore is that run's own, the one that really ran;
+    the canvas version still travels. No match: the recipe travels, no claim."""
+    from .verified import scan_comfyui_output
+
+    cui.pop("workflow_path", None)
+    # capture's environment-wide answer; this recipe is judged on its own below.
+    cui.pop("verified_run", None)
+    report["gaps"] = [g for g in report.get("gaps", [])
+                      if not g.startswith("The workflow file isn't inside the environment root")]
+    evidence = scan_comfyui_output(cdir / "output")
+    ran = next((r for r in evidence.recipes if r.workflow == wf_json), None) or next(
+        (r for r in evidence.recipes if _same_graph_but_whole_numbers(r.workflow, wf_json)),
+        None)
+    cui["workflow_inline"] = ran.workflow if ran is not None else wf_json
+    if ran is None:
+        spec["_evidence"] = {
+            "source": "none",
+            "note": "No finished run in this environment wrote this recipe into its "
+                    "output, so nothing confirms it produced anything.",
+        }
+        report["gaps"].append(
+            "No finished run in this environment wrote this workflow into its output, so "
+            "this nest carries the workflow but no verified run. Everything still restores "
+            "byte for byte — restoring it just will not try to re-render, since nothing "
+            "here confirms this workflow produced a picture."
+        )
+        return
+    cui["verified_run"] = {
+        "queue_completed_at": _iso_utc(ran.mtime),
+        "evidence_source": "observed_run",
+    }
+    spec["_evidence"] = {"source": "observed_run"}
+    if ran.workflow != wf_json:
+        spec["_extra_recipes"] = [wf_json]
+        report["gaps"].append(
+            "The workflow on the canvas differs from the last finished run only in whole "
+            "numbers (a seed that changes after every run, usually), so restoring this nest "
+            "re-runs the recipe of that finished run. The canvas version travels with the "
+            "nest too."
+        )
+    else:
+        report["gaps"].append(
+            "A finished run in this environment wrote this very workflow into its output, "
+            "so this nest carries a verified run: restoring it will re-run that workflow and "
+            "require a picture to come out."
+        )
 
 
 def infer_spec_current_state(
@@ -3129,6 +3301,9 @@ def infer_spec_current_state(
             # can follow.
             cui.pop("workflow_path", None)
             cui["workflow_inline"] = driving.workflow
+            # capture's "fill workflow_path in by hand" no longer applies: it is inline.
+            report["gaps"] = [g for g in report.get("gaps", []) if not g.startswith(
+                "The workflow file isn't inside the environment root")]
         if evidence.verified:
             cui["verified_run"] = {
                 "queue_completed_at": _iso_utc(evidence.most_recent.mtime),
@@ -3160,6 +3335,12 @@ def infer_spec_current_state(
     extra = [r.workflow for r in (*evidence.recipes, *saved) if r is not driving]
     if extra:
         spec["_extra_recipes"] = extra
+    # The same run's editor-form graph, out of the same picture's text, so the restored
+    # app's Workflows sidebar can open it. Pictures themselves never travel.
+    if driving is not None and driving.origin == "output_image":
+        ui = _editor_graph_of_newest_run(cdir / "output", driving.workflow)
+        if ui is not None:
+            spec["_workflow_ui"] = ui
     report["unreadable_images"] = [str(p) for p in evidence.unreadable]
     # **Say which run this nest will re-run, when there was more than one to choose from.**
     # Every recipe found travels with the nest either way, so nothing is lost -- but the
@@ -3291,9 +3472,11 @@ def pack(
     env_python: str | None = None,
     no_fingerprint: bool = False,
     workflow: dict | str | os.PathLike[str] | None = None,
+    workflow_ui: dict | str | os.PathLike[str] | None = None,
     comfyui_dir: str | os.PathLike[str] | None = None,
     program_dir: str | os.PathLike[str] | None = None,
     auto: bool = False,
+    workflow_name: str | None = None,
     framework: str | None = None,
     run_record: dict | None = None,
     uploader: Uploader | None = None,
@@ -3331,7 +3514,15 @@ def pack(
     read. The ComfyUI panel needs it: its confirm page runs a dry run first, and
     a dry run writes nothing to the user's folder, so without a shared object
     the pack behind the button reads every weight a second time (measured
-    2026-08-30 through ``renest serve``: 2.00x)."""
+    2026-08-30 through ``renest serve``: 2.00x).
+
+    ``workflow_ui``: the same workflow as ComfyUI's editor saves it (a dict, or a
+    path to one). It travels as a files[] entry of kind ``workflow`` so the restored
+    app's Workflows sidebar can open it; ``--auto`` finds it in the run's picture.
+
+    ``workflow_name``: what the caller calls this nest (the panel's name field,
+    ``--nest-name``); written, cleaned, as ``adapters.comfyui.workflow_name`` -- the
+    name the restored sidebar shows."""
     root = Path(root).resolve()
     # Kept for the manifest stage too, not just for capture: with a spec handed in
     # ready-made, capture never runs, and this is the only thing that says which
@@ -3405,6 +3596,49 @@ def pack(
         # custom node came from, so it is not in the nest" hands the user an
         # inventory that looks complete and fails at rebuild time.
         warnings.extend(cap_report.get("gaps", []))
+
+    # -- The editor-form workflow, when one was handed in ----------------------
+    if workflow_ui is not None and spec is not None:
+        ui = workflow_ui
+        if not isinstance(ui, dict):
+            try:
+                ui = json.loads(Path(workflow_ui).read_text(encoding="utf-8"))
+            except (OSError, ValueError) as e:
+                report.exit_code = int(ExitCode.USAGE)
+                report.findings = [f"Can't read the --workflow-ui file: {e}"]
+                return report
+        if is_editor_workflow(ui):
+            spec["_workflow_ui"] = ui
+        else:
+            spec.pop("_workflow_ui", None)
+            warnings.append(
+                "The file given as --workflow-ui is not the editor's form (a workflow "
+                "saved with Save, which has a \"nodes\" list), so it was left out; "
+                "ComfyUI's Workflows sidebar could not open it anyway."
+            )
+    # -- The name the restored app's Workflows sidebar shows ---------------------
+    # Never written before 2026-10-03, so every restored nest's workflow was called
+    # "renest-workflow". The caller's name for this nest (the panel's name field,
+    # --nest-name) goes through the sidebar's own cleaning rule; a hand-written
+    # workflow_name in a spec stays as written.
+    if workflow_name and isinstance(spec, dict):
+        _cui = (spec.get("adapters") or {}).get("comfyui")
+        if isinstance(_cui, dict) and not _cui.get("workflow_name"):
+            from .restore import sidebar_safe_name
+
+            _safe = sidebar_safe_name(workflow_name)
+            if _safe:
+                _cui["workflow_name"] = _safe
+    if isinstance(spec, dict) and spec.get("_workflow_ui") is not None:
+        # The API form of the same graph, for the credential scan below only.
+        twin = workflow
+        if twin is not None and not isinstance(twin, dict):
+            try:
+                twin = json.loads(Path(twin).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                twin = None
+        spec["_workflow_ui_twin"] = twin or (
+            (spec.get("adapters") or {}).get("comfyui") or {}).get("workflow_inline")
 
     # -- Are we ourselves installed in the environment being packed? -----------
     # The one wrong-but-natural move a newcomer makes: venv active, mental model
@@ -3754,6 +3988,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
              "(use this, --spec, or --auto)",
     )
     parser.add_argument(
+        "--workflow-ui",
+        help="The same workflow saved the ordinary way (Save, not Export (API)). Optional: "
+             "it travels with the nest so that after a restore it opens straight from "
+             "ComfyUI's Workflows sidebar",
+    )
+    parser.add_argument(
         "--auto",
         action="store_true",
         help="Pack this ComfyUI folder as it stands, without naming a workflow — we look for "
@@ -3913,6 +4153,16 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
     if not args.dry_run and not args.out:
         print("✗ A real pack needs --out", file=sys.stderr)
         return int(ExitCode.USAGE)
+    # --out is written into, so it gets restore's refusal of system folders. --dir is
+    # only read (an image may well keep its app at /ComfyUI and pack from /), so it
+    # is left alone.
+    if args.out:
+        from .restore import system_dir_refusal
+
+        _why = system_dir_refusal(args.out, flag="--out")
+        if _why:
+            print(f"✗ {_why}", file=sys.stderr)
+            return int(ExitCode.USAGE)
 
     # -- Upload destination. Both options obey the same discipline: **check the
     #    credentials first, pack second** — spending tens of GB on a pack and
@@ -4057,7 +4307,9 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
         env_python=args.env_python,
         no_fingerprint=args.no_fingerprint,
         workflow=args.workflow,
+        workflow_ui=getattr(args, "workflow_ui", None),
         comfyui_dir=getattr(args, "comfyui_dir", None),
+        workflow_name=getattr(args, "nest_name", None),
         program_dir=getattr(args, "program_dir", None),
         auto=auto,
         framework=framework,
@@ -4106,6 +4358,12 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
                 print(f"⚠ {w}", file=sys.stderr)
         if report.ok and not report.dry_run:
             print(sealed_summary(report), file=sys.stderr)
+            if args.workflow and not getattr(args, "workflow_ui", None):
+                print(
+                    "  Tip: add --workflow-ui <the same workflow saved with Save> next time, "
+                    "and after a restore it opens straight from ComfyUI's Workflows sidebar.",
+                    file=sys.stderr,
+                )
         elif report.ok:
             print(
                 f"✓ Dry run: nest {report.nest_id} would seal "

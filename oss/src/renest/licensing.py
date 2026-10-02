@@ -520,7 +520,8 @@ def judge_civitai(
 _STRICTNESS = {"open": 0, "private": 1, "gated": 2}
 
 
-def stricter_of(spec_license: dict | None, verdict: LicenseVerdict | None) -> dict:
+def stricter_of(spec_license: dict | None, verdict: LicenseVerdict | None,
+                *, user_stated: bool = True) -> dict:
     """Merge **what the user wrote in the spec** with **what we looked up**, taking
     whichever is stricter.
 
@@ -537,6 +538,11 @@ def stricter_of(spec_license: dict | None, verdict: LicenseVerdict | None) -> di
     Wiring the judgement in this way **can only make a nest stricter, never looser**, and
     that guarantee needs no new fields at all -- while "adding a feature loosened things"
     is the single worst kind of regression to have here.
+
+    ``user_stated=False``: the spec block is the tool's own default (capture fills one
+    in when nobody said anything), so nobody declared it and ``declared_by`` is left
+    out -- absent means unknown in the format (manifest spec §8). It never loosens
+    anything: the default-deny tier is applied exactly as before.
     """
     spec_block = dict(spec_license) if isinstance(spec_license, dict) else {}
     if verdict is None:
@@ -552,7 +558,8 @@ def stricter_of(spec_license: dict | None, verdict: LicenseVerdict | None) -> di
             if spec_block["serving_scope"] == "gated":
                 spec_block["shareable"] = False
             spec_block.setdefault("shareable", False)
-            spec_block.setdefault("declared_by", "user")
+            if user_stated:
+                spec_block.setdefault("declared_by", "user")
         return spec_block
 
     detected = verdict.as_license_block()
@@ -571,7 +578,10 @@ def stricter_of(spec_license: dict | None, verdict: LicenseVerdict | None) -> di
         merged = dict(detected)
         merged["serving_scope"] = spec_scope
         merged["shareable"] = bool(spec_block.get("shareable", False)) and spec_scope != "gated"
-        merged["declared_by"] = "user"
+        if user_stated:
+            merged["declared_by"] = "user"
+        else:
+            merged.pop("declared_by", None)
         return merged
     return detected
 

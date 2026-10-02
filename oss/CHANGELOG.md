@@ -2,7 +2,91 @@
 
 What changed for the person using `renest`. Dates are the release date.
 
-## 0.1.16 — 2026-09-19 (not yet published; accumulating fixes before release)
+## 0.1.17 — 2026-10-02
+
+### After a restore, your workflow opens from ComfyUI's Workflows sidebar
+
+- Measured on the official starter nest: the restore succeeded and rendered, and
+  ComfyUI then opened on an empty canvas. The nest only held the workflow in API
+  form (what a test render runs), and the sidebar can only open the form the
+  editor saves.
+- The editor form now travels in the nest as an ordinary file (`files[]` kind
+  `workflow`; no format change). The Renest panel sends it on its own; `pack --auto`
+  reads it from the text block of the picture it picks (the picture itself still
+  never goes in); with `--workflow`, add `--workflow-ui` and the same workflow
+  saved with Save.
+- After a restore it is in the sidebar, and What's next says
+  "In ComfyUI, open Workflows (left sidebar) → <name>". `renest start` puts it
+  back if it went missing. Nests without it behave as before.
+- It goes through the same credential check as the recipe — a nest is handed to
+  other people.
+
+### `renest start --port PORT`
+
+- On a machine where something already holds the recorded port — a rented box
+  that ships its own ComfyUI on 8188 — `renest start` collided, and the only way
+  round it was editing the restored files by hand.
+- `--port` now overrides the port for this run, like `--listen` does for the
+  address: the command's `--port` is rewritten, or added when the restore knew the
+  app's port (ComfyUI's 8188). The printed command and the "answers on port" line
+  follow it. Nothing in the restore folder is rewritten. A value that is not a
+  whole number from 1 to 65535 is refused as a usage error.
+
+### Nests saved from the Renest panel carry their workflow, and restore test-renders it
+
+- A nest saved with "Nest this run" held every file but not the workflow itself,
+  so restoring it never ran a test render. The workflow now travels in the nest
+  (no format change).
+- It is marked as having worked only when a finished run in that ComfyUI wrote
+  this workflow into its output picture. If the canvas differs from that run only
+  in whole numbers (a seed that changes after every run), restore re-runs the
+  recipe of the run that really happened, and the canvas version travels too.
+  With no such run, the workflow travels, restore does not test-render, and the
+  pack says so.
+
+### The restored workflow in the sidebar carries the nest's name
+
+- Every restored workflow was listed as "renest-workflow". It now takes the name
+  typed in the Renest panel, or `pack --nest-name`, cleaned the same way the
+  sidebar cleans names. With neither, nothing changes.
+
+### A nest folder on this machine restores with the command the docs give
+
+- `renest restore --manifest <folder>/nests/<nest-id>/manifest.json --dir ./run`
+  on a nest saved from the panel or by `renest pack` stopped with "Nowhere to
+  download ComfyUI from"; `--blob-base file://…` then failed as a network
+  interruption, retried three times. The bytes were in the folder all along.
+- A manifest read from a nest folder now takes its files from the `blobs/sha256`
+  folder beside it, and says so. `--blob-base` also takes a folder path or a
+  `file://` address. A file missing from that folder is reported as missing,
+  with its path, not as a network problem, and is not retried.
+
+### Restoring on the machine that packed the nest no longer says it "differs"
+
+- The comparison before the download can only read renest's own environment,
+  which holds no torch, so torch and the nest's key packages read as empty, and
+  the closing line said the machine differs a little.
+- Once the environment is rebuilt, its own Python is asked again, and that
+  answer is the one the closing line and the report use. A value that still
+  cannot be read is named as unread, never counted as a difference.
+
+### A licence nobody stated is no longer recorded as the user's
+
+- A model whose licence could not be found was written into the nest with
+  `declared_by: "user"`, though the user never said anything about it. The
+  restrictive default that capture fills in now leaves `declared_by` out
+  (meaning unknown). It stays restricted as before; a licence a person wrote
+  or edited is still recorded as theirs.
+
+### Smaller fixes
+
+- `renest serve` no longer tells you to set `RENEST_TOKEN_FILE` for the panel;
+  the panel has not read it since 0.1.7. The line now says where the panel
+  finds the token, and names the pointer file for a token kept elsewhere.
+- The restore report's lines for a skipped test render (and for a nest with no
+  recipe) no longer show literal `**` marks, and a packing note uses the same dash as its neighbours.
+
+## 0.1.16 — 2026-10-02
 
 ### `renest restore --json` now carries the boot-time health check report on the result event
 

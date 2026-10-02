@@ -29,6 +29,12 @@ from .uplink import USER_AGENT, UPLINK_CONTRACT_VERSION, machine_facts, scrub_ev
 _FLUSH_AT = 20  # events per batch
 _TIMEOUT_S = 3.0  # per-batch timeout; short, because reporting is a side channel
 _FINAL_TYPES = {"result", "error"}  # flush on arrival: leave no tail at the end
+# Stage boundaries also go out on arrival (2026-10-02): the console's Restore page reads
+# these every few seconds as "the same restore you see in the terminal". After the
+# download each stage has only these two events, so waiting for a full batch left the
+# page on "Download" until the very end -- and, with a long dependency install, saying
+# the machine had gone quiet. A handful of small posts per restore.
+_STAGE_TYPES = {"stage_start", "stage_done"}
 
 
 def origin_from_grant_source(source: str) -> str | None:
@@ -90,7 +96,7 @@ def make_report_sink(
         if kept is None:
             return  # logs and unregistered types: whole category stays local
         buf.append(kept)
-        if len(buf) >= _FLUSH_AT or event.get("type") in _FINAL_TYPES:
+        if len(buf) >= _FLUSH_AT or event.get("type") in _FINAL_TYPES | _STAGE_TYPES:
             _flush()
 
     atexit.register(_flush)
