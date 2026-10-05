@@ -43,6 +43,7 @@ __all__ = [
     "vendor_only_locals",
     "find_env_python",
     "find_launchers",
+    "launcher_starts_python",
     "find_site_packages",
     "drop_ourselves",
     "freeze_environment",
@@ -967,6 +968,22 @@ def find_launchers(env_root: Path) -> list[Path]:
            if p.is_file() and p.suffix.lower() in _LAUNCHER_SUFFIXES
            and p.stat().st_size <= _LAUNCHER_MAX_BYTES]
     return out
+
+
+_STARTS_PYTHON = re.compile(r"python|main\.py", re.I)
+
+
+def launcher_starts_python(script: Path) -> bool:
+    """Whether a start-script-shaped file actually mentions Python or ``main.py``.
+
+    Every ``.sh`` beside an environment is not the thing that starts it: a backup or
+    download helper sitting there was being called "the script that starts this
+    setup" (scan 2026-10-05). Naming one only when its text says ``python`` or
+    ``main.py`` keeps the warning for the file a person really double-clicks."""
+    try:
+        return bool(_STARTS_PYTHON.search(script.read_text(encoding="utf-8", errors="replace")))
+    except OSError:
+        return False
 
 
 #: A launcher that calls the interpreter straight, no variable in between:

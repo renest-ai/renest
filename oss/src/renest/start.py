@@ -22,8 +22,11 @@ from pathlib import Path
 
 from .errors import ExitCode
 from .restore import (
+    PASTE_NOTE,
     RECIPE_REL,
     START_REL,
+    browser_address,
+    expose_note,
     loopback_bind,
     place_sidebar_workflow,
     rebind_argv,
@@ -268,7 +271,19 @@ def run_from_args(args: argparse.Namespace, emitter) -> int:  # noqa: ANN001
     # "listen_port", never the old "port" key: that one held the spare port the
     # rebuild's check borrowed, which the command below does not use (2026-09-30).
     _answers = _port if _port is not None else facts.get("listen_port")
-    if _answers:
+    # The address the provider gives this port, from the command actually run (after
+    # --listen / --port), so it is the one that will answer -- never a guess.
+    _url = browser_address([str(a) for a in cmd[1:]], _answers) if _answers else None
+    if _url:
+        # The address alone on its line, so a triple-click copies exactly it.
+        print(f"[start] It answers on port {_answers}. Open it at:", file=sys.stderr, flush=True)
+        print(_url, file=sys.stderr, flush=True)
+        print(f"[start] {PASTE_NOTE[0].upper()}{PASTE_NOTE[1:]}.", file=sys.stderr, flush=True)
+        # Restore's closing lines say this; the address alone used to drop it, and
+        # RunPod's address exists whether or not the port was ever opened.
+        print(f"[start] If it doesn't answer, {expose_note(_answers)}.",
+              file=sys.stderr, flush=True)
+    elif _answers:
         print(
             f"[start] It answers on port {_answers}. On a rented GPU box, reaching it "
             f"from your own browser also means exposing that port in your provider's panel.",

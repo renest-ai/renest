@@ -745,6 +745,101 @@ def start_listen_port(argv: Sequence[str], adapters: dict | None) -> int | None:
     return None
 
 
+#: Where a container's own environment lives. A person's SSH session on a rented
+#: box does not inherit the variables the provider gave the container (vast says
+#: so in its docs; the floor image writes only its own into /etc/environment), but
+#: the container's first process still holds them.
+_INIT_ENVIRON = Path("/proc/1/environ")
+
+#: Addresses that mean "every interface" -- what a provider's proxy or port
+#: mapping needs to reach the app at all.
+_ALL_INTERFACES = frozenset({"0.0.0.0", "::", "[::]", "0.0.0.0,::", "*"})
+
+_RUNPOD_POD_ID_RE = re.compile(r"^[a-z0-9]{1,64}$")
+
+
+def _provider_env(keys: Sequence[str]) -> dict[str, str]:
+    """The provider variables in ``keys``: this process first, then the container's own."""
+    found = {k: os.environ[k] for k in keys if os.environ.get(k)}
+    missing = [k for k in keys if k not in found]
+    if missing:
+        try:
+            raw = _INIT_ENVIRON.read_bytes()
+        except OSError:
+            raw = b""
+        for item in raw.split(b"\0"):
+            k, sep, v = item.decode("utf-8", "replace").partition("=")
+            if sep and k in missing and v and k not in found:
+                found[k] = v
+    return found
+
+
+def browser_address(
+    argv: Sequence[str], port: int | None, environ: Mapping[str, str] | None = None,
+) -> str | None:
+    """The address to paste into a browser for an app this command serves, or None.
+
+    Why: measured 2026-10-03, the founder's run of the official Z-Image starter on
+    RunPod -- restore, sidebar workflow and render all passed, and the one wall was
+    the ComfyUI link on RunPod's console page answering 403. ComfyUI refuses every
+    request whose ``Sec-Fetch-Site`` is ``cross-site`` (a click from another site);
+    an address pasted into the bar is ``none`` and passes. The protection stays on;
+    the person is handed the address to paste instead.
+
+    Only from facts the provider itself set: RunPod's ``RUNPOD_POD_ID`` (proxy
+    ``https://<id>-<port>.proxy.runpod.net``), vast's ``PUBLIC_IPADDR`` plus the
+    ``VAST_TCP_PORT_<port>`` mapping for exactly this port. Only when the command
+    listens on every interface -- loopback is unreachable through either, and a
+    command naming no address binds wherever the app defaults to, which is not
+    known here. Anything else: None, never a guessed address.
+    """
+    if not port:
+        return None
+    args = [str(a) for a in argv]
+    found = host_bind(args)
+    if found is None:
+        # ComfyUI's bare `--listen` (no value) is every interface.
+        if not any(a == "--listen" for a in args):
+            return None
+    elif found[1] not in _ALL_INTERFACES:
+        return None
+    keys = ("RUNPOD_POD_ID", "PUBLIC_IPADDR", f"VAST_TCP_PORT_{port}")
+    env = ({k: environ[k] for k in keys if environ.get(k)} if environ is not None
+           else _provider_env(keys))
+    pod = env.get("RUNPOD_POD_ID", "").strip()
+    if pod:
+        return f"https://{pod}-{port}.proxy.runpod.net" if _RUNPOD_POD_ID_RE.match(pod) else None
+    ip, ext = env.get("PUBLIC_IPADDR", "").strip(), env.get(f"VAST_TCP_PORT_{port}", "").strip()
+    if ip and ext:
+        import ipaddress
+
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return None
+        if not (ext.isdigit() and 0 < int(ext) < 65536):
+            return None
+        host = f"[{addr}]" if addr.version == 6 else str(addr)
+        return f"http://{host}:{int(ext)}"
+    return None
+
+
+#: Said next to every printed address: the reason it is printed at all.
+PASTE_NOTE = ("paste it into a new tab; clicking it from the provider's console page is "
+              "refused by ComfyUI (HTTP 403)")
+
+
+def expose_note(port: int | None) -> str:
+    """The one sentence about opening the port, said the same by restore and start.
+
+    RunPod's proxy address exists for every port of a pod, but answers only for the
+    ports opened as HTTP ports in the pod's settings -- so an address printed without
+    this line is one that can fail for a reason nothing on screen names."""
+    what = f"expose {port} (HTTP)" if port else "expose that port (HTTP)"
+    return (f"{what} in your provider's panel to open it in your browser — RunPod's "
+            f"proxy only answers on ports opened as HTTP ports")
+
+
 def whats_next_lines(
     manifest: dict,
     plan_app_dir: Path,
@@ -818,6 +913,7 @@ def whats_next_lines(
         # then the same thing by hand (2026-10-02: the founder's first restore
         # printed seven lines here, one of them sending him to expose the spare
         # port the check had borrowed).
+        _url = None
         if cmd and ep:
             argv = [str(a) for a in ep["argv"]]
             # The recorded command is the one that worked -- from this box. When it
@@ -834,15 +930,14 @@ def whats_next_lines(
             # borrowed (see start_listen_port); unknown means no number is said.
             port = start_listen_port(argv, manifest.get("adapters"))
             where = f"port {port}" if port else "the port its command names (this nest does not record which)"
-            expose = f"expose {port} (HTTP)" if port else "expose that port (HTTP)"
             if _bound is None:
                 # The command names no address at all, so what it binds to is the
                 # application's own default and we do not know it -- and nothing
                 # can be changed without inventing a flag. Say the condition.
                 reach = (f"; on a rented box your browser reaches it only if it listens "
-                         f"on 0.0.0.0 and you {expose} in your provider's panel.")
+                         f"on 0.0.0.0 and you {expose_note(port)}.")
             else:
-                reach = f"; {expose} in your provider's panel to open it in your browser."
+                reach = f"; {expose_note(port)}."
             lb_note = (f" (The nest records {_lb}, which answers this machine only — "
                        f"right for the check, not for your browser.)") if _lb else ""
             if renest_start:
@@ -851,6 +946,10 @@ def whats_next_lines(
                 lines.append(f"  · The same by hand: {by_hand}.{lb_note}")
             else:
                 lines.append(f"  · Start it: {by_hand} — serves it on {where}{reach}{lb_note}")
+            # Same function `renest start` prints from, on the command given above.
+            _url = browser_address(open_argv[1:], port)
+            if _url:
+                lines.append(f"  · Then open {_url} — {PASTE_NOTE}.")
         if (manifest.get("adapters") or {}).get("comfyui") is not None:
             lines.append(f"  · Images render into {cwd / 'output'} — that is where yours is.")
         if sidebar is not None:
@@ -875,7 +974,7 @@ def whats_next_lines(
                     q = urlencode({"filename": test_image["filename"], "type": "output",
                                    **({"subfolder": test_image["subfolder"]}
                                       if test_image.get("subfolder") else {})})
-                    img = (f" Quickest way in: open <your ComfyUI address>/view?{q} in your "
+                    img = (f" Quickest way in: open {_url or '<your ComfyUI address>'}/view?{q} in your "
                            f"browser, save that test image, and drop it onto the canvas.")
                 lines.append(
                     f"  · The workflow that produced the test render is {recipe_path}. This "

@@ -764,6 +764,37 @@ def _api_node_names(py: Path, *, package_root: bool) -> set[str]:
     return names
 
 
+#: Where ComfyUI keeps the nodes it ships: the old core file, the extras it loads at
+#: start, and the service-calling package (``init_builtin_extra_nodes`` in nodes.py).
+_SHIPPED_NODE_SOURCES = ("nodes.py", "comfy_extras", _API_NODE_PKG)
+
+
+def shipped_node_names(program_dir: Path) -> frozenset[str]:
+    """Every node name the ComfyUI program in ``program_dir`` ships, plus the hand list.
+
+    Read statically off the program's own files -- never imported, never run: the
+    ``NODE_CLASS_MAPPINGS`` table (old style) and each class's ``node_id=`` (the
+    schema style ``define_schema`` uses). Measured 2026-10-05 on v0.37.2 and v0.38.2:
+    fourteen nodes the official Flux2 / Wan / Z-Image starters use were absent from
+    the hand list, so every one of those packs told its owner they might be missing a
+    node pack.
+
+    **Always a union with :data:`BUILTIN_CLASSES`**: a tree we cannot read, a file
+    that will not parse or a layout we do not recognise adds nothing, and the answer
+    is then exactly what it was before -- never "everything is unknown"."""
+    names: set[str] = set(BUILTIN_CLASSES)
+    root = Path(program_dir)
+    for rel in _SHIPPED_NODE_SOURCES:
+        here = root / rel
+        try:
+            files = [here] if here.is_file() else sorted(here.rglob("*.py")) if here.is_dir() else []
+        except OSError:
+            continue
+        for py in files:
+            names.update(_api_node_names(py, package_root=False))
+    return frozenset(names - THIRD_PARTY_LOADERS)
+
+
 def api_forwarding_nodes(comfyui_dir: Path, classes: Iterable[str]) -> list[dict]:
     """Which of these nodes hand the work to somebody else's servers.
 
@@ -962,6 +993,8 @@ def capture(workflow: dict, comfyui_dir: Path,
     # bookkeeping; explaining what it means reads as inspecting the user's work,
     # which is not how a moving tool should feel. Deliberate, so keep it.
     unrecognized_inputs: list[dict] = []
+    # The program this nest records -- the separate tree on the desktop build.
+    shipped = shipped_node_names(program_dir or comfyui_dir)
     for node_id, node in sorted(nodes.items()):
         cls = node["class_type"]
         inputs = node.get("inputs", {}) if isinstance(node.get("inputs"), dict) else {}
@@ -971,7 +1004,12 @@ def capture(workflow: dict, comfyui_dir: Path,
                 refs.append({"node_id": node_id, "class_type": cls,
                              "input": input_name, "value": value, "category": category})
         if cls not in BUILTIN_CLASSES:
-            unknown_classes.setdefault(cls, []).append(node_id)
+            # Only a node ComfyUI does not ship is looked for under custom_nodes/. The
+            # string scan below still covers every node off the hand list: a shipped
+            # loader the loader table does not know (LoadVideo, say) names its file
+            # the same way an unknown one does, and losing that file is the worse miss.
+            if cls not in shipped:
+                unknown_classes.setdefault(cls, []).append(node_id)
             for input_name, value in inputs.items():
                 if isinstance(value, str):
                     # A table of node classes can never keep up with upstream, so this
@@ -1235,14 +1273,17 @@ def capture(workflow: dict, comfyui_dir: Path,
             # same from here. Checking in a running ComfyUI is advice to the reader,
             # not something this module does: the static-parse rule at the top governs
             # what capture touches, not what its report may suggest you go and look at.
-            gaps.append(f"Node type {cls} is not in our list of ComfyUI built-ins, and no "
-                        f"folder under custom_nodes/ defines it either. Either it is a "
-                        f"built-in we have not listed, or it comes from a node pack — and "
-                        f"if that pack is installed here, this nest will not record it, "
-                        f"which is the reading that costs you a rebuild. To settle it: "
-                        f"install the Renest panel in ComfyUI, run this workflow once and "
-                        f"capture again — a finished run reports which pack every node came "
-                        f"from, and that answer beats anything we can read from outside")
+            # Said so it holds for both readers: someone already packing from the panel
+            # inside ComfyUI, and someone at a terminal who may never have installed it.
+            gaps.append(f"Node type {cls} is not among the ComfyUI built-ins we could read "
+                        f"from this install, and no folder under custom_nodes/ defines it "
+                        f"either. Either it is a built-in we could not read, or it comes from "
+                        f"a node pack — and if that pack is installed here, this nest will "
+                        f"not record it, which is the reading that costs you a rebuild. To "
+                        f"settle it: run this workflow once in ComfyUI with the Renest panel "
+                        f"loaded, then pack again — a finished run reports which pack every "
+                        f"node came from, and that answer beats anything we can read from "
+                        f"outside")
             continue
         if len(hits) > 1:
             gaps.append(f"Node type {cls} shows up in more than one custom_nodes folder "
@@ -1360,11 +1401,14 @@ def capture(workflow: dict, comfyui_dir: Path,
             # somebody you hand the nest to (pack.py says the same thing in the same
             # words). Reading this as "not in the nest" sends people re-downloading
             # models they already have.
-            gaps.append(f"{r['path']}: license unknown, so it's restricted by default and has "
-                        f"no origin_url. The bytes are in the nest and your own rebuilds work; "
-                        f"what they won't do is travel to anyone you hand this nest to, and "
-                        f"without an origin_url that person has nowhere to fetch it from. Add "
-                        f"the licence and origin_url before you pack.")
+            # Only advice the reader can act on: the panel has nowhere to type a licence
+            # and --auto has no flag for one, but --mine works on every route.
+            gaps.append(f"{r['path']}: license unknown, so it's restricted by default. The "
+                        f"bytes are in the nest and your own rebuilds work; what they won't "
+                        f"do is travel to anyone you hand this nest to — that person has to "
+                        f"download it from where it came from. If you made this file "
+                        f"yourself (a LoRA you trained, say), pack again with "
+                        f"--mine {r['path']} and it travels with a hand-off.")
         # Hand the hash we just measured to the packer as `expected_sha256`. It is a
         # cross-check, not a source — packing hashes the file again and refuses to
         # continue if it has changed since capture. The hash that reaches the nest is
@@ -1388,8 +1432,8 @@ def capture(workflow: dict, comfyui_dir: Path,
         # strength of that sentence would have been told the opposite of the truth.
         gaps.append(f"{u['path']} ({u['size_bytes']} bytes) is a big model this recipe "
                     f"never loads, so it is NOT packed — only the models the recipe "
-                    f"names travel with the nest. If you want it in there anyway, list "
-                    f"it under files[] in a pack-spec and pack with --spec")
+                    f"names travel with the nest. If you want it in there too, load it "
+                    f"in your workflow, run it once in ComfyUI and pack again")
 
     # A container cannot answer these about itself (it cannot even see its own image
     # name), so they have to come from outside. **The digest is not on this list** --

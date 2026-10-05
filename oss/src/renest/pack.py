@@ -50,6 +50,7 @@ from .envlock import (
     find_env_python,
     find_launchers,
     find_site_packages,
+    launcher_starts_python,
     dists_built_from_a_directory,
     lock_lines_for,
     unreinstallable_manager_parts,
@@ -1790,18 +1791,14 @@ def _build_manifest(
     # from format 2.3 on. **Write it if we have it, omit the block if we don't,
     # never write placeholder text** — a placeholder fails the schema's format
     # check (sha256: plus 64 hex characters) and invalidates the whole archive.
+    # When there is none, the blanket line is the invariant sweep's (I-5, at the end), so
+    # it is said once in the words `renest lint` uses -- this step used to say it too, in
+    # other words, and one pack printed the same fact twice (scan 2026-10-05).
     _said = len(warnings)
     _img = _base_image_for_manifest(spec.get("base_image"), warnings)
+    _image_said_precisely = len(warnings) > _said
     if _img is not None:
         manifest["base_image"] = _img
-    elif len(warnings) > _said:
-        pass  # it already said the precise thing; the blanket line below would muddy it
-    else:
-        warnings.append(
-            "We can't tell which container image this environment runs on, so that line is "
-            "left out of the manifest rather than filled with a placeholder. Rebuilding does "
-            "not need it — it is a record of where this ran, not a rebuild instruction."
-        )
     for k in ("name", "post_install", "api_deps", "creation", "entrypoint"):
         if k in spec:
             manifest[k] = spec[k]
@@ -2147,14 +2144,17 @@ def _build_manifest(
             rel = script.relative_to(root).as_posix()
         except ValueError:  # pragma: no cover - find_launchers only walks below root
             continue
-        if not any(p and (rel == p or rel.startswith(p + "/")) for p in packed_dirs):
+        if (not any(p and (rel == p or rel.startswith(p + "/")) for p in packed_dirs)
+                and launcher_starts_python(script)):
             stray.append(rel)
     if stray:
+        one = len(stray) == 1
         warnings.append(
-            f"{', '.join(stray)} looks like the script that starts this setup, and it "
-            f"sits outside everything the nest carries — so it won't come back with it. "
-            f"Move it inside the application folder, or list it under files[] in a "
-            f"pack-spec, if whoever restores this should get it too."
+            f"{', '.join(stray)} {'looks' if one else 'look'} like the script that starts "
+            f"this setup (it runs Python), and {'it sits' if one else 'they sit'} outside "
+            f"the folders this nest carries — so {'it' if one else 'they'} won't come back "
+            f"with it. If whoever restores this should get {'it' if one else 'them'} too, "
+            f"move {'it' if one else 'them'} into the application folder and pack again."
         )
 
     # -- python_lock: four tiers, in order (the format spec carries the full table) --
@@ -3003,13 +3003,16 @@ def _build_manifest(
     # at archive time through the same module, and I-1 is voiced above by the
     # family-split lock warnings, which carry family-specific advice the generic
     # record cannot (--pin-wheels helps a vendor +cuNNN build and is exactly
-    # wrong for a distro- or image-owned one).
+    # wrong for a distro- or image-owned one). I-5 (no base image) stays quiet when the
+    # manifest step already said the precise thing about a named image.
     from .invariants import check_all as _check_invariants
 
+    _voiced = ("workflow-ref-missing", "model-license-missing") + (
+        () if _image_said_precisely else ("base-image-missing",))
     warnings.extend(
         v.message
         for v in _check_invariants(manifest, "", (), workflow=_wf_json)
-        if v.code in ("workflow-ref-missing", "model-license-missing", "base-image-missing")
+        if v.code in _voiced
     )
 
     return manifest, inventory
@@ -3292,6 +3295,11 @@ def infer_spec_current_state(
     _fill_python_lock_and_version(spec, env_root, cdir, env_python)
 
     cui = spec.get("adapters", {}).get("comfyui")
+    # capture's "fill workflow_path in by hand" is for someone editing a pack-spec. Here
+    # there is nothing to fill: either the recipe goes inline (below) or there is no
+    # recipe at all, and what that person can do about it is said further down.
+    report["gaps"] = [g for g in report.get("gaps", []) if not g.startswith(
+        "The workflow file isn't inside the environment root")]
     if driving is None:
         spec.pop("adapters", None)
     elif cui is not None:
@@ -3301,9 +3309,6 @@ def infer_spec_current_state(
             # can follow.
             cui.pop("workflow_path", None)
             cui["workflow_inline"] = driving.workflow
-            # capture's "fill workflow_path in by hand" no longer applies: it is inline.
-            report["gaps"] = [g for g in report.get("gaps", []) if not g.startswith(
-                "The workflow file isn't inside the environment root")]
         if evidence.verified:
             cui["verified_run"] = {
                 "queue_completed_at": _iso_utc(evidence.most_recent.mtime),
@@ -3371,7 +3376,8 @@ def infer_spec_current_state(
             "This environment carries no picture with a recipe attached, so this nest packs "
             "with no verified run. Everything still restores exactly, byte for byte -- "
             "restoring it just will not try to re-render anything, since nothing here is "
-            "confirmed to have worked yet."
+            "confirmed to have worked yet. To have it carry one, run your workflow once in "
+            "ComfyUI and pack again."
         )
 
     return env_root, spec, report

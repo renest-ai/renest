@@ -1,8 +1,81 @@
 {
   "schema": "ai.renest.rules.known-components",
   "schema_version": "1.0",
-  "updated": "2026-08-22",
+  "updated": "2026-10-03",
   "provenance": "One text encoder or VAE sits inside dozens of unrelated bundles, so a content-hash lookup on a community site returns whichever bundle somebody uploaded first, and that stranger's permission flags then decide the licence of a file they did not publish. Each entry here is a file whose sha256 was traced back to the repository that actually publishes it, together with the licence tag that repository declares. Entries are added one misjudged case at a time; a mirror, a re-upload or a guess is not a source.",
-  "components": [],
-  "components_note": "Empty is the correct starting state, not an oversight: this table only ever releases, so an empty table releases nothing and every file keeps the deny-by-default answer. Entries arrive through the signed rules channel, which is the whole point of putting them here rather than in code - a shared part judged wrongly is fixed for everyone without a release. Each entry needs sha256, origin_url and spdx; the reader in licensing.py refuses any entry whose origin is not an authority it recognises or whose licence is not one we already pass on, so adding a row cannot widen either of those."
+  "components": [
+    {
+      "sha256": "97ed34fe0567e436200f2faee3939b88f2b5d99f8af2a4dc16532c4245c0ccb6",
+      "name": "FLUX.2 Klein 4B fp8 weights",
+      "origin_url": "https://huggingface.co/black-forest-labs/FLUX.2-klein-4b-fp8",
+      "path": "flux-2-klein-4b-fp8.safetensors",
+      "revision": "5b4408e59397a4a37ccb46afe426d8ed86379441",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-03 against the HF API, anonymous, not gated. Official Black Forest Labs repo; paths-info at commit 5b4408e5 gives lfs.oid equal to this sha256 (size 4070624520, file last commit c30fa39e). Repo cardData.license and tag license:apache-2.0. Same bytes as the FLUX.2 Klein starter pack uses."
+    },
+    {
+      "sha256": "6c671498573ac2f7a5501502ccce8d2b08ea6ca2f661c458e708f36b36edfc5a",
+      "name": "Qwen3-4B text encoder (single-file)",
+      "origin_url": "https://huggingface.co/Comfy-Org/z_image_turbo",
+      "path": "split_files/text_encoders/qwen_3_4b.safetensors",
+      "revision": "6fc90a3b1b653e935a0d175e260736de25b84df5",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-03 against the HF API, anonymous, not gated. Comfy-Org (the ComfyUI organisation) single-file repack; paths-info at commit 6fc90a3b gives lfs.oid equal to this sha256 (size 8044982048, file last commit 429cce00). The identical bytes are also published at Comfy-Org/vae-text-encorder-for-flux-klein-4b (the address Comfy-Org/flux2-klein-4B now 307-redirects to), commit 5f526678, file last commit 8556e4d8. Both Comfy-Org repos tag license:apache-2.0. Upstream Qwen/Qwen3-4B (commit 1cfa9a72) tags license:apache-2.0; it ships sharded safetensors, none byte-identical to this file. Civitai by-hash hits a stranger's Z Image Turbo upload (modelId 2168935), which is the 2026-08-09 misjudgement."
+    },
+    {
+      "sha256": "868fe7b343cc8f3a19dbcfcafbc3d5f888802be3f89bd81b65b3621a066ce8f3",
+      "name": "FLUX.2 VAE (single-file)",
+      "origin_url": "https://huggingface.co/Comfy-Org/vae-text-encorder-for-flux-klein-4b",
+      "path": "split_files/vae/flux2-vae.safetensors",
+      "revision": "5f526678002e43af5551dadb73ce2e8c91b43afe",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-03 against the HF API, anonymous, not gated. Comfy-Org/flux2-klein-4B 307-redirects to Comfy-Org/vae-text-encorder-for-flux-klein-4b; paths-info at commit 5f526678 gives lfs.oid equal to this sha256 (size 336211292, file last commit a9e4ca87). Repo tags license:apache-2.0. Upstream black-forest-labs/FLUX.2-klein-4B (commit e7b7dc27) tags license:apache-2.0 and ships the VAE in diffusers form, not byte-identical. Civitai by-hash hits a stranger's finetune bundle (MageTrail 2.8B, base MageFlow) whose permission flags forbid redistribution - that record does not speak for this file."
+    },
+    {
+      "sha256": "456f901338bd9eadbded3828b819109a9b68e8a525ca5cf8d0049a69fcfeca1e",
+      "name": "Wan 2.2 TI2V 5B fp16 weights (single-file)",
+      "origin_url": "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+      "path": "split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors",
+      "revision": "ee6f4a40737a995bf5818954cfce6d59443b0f04",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-03 against the HF API, anonymous, not gated. Comfy-Org repack; paths-info at commit ee6f4a40 gives lfs.oid equal to this sha256 (size 9999658848, file last commit 5ca2dfec). Repo tags license:apache-2.0. Upstream Wan-AI/Wan2.2-TI2V-5B (commit 921dbaf3) tags license:apache-2.0; it ships sharded safetensors, none byte-identical. Civitai by-hash hits a 'Wan Video 2.2' record whose base field 'Wan Video 2.2 TI2V-5B' is not on the base allow-list, so the file was judged as an add-on with an unknown base - it is the base model itself."
+    },
+    {
+      "sha256": "c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651204f68",
+      "name": "umT5-XXL text encoder fp8 scaled (single-file)",
+      "origin_url": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged",
+      "path": "split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "revision": "123acf1cc74bccbb9bfff8ac1ee72edc08c2341d",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-03 against the HF API, anonymous, not gated. Comfy-Org repack; paths-info at commit 123acf1c gives lfs.oid equal to this sha256 (size 6735906897, file last commit dfcea77b). Repo tags license:apache-2.0. Upstream google/umt5-xxl (commit 66cb9e7e) tags license:apache-2.0 and lists no safetensors; Wan-AI/Wan2.2-TI2V-5B, which ships this encoder, tags license:apache-2.0. Civitai by-hash hits a stranger's bundle (RedCraft ... H3 GS, base Wan Video) whose permission flags forbid redistribution - that record does not speak for this file."
+    },
+    {
+      "sha256": "e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156",
+      "name": "Wan 2.2 VAE (single-file)",
+      "origin_url": "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+      "path": "split_files/vae/wan2.2_vae.safetensors",
+      "revision": "ee6f4a40737a995bf5818954cfce6d59443b0f04",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-03 against the HF API, anonymous, not gated. Comfy-Org repack; paths-info at commit ee6f4a40 gives lfs.oid equal to this sha256 (size 1409400960, file last commit 8441d066). Repo tags license:apache-2.0. Upstream Wan-AI/Wan2.2-TI2V-5B (commit 921dbaf3) tags license:apache-2.0; no byte-identical file there. Recorded so the starter pack's VAE rests on its source, not on the packer's own statement."
+    },
+    {
+      "sha256": "2407613050b809ffdff18a4ac99af83ea6b95443ecebdf80e064a79c825574a6",
+      "name": "Z-Image-Turbo bf16 weights (single-file)",
+      "origin_url": "https://huggingface.co/Comfy-Org/z_image_turbo",
+      "path": "split_files/diffusion_models/z_image_turbo_bf16.safetensors",
+      "revision": "6fc90a3b1b653e935a0d175e260736de25b84df5",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-03 against the HF API, anonymous, not gated. Comfy-Org repack; paths-info at commit 6fc90a3b gives lfs.oid equal to this sha256 (size 12309866400, file last commit 4895ae2d). Repo tags license:apache-2.0. Upstream Tongyi-MAI/Z-Image-Turbo (commit f332072a) tags license:apache-2.0; it ships sharded safetensors, none byte-identical. Civitai by-hash hits a 'Z Image Turbo' record whose base 'ZImageTurbo' is not on the base allow-list, so the file was judged as an add-on with an unknown base - it is the base model itself."
+    },
+    {
+      "sha256": "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38",
+      "name": "FLUX.1 autoencoder ae.safetensors",
+      "origin_url": "https://huggingface.co/Comfy-Org/z_image_turbo",
+      "path": "split_files/vae/ae.safetensors",
+      "revision": "6fc90a3b1b653e935a0d175e260736de25b84df5",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-03 against the HF API, anonymous, not gated. Comfy-Org repack for Z-Image-Turbo; paths-info at commit 6fc90a3b gives lfs.oid equal to this sha256 (size 335304388, file last commit 93fae7d7). Repo tags license:apache-2.0; Tongyi-MAI/Z-Image-Turbo tags license:apache-2.0. This is the FLUX.1 autoencoder; the row rests on the Comfy-Org repo (FLUX.1-schnell is click-through gated, see the evidence page for that check). BFL's own github.com/black-forest-labs/flux README (main, read 2026-10-03, line 50) says the autoencoder weights are released under apache-2.0, dev repos included. Civitai by-hash hits a stranger's 'Flux vae.sft' record with base Flux.1 D."
+    }
+  ],
+  "components_note": "This table only ever releases, so an empty table releases nothing and every file keeps the deny-by-default answer. Entries arrive through the signed rules channel, which is the whole point of putting them here rather than in code - a shared part judged wrongly is fixed for everyone without a release. Each entry needs sha256, origin_url and spdx; the reader in licensing.py refuses any entry whose origin is not an authority it recognises or whose licence is not one we already pass on, so adding a row cannot widen either of those."
 }

@@ -304,8 +304,9 @@ def i5_base_image_absence_is_recorded(
         Violation(
             "warn",
             "base-image-missing",
-            "this nest doesn't say which container image it was built on. That is "
-            "allowed (a container often cannot see its own image name) and rebuilding "
+            "this nest doesn't say which container image it was built on — it couldn't "
+            "be told, so the line is left out rather than filled with a placeholder. That "
+            "is allowed (a container often cannot see its own image name) and rebuilding "
             "never needed it — but whoever rebuilds loses the one clue about the "
             "system layer underneath.",
         )

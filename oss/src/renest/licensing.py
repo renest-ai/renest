@@ -541,8 +541,12 @@ def stricter_of(spec_license: dict | None, verdict: LicenseVerdict | None,
 
     ``user_stated=False``: the spec block is the tool's own default (capture fills one
     in when nobody said anything), so nobody declared it and ``declared_by`` is left
-    out -- absent means unknown in the format (manifest spec §8). It never loosens
-    anything: the default-deny tier is applied exactly as before.
+    out -- absent means unknown in the format (manifest spec §8). With nothing found the
+    default-deny tier is applied exactly as before. With a verdict, the default block is
+    **not a party to stricter-wins** -- it is nobody's claim, so the lookup stands alone
+    (``declared_by: detected``), exactly as if no block had been written. Otherwise the
+    tool's own placeholder would end up stricter than writing nothing at all, and every
+    known file packed by ``pack --auto`` would stay gated (2026-10-03).
     """
     spec_block = dict(spec_license) if isinstance(spec_license, dict) else {}
     if verdict is None:
@@ -566,7 +570,7 @@ def stricter_of(spec_license: dict | None, verdict: LicenseVerdict | None,
     detected["declared_by"] = "detected"
     if verdict.gated_form != GatedForm.NONE:
         detected["gated_form"] = verdict.gated_form
-    if not spec_block:
+    if not spec_block or not user_stated:
         return detected
 
     spec_scope = spec_block.get("serving_scope", "gated")

@@ -2,6 +2,67 @@
 
 What changed for the person using `renest`. Dates are the release date.
 
+## 0.1.18 — 2026-10-05
+
+### `renest start` and the restore summary print the address to paste on RunPod and vast
+
+- On RunPod, clicking ComfyUI's link on the provider's console page is refused by
+  ComfyUI (HTTP 403); an address pasted into a new tab is not. `renest start` and
+  the restore's closing lines now print that address on its own line —
+  `https://<pod>-<port>.proxy.runpod.net` on RunPod, `http://<ip>:<port>` on vast
+  when that port is mapped. Only when the command listens on every interface;
+  anything we can't work out is not guessed.
+- After the address, `renest start` now also says to expose the port as an HTTP
+  port in your provider's panel, the same sentence the restore summary uses —
+  RunPod's proxy only answers on ports opened that way.
+
+### The official starter nests' models are recognised as redistributable
+
+- The bundled known-files table now lists the 8 model files of the three official
+  starter nests (FLUX.2 Klein 4B, Wan 2.2 TI2V 5B, Z-Image-Turbo), checked byte for
+  byte against their Apache-2.0 upstream releases. They no longer come out
+  restricted because a stranger re-uploaded the same bytes under a stricter label.
+
+### Known files packed with `pack --auto` are no longer always restricted
+
+- When nobody had said anything about a file's licence, the placeholder that
+  `renest` fills in ("restricted by default") was treated as a claim and outvoted
+  the lookup, so a file we recognise as redistributable still ended up restricted --
+  stricter than writing no licence at all. The placeholder now stands aside when the
+  lookup has an answer, and the entry is recorded as looked up.
+- Nothing gets looser where someone said otherwise: a licence you wrote or edited by
+  hand still wins when it is stricter, a file the lookup can't place stays
+  restricted, and a record that forbids passing it on still restricts it.
+
+### ComfyUI's own nodes are no longer reported as possibly missing a node pack
+
+- Packing the FLUX.2, Wan 2.2 and Z-Image starters warned about 14 nodes that
+  ship with ComfyUI (`KSamplerSelect`, `CFGGuider`, `SaveVideo`,
+  `ModelSamplingAuraFlow` and more): our hand-kept list of built-ins was behind.
+- Packing now reads the names of ComfyUI's own nodes from the ComfyUI program it
+  packs — both the old and the new way nodes are declared, from the program
+  folder on the desktop build — without running any of it. If that can't be read,
+  the old list still applies. A node that really comes from a node pack is still
+  reported.
+
+### Pack warnings now say something you can actually do
+
+- A model with an unknown licence: instead of "add the licence and origin_url"
+  (which neither the panel nor `--auto` lets you do), it says what restricted means
+  for a hand-off and, for a file you made yourself, to pack again with
+  `--mine PATH`.
+- A node we can't place: the advice now reads right whether you pack from the
+  Renest panel or from a terminal.
+- A big model your workflow doesn't load: load it in your workflow, run it once and
+  pack again — no more pack-spec instructions.
+- `pack --auto` on a setup that has never run: no more "fill workflow_path in by
+  hand"; it says to run your workflow once in ComfyUI and pack again.
+- A start script left outside the nest: only a script that mentions Python or
+  `main.py` is named now, not every `.sh`/`.bat` beside the environment, and the
+  advice is to move it into the application folder.
+- "We can't tell which container image this ran on" is said once per pack, not
+  twice.
+
 ## 0.1.17 — 2026-10-02
 
 ### After a restore, your workflow opens from ComfyUI's Workflows sidebar
