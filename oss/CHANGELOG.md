@@ -2,6 +2,14 @@
 
 What changed for the person using `renest`. Dates are the release date.
 
+## 0.1.19 — 2026-10-07
+
+### `renest watch` works again
+`renest watch -- <your training command>` crashed the moment it started
+(`TypeError: unhashable type: 'list'`) in 0.1.15 through 0.1.18, so the first step of
+packing a fine-tuning run could not be taken. It now runs your command and records what it
+loaded, as documented.
+
 ## 0.1.18 — 2026-10-05
 
 ### `renest start` and the restore summary print the address to paste on RunPod and vast

@@ -1,26 +1,25 @@
 # renest
 
-Renest saves a ComfyUI or fine-tuning setup that already worked on a rented GPU — the model files, custom nodes, exact package versions and workflow — and brings it back on another Linux GPU machine, every file checked against its SHA-256. It promises that the files and dependencies come back verified; whether the app then runs is tested on every restore and reported, not promised.
+![Run it once. Keep what it needed. — Renest captures a ComfyUI or fine-tuning run that worked and brings it back on the next GPU you rent.](https://renest.ai/assets/readme-banner.jpg)
 
-Renest is for the moment *after* something works: a ComfyUI workflow producing the image
-you wanted, or a fine-tuning run (kohya_ss, LLaMA-Factory) that finally trained. It captures
-what that success depended on — models, custom nodes pinned to their commits, the
-dependency lock, the workflow or training config, the system libraries the run loaded —
-into a single open-format archive called a **nest**. Later, on a fresh pod, another region
-or another cloud, `renest restore` checks the machine first, brings every file back and
-checks it against its SHA-256, reinstalls the locked package versions, then starts the app,
-runs the workflow once and tells you what passed and what didn't.
+Renest keeps a ComfyUI or fine-tuning setup (kohya_ss, LLaMA-Factory) that already worked on
+a rented GPU, and brings it back on the next Linux GPU machine you rent: the model files,
+custom nodes, exact package versions and workflow, every file checked against its SHA-256 on
+the way in. Then it starts the app on the new machine, runs the packed workflow once, and
+reports what passed and what didn't.
 
-System libraries belong to the machine, not the nest. A nest records which ones the run
-loaded and which image it ran on; on a machine that lacks one, the restore names it and the
-command to install it.
+It promises that the files and dependencies come back, checked. Whether the app then runs is
+tested on every restore and reported, not promised.
 
-It does not try to make unfamiliar things work. It reproduces what already did.
-
-- Website and docs: https://renest.ai · Quick start: https://renest.ai/docs/quick-start
-- ComfyUI panel: https://github.com/renest-ai/comfyui-renest
-- Format spec and the standalone `restore.sh` escape hatch: Apache-2.0. The CLI itself is
-  source-available, not open-source software (see `LICENSE-CLI`).
+- **Try it free, without a setup of your own:** a [starter nest](https://renest.ai/docs/starter-nests)
+  is a run we packed after it produced output. Take one with a free account, rent a GPU in
+  your own RunPod or vast.ai account, and restore it with one command.
+- **The Renest drive:** a hosted place for nests at <https://renest.ai>. A free account can
+  take starter nests and nests handed to it, and restore them on any machine. Keeping your own
+  nests in the drive, so they wait in storage instead of on a pod that bills by the hour, is
+  what the paid plans are for. Files several nests share are stored once.
+- **What we have measured:** <https://renest.ai/proof>, and the field reports at
+  <https://renest.ai/blog/topic/field-reports>.
 
 ## Install
 
@@ -29,127 +28,134 @@ uv tool install --upgrade renest
 renest --version
 ```
 
-`--upgrade` matters if you have installed `renest` before: plain
-`uv tool install renest` treats an existing install as done and leaves the old
-version in place, so re-running it looks like an upgrade but is not. `--upgrade`
-moves an old install to the latest and is a harmless no-op on a fresh machine.
+Python 3.11 or newer. No `uv` yet? `curl -LsSf https://astral.sh/uv/install.sh | sh`
+(only have pip? `pip install uv`). On a proxy network, export `HTTPS_PROXY` first: `uv` and
+`curl` read the proxy only from the environment.
 
-Python 3.11 or newer. No `uv` on this machine yet?
+`--upgrade` matters if you installed `renest` before: without it, `uv` treats the old version
+as done and leaves it in place. Use `uv` rather than `pip install renest`, because `pip`
+installs into whatever environment is active, and that is often the very environment you are
+about to capture; installing us there can move versions inside it. `uv tool install` keeps the
+command in its own environment, and restoring calls `uv` anyway.
 
-```
-curl -LsSf https://astral.sh/uv/install.sh | sh
-# Windows:  powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-# only have pip?  pip install uv
-```
+## Capture a run that worked
 
-On a proxy network, `uv` and `curl` read the proxy only from the environment,
-not from the OS/system proxy settings — so `export HTTPS_PROXY=http://host:port`
-(and `ALL_PROXY`) first, or the very first install step hangs with no error.
-
-That last one is safe even inside the environment you are about to capture: `uv`
-is a single binary with no dependencies of its own, so installing it moves
-nothing else. That is not true of installing this package with `pip`.
-
-**Why `uv` and not `pip`.** Two reasons, and the second one matters more than
-taste. First, rebuilding an environment is what this tool does, and it does it by
-calling `uv` — so does the escape hatch script inside every archive. A machine
-without `uv` can install this package and still not restore anything. Second,
-`pip install renest` installs into whatever environment is active, and that is
-often the very environment you are about to capture; resolving our dependencies
-there can move versions inside it. Protecting a setup that already works is the
-whole point of this tool, so we do not ask you to touch it to install us.
-`uv tool install` keeps the command in its own environment. `pip install renest`
-still works if you know your environment is separate.
-
-## Use
+Pack after the run produced output, on the machine where it did. The easiest way lets Renest
+find the run itself:
 
 ```
-renest pack --dir /path/to/comfyui --workflow workflow.json --out ./nests
-renest verify ./nests/<id>/manifest.json --dir /path/to/comfyui
-renest restore --manifest ./nests/<id>/manifest.json --dir /path/on/the/new/machine
-renest doctor
+renest pack --dir /workspace/run --auto --out ./nests
 ```
 
-In order: capture a setup that already worked, check a rebuild end to end, rebuild it
-somewhere else, and ask whether this machine can. `--dir` is always the environment root
-— the folder holding `ComfyUI/` — and every path is one you name, never one we guess.
+`--dir` is the environment root, the folder that holds `ComfyUI/`. `--auto` looks for a
+picture ComfyUI already produced (the recipe travels inside the picture) and uses the newest
+one to check the file list.
 
-`renest --help` lists the rest (`list`, `lint`, `export`, `serve`, `presign`,
-`update-rules`, `support`).
+To name the workflow yourself, `--workflow` takes it in **API format**: in ComfyUI, *Export
+(API)*. A workflow saved the ordinary way is refused with a note saying so. If you also want
+the ordinary one to open from ComfyUI's Workflows sidebar after a restore, pass it with
+`--workflow-ui`:
+
+```
+renest pack --dir /workspace/run --workflow workflow-api.json --dry-run
+renest pack --dir /workspace/run --workflow workflow-api.json --workflow-ui workflow.json --out ./nests
+```
+
+`--dry-run` prints what would be captured and writes nothing. For fine-tuning, name the
+framework and a small record of the training command that worked:
+
+```
+renest pack --dir /workspace/run --framework kohya --run-record run.json --out ./nests
+```
+
+If a package can't be installed on another machine as recorded (one that came from conda or
+the operating system, or `pip install -e .`), the pack says so, names it, and marks the nest.
+
+## Restore it somewhere else
+
+```
+renest restore --manifest ./nests/<id>/manifest.json --dir /workspace/run
+renest restore --grant grant.json --dir /workspace/run
+```
+
+The second form restores a nest from your drive, with a short-lived restore code from the web
+console. Before anything
+downloads, the restore checks the machine (GPU generation, driver, disk) and refuses one the
+packed build can't run on. Then it brings every file back and checks it, reinstalls the locked
+package versions without re-resolving them, starts the app, runs the packed workflow (or
+training config) once, and tells you which of three gates passed: the machine check, the app
+starting, and real output coming out.
+
+`renest doctor` asks whether this machine can restore at all. `renest --help` lists the rest.
+
+## What a nest holds, and what it doesn't
+
+A nest is one run that worked: the workflow or training config, the model files it used,
+each custom node's source pinned to its commit, the dependency lock, and a record of the
+machine it ran on (GPU, driver, the system libraries the run loaded).
+
+- **One run, one nest.** Fifteen workflows you care about are fifteen nests. The models they
+  share are stored once, both in a local `--out` folder and in the drive.
+- **Not in a nest:** finished outputs, ComfyUI's personal settings, and saved workflows the
+  run didn't use. They don't belong to any one run. Keep an ordinary backup of those.
+- **Not in a nest:** system libraries. They belong to the machine. The nest records which ones
+  the run loaded; on a machine that lacks one, the restore names it and the command to install
+  it.
+
+## Renest and Docker images
+
+An image is the right tool when you already know exactly what goes in and need the same start
+many times: deployment, serverless. Renest is for a setup that grew by hand on a rented
+machine until a run finally worked. Two things differ:
+
+- **You don't have to work out what you installed.** The nest is captured from the run that
+  worked: the files the workflow touched and the package versions that were actually there.
+- **A restore doesn't stop at "the files are there".** It runs the workflow once on the new
+  machine and reports whether the app started and output came out.
+
+Images still matter, and we publish one: `ghcr.io/renest-ai/nest-base`, a minimal Ubuntu
+22.04 image with the `renest` tool, `uv` and `sshd`, and deliberately no torch, ComfyUI or
+models, so nothing in it competes with what the nest brings. The image is the floor; the nest
+is what you carry onto it. Any Linux machine with an NVIDIA GPU works as well.
+Details: <https://renest.ai/docs/base-image>.
+
+## What it promises, and what it doesn't
+
+- Promised: the files and dependencies come back, each one checked against its SHA-256.
+- Tested and reported, not promised: that the app starts and produces output.
+- Not promised: an identical image on different hardware. The same GPU model and CPU brand
+  give the same file back; other hardware gives small differences.
+- Not offered: getting an unfamiliar setup working for the first time, or arbitrary Python
+  environments. Renest reproduces what already ran.
+
+What our own restores on rented GPUs show, and every kind of failure our stress tests have
+produced, is written up on <https://renest.ai/proof> with what changed because of each. When you don't need Renest at all: <https://renest.ai/answers/when-you-dont-need-renest>.
 
 ## The escape hatch
 
-Every nest ships with `restore.sh`, a plain shell script that rebuilds the
-archive using nothing but `curl`, `jq`, `sha256sum`, `uv` and `tar`. It does not
-import a single line of the rest of this project, and it is Apache-2.0 along with
-the format specification. If this project disappears tomorrow, your archives
-still open. That is the point of it, and it is why it is licensed the way it is.
+Every nest ships with `restore.sh`, a plain shell script that brings the files and locked
+dependencies back using nothing but `curl`, `jq`, `sha256sum`, `uv` and `tar`. It imports no
+code from this project, asks no server, and is Apache-2.0 together with the format
+specification (in `specs/`). If this project disappears, your nests still open. For that day,
+`renest presign` signs a download link for an object in your own bucket with keys that stay
+on your machine.
 
-The format specification lives in `specs/` inside the wheel. Anyone can write
-their own reader from it.
+## Licence: three layers
 
-One command exists purely for that day: `renest presign` signs a download link
-for an object in your own bucket, using keys that live on your machine. The
-escape hatch deliberately depends on nothing but `curl`, `jq`, `sha256sum`, `uv`
-and `tar` — it has no way to sign anything itself. So if this project is gone,
-the machine holding your storage keys is the one that can still hand out links,
-and that command is how.
+- **Apache-2.0, genuinely open:** the format specification and the escape hatch.
+- **GPL-3.0:** the ComfyUI plugin, which runs inside ComfyUI and follows that ecosystem.
+  It lives in its own repository.
+- **This command-line tool: source-available, not open-source software.** The code is
+  published in full: read it, audit it, modify it for your own use. The one thing not granted
+  is using it to run a hosted service that competes with ours. Any individual may use it on
+  their own data forever, unconditionally. Text: `LICENSE-CLI`.
 
-## Versions you will see
-
-Five separate things carry their own version, because they change at completely
-different speeds:
-
-- **the tool** — the version of `renest` itself
-- **the archive format** — printed by `renest --version`; an archive records
-  which one it was written with, and a newer tool reads every older one in the
-  same major version
-- **the environment fingerprint** — how a machine's shape is recorded
-- **the retrieval grant** — how a time-limited download permission is written
-- **the local API** — the endpoints under `/api/v1` that a desktop or web client
-  talks to
-
-Plus a set of compatibility facts kept on your machine as data — things like
-which driver version a given CUDA release needs. Those are refreshed with
-`renest update-rules` without installing a new version of the tool.
-
-Within one major version, things are added and never changed or removed. A
-breaking change moves to the next major version, and the old one keeps working
-alongside it.
-
-Note that the tool's own version number is still `0.x`, and the archive format's
-is not. That is deliberate, and the difference matters: the tool's command-line
-surface may still shift, but **an archive written today stays readable**. The
-format promise is the one your data depends on, and it does not move with the
-tool.
-
-## Licence — three layers, and they are not the same
-
-**Genuinely open (Apache-2.0):** the archive format specification and the escape
-hatch script. These are the proof that you can open your own archives even if we
-are gone. Use, modify and redistribute them freely, with no conditions from us.
-
-**The ComfyUI plugin (GPL-3.0):** it runs inside the ComfyUI process, so it
-follows that ecosystem's rules. It lives in its own repository.
-
-**This command-line tool — source-available, and *not* open-source software:**
-the code is published in full. Read it, audit it, modify it for your own use,
-publish your modifications. The one thing not granted is using it, or a
-derivative of it, to offer other people a hosted service that competes with ours.
-The text is in `LICENSE-CLI`, which ships with this package.
-
-It also carries a **permanent exemption**: any individual using it to pack, sign
-links for, restore or verify *their own data* may do so forever, unconditionally
-— this does not lapse because we shut down, because you have no account, or for
-any other reason.
-
-In one line: the format and the escape route are public, the tool's code is open
-to read, and the only thing not given away is running a competing hosted service
-on it.
+The archive format carries its own version, separate from the tool's `0.x`: an archive
+written today stays readable by later tools in the same major format version.
 
 ## Links
 
-- Source: <https://github.com/renest-ai/renest>
+- Website and docs: <https://renest.ai> · Quick start: <https://renest.ai/docs/quick-start>
 - ComfyUI plugin: <https://github.com/renest-ai/comfyui-renest>
 - Compatibility data: <https://github.com/renest-ai/renest-rules>
 

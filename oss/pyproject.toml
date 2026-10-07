@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "renest"
-version = "0.1.18"
+version = "0.1.19"
 readme = "README.md"
 description = "Save a ComfyUI or fine-tuning setup that already worked on a rented GPU - models, custom nodes, exact package versions, workflow - and bring it back on another Linux GPU machine, every file checked against its SHA-256."
 requires-python = ">=3.11"

@@ -166,15 +166,19 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         help="the folder that will be packed (default: the current one). The record "
              "is written inside it, where packing looks for it",
     )
+    # The dest must not be "command": the subcommand table already stores the
+    # subcommand name in args.command (cli.add_subparsers). Sharing the name turned
+    # it into a list and every `renest watch` crashed at the entry point.
     parser.add_argument(
-        "command",
+        "run_argv",
+        metavar="command",
         nargs=argparse.REMAINDER,
         help="the command to run, after a `--`: renest watch -- accelerate launch train.py",
     )
 
 
 def run_from_args(args: argparse.Namespace, emitter) -> int:
-    argv = list(args.command or [])
+    argv = list(args.run_argv or [])
     if argv and argv[0] == "--":
         argv = argv[1:]
     if not argv:

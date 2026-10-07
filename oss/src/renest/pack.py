@@ -38,7 +38,7 @@ from typing import Any, Callable
 
 import httpx
 
-from .capture import _parse_extra_model_paths, capture, is_tool_default_licence
+from .capture import _parse_extra_model_paths, capture, is_tool_default_licence, unknown_licence_gap
 from .envlock import (
     COMPILE_REQUIRED_VERDICT,
     LOCK_FROM_ENV_HEADER,
@@ -2892,6 +2892,12 @@ def _build_manifest(
                 ),
             ),
         }
+        # capture said "license unknown, restricted by default" before any lookup ran;
+        # once the lookup lets the file travel, that line is no longer true.
+        _lic = entry["license"]
+        if _lic.get("shareable") is True and _lic.get("serving_scope") != "gated":
+            _gap = unknown_licence_gap(fspec["path"])
+            warnings[:] = [w for w in warnings if w != _gap]
         # Format 2.2: does loading this file execute code? Reading the file
         # header answers it at zero cost. If we cannot tell, we leave the field
         # out — skip honestly, never invent (same discipline as the .so

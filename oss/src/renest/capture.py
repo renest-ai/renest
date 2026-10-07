@@ -49,6 +49,18 @@ INPUT_ASSET_LICENCE_DEFAULT: dict = {
 }
 
 
+def unknown_licence_gap(path: str) -> str:
+    """What capture says about a model file it could not vouch for. Pack withdraws
+    this exact line once its own lookup finds the file may travel (2026-10-07: four
+    models said "restricted by default" while the manifest wrote them open)."""
+    return (f"{path}: license unknown, so it's restricted by default. The "
+            f"bytes are in the nest and your own rebuilds work; what they won't "
+            f"do is travel to anyone you hand this nest to — that person has to "
+            f"download it from where it came from. If you made this file "
+            f"yourself (a LoRA you trained, say), pack again with "
+            f"--mine {path} and it travels with a hand-off.")
+
+
 def is_tool_default_licence(block: object) -> bool:
     """True when ``block`` is exactly one of capture's own defaults (nobody said so)."""
     return block in (UNKNOWN_LICENCE_DEFAULT, INPUT_ASSET_LICENCE_DEFAULT)
@@ -1403,12 +1415,7 @@ def capture(workflow: dict, comfyui_dir: Path,
             # models they already have.
             # Only advice the reader can act on: the panel has nowhere to type a licence
             # and --auto has no flag for one, but --mine works on every route.
-            gaps.append(f"{r['path']}: license unknown, so it's restricted by default. The "
-                        f"bytes are in the nest and your own rebuilds work; what they won't "
-                        f"do is travel to anyone you hand this nest to — that person has to "
-                        f"download it from where it came from. If you made this file "
-                        f"yourself (a LoRA you trained, say), pack again with "
-                        f"--mine {r['path']} and it travels with a hand-off.")
+            gaps.append(unknown_licence_gap(r['path']))
         # Hand the hash we just measured to the packer as `expected_sha256`. It is a
         # cross-check, not a source — packing hashes the file again and refuses to
         # continue if it has changed since capture. The hash that reaches the nest is

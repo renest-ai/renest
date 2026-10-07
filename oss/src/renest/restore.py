@@ -246,8 +246,12 @@ def sidebar_workflow_name(manifest: dict) -> str:
 def sidebar_safe_name(cand: object) -> str:
     """``cand`` cut down to what may name a file in the Workflows sidebar; ``""``
     when nothing usable is left. Pack writes ``workflow_name`` through this same
-    rule, so the name stored is the name the sidebar shows."""
-    return re.sub(r"[^A-Za-z0-9._ -]+", "-", str(cand or "")).strip(" .-")[:80]
+    rule, so the name stored is the name the sidebar shows.
+
+    Letters and digits of any script stay (a name typed in Chinese used to come out
+    with every character replaced). Anything else that could break a file name --
+    slashes, ``:*?"<>|``, control characters -- still becomes ``-``."""
+    return re.sub(r"[^\w. -]+", "-", str(cand or "")).strip(" .-")[:80]
 
 
 def first_saved_image(outputs: dict) -> dict | None:

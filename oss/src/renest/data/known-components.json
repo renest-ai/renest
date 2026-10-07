@@ -1,7 +1,7 @@
 {
   "schema": "ai.renest.rules.known-components",
   "schema_version": "1.0",
-  "updated": "2026-10-03",
+  "updated": "2026-10-07",
   "provenance": "One text encoder or VAE sits inside dozens of unrelated bundles, so a content-hash lookup on a community site returns whichever bundle somebody uploaded first, and that stranger's permission flags then decide the licence of a file they did not publish. Each entry here is a file whose sha256 was traced back to the repository that actually publishes it, together with the licence tag that repository declares. Entries are added one misjudged case at a time; a mirror, a re-upload or a guess is not a source.",
   "components": [
     {
@@ -75,6 +75,33 @@
       "revision": "6fc90a3b1b653e935a0d175e260736de25b84df5",
       "spdx": "apache-2.0",
       "provenance": "Checked 2026-10-03 against the HF API, anonymous, not gated. Comfy-Org repack for Z-Image-Turbo; paths-info at commit 6fc90a3b gives lfs.oid equal to this sha256 (size 335304388, file last commit 93fae7d7). Repo tags license:apache-2.0; Tongyi-MAI/Z-Image-Turbo tags license:apache-2.0. This is the FLUX.1 autoencoder; the row rests on the Comfy-Org repo (FLUX.1-schnell is click-through gated, see the evidence page for that check). BFL's own github.com/black-forest-labs/flux README (main, read 2026-10-03, line 50) says the autoencoder weights are released under apache-2.0, dev repos included. Civitai by-hash hits a stranger's 'Flux vae.sft' record with base Flux.1 D."
+    },
+    {
+      "sha256": "d2e566ecac3f164cb1a6b63dc7d868d6678c9affa49fbceb3abe4f9458f89c8a",
+      "name": "Wan Animate 2 distilled int8 weights (single-file)",
+      "origin_url": "https://huggingface.co/Comfy-Org/Wan-Animate-2",
+      "path": "diffusion_models/wan_animate_2_distill_int8_convrot.safetensors",
+      "revision": "e7181fe1896b7f2ce34120d1a3663413548240d7",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-07 against the HF API, anonymous, not gated. Comfy-Org repack for Wan Animate 2; paths-info at commit e7181fe1 gives lfs.oid equal to this sha256 (size 16653175528, file last commit 92456346). Repo tags license:apache-2.0 and its README names Wan-AI/Wan2.2-Animate-2-14B as the original, which tags license:apache-2.0 (commit 6e8f1973). Upstream ships bf16 weights (wan_animate_2/wan_animate_2_bf16_distillation.safetensors), none byte-identical; this int8 file is Comfy-Org's quantisation. No Civitai by-hash record."
+    },
+    {
+      "sha256": "64a7ef761bfccbadbaa3da77366aac4185a6c58fa5de5f589b42a65bcc21f161",
+      "name": "CLIP vision H (clip_vision_h.safetensors)",
+      "origin_url": "https://huggingface.co/Comfy-Org/Wan-Animate-2",
+      "path": "clip_vision/clip_vision_h.safetensors",
+      "revision": "e7181fe1896b7f2ce34120d1a3663413548240d7",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-07 against the HF API, anonymous, not gated. Comfy-Org repack for Wan Animate 2; paths-info at commit e7181fe1 gives lfs.oid equal to this sha256 (size 1264219396, file last commit 92456346). Repo tags license:apache-2.0 and its README names Wan-AI/Wan2.2-Animate-2-14B as the original, which tags license:apache-2.0 (commit 6e8f1973). The same bytes ship in Comfy-Org/Wan_2.1_ComfyUI_repackaged (split_files/clip_vision/clip_vision_h.safetensors, commit 123acf1c, license:apache-2.0). Civitai by-hash hits a stranger's 'Wan Video 2.1' record, so the file was judged as an add-on whose base licence could not be confirmed - it is a shared encoder."
+    },
+    {
+      "sha256": "1ab9a32cc2c740f6e39d80d367ce5dcc28db8c71b79b28670546b8973e9d75f9",
+      "name": "Wan 2.1 VAE bf16 (single-file)",
+      "origin_url": "https://huggingface.co/Comfy-Org/Wan-Animate-2",
+      "path": "vae/Wan2_1_VAE_bf16.safetensors",
+      "revision": "e7181fe1896b7f2ce34120d1a3663413548240d7",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-07 against the HF API, anonymous, not gated. Comfy-Org repack for Wan Animate 2; paths-info at commit e7181fe1 gives lfs.oid equal to this sha256 (size 253806278, file last commit 92456346). Repo tags license:apache-2.0 and its README names Wan-AI/Wan2.2-Animate-2-14B as the original, which tags license:apache-2.0 (commit 6e8f1973). Upstream ships the VAE as videomodel/Wan-AI/vae.pth, not byte-identical. No Civitai by-hash record."
     }
   ],
   "components_note": "This table only ever releases, so an empty table releases nothing and every file keeps the deny-by-default answer. Entries arrive through the signed rules channel, which is the whole point of putting them here rather than in code - a shared part judged wrongly is fixed for everyone without a release. Each entry needs sha256, origin_url and spdx; the reader in licensing.py refuses any entry whose origin is not an authority it recognises or whose licence is not one we already pass on, so adding a row cannot widen either of those."
