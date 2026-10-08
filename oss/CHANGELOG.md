@@ -2,6 +2,141 @@
 
 What changed for the person using `renest`. Dates are the release date.
 
+## 0.1.20 — 2026-10-07
+
+### Your Hugging Face token only goes to Hugging Face
+When a nest you were handed lists a download address for a restricted file, `renest`
+fetches it with your Hugging Face token so gated models work. That token used to go to
+whatever address the nest named, so a nest built to do so could collect it. A restricted
+file's download address now only receives your Hugging Face token if it is on
+huggingface.co (or hf.co) over https; any other address is fetched without it.
+
+### Model weights saved as `.pth` now travel in the nest
+SAM, upscaler and face-restoration models are often `.pth` files. `pack` used to treat
+every `.pth` as program code and leave it out, so a workflow that loaded one could not
+run after a restore. A `.pth` is now treated as code only inside a Python package folder
+(`site-packages`, a virtual environment, `bin`), which is the only place Python runs one.
+
+### Restore installs the tools it needs instead of only naming them
+When a nest needs git, a C compiler or git-lfs and the machine has none, `renest restore`
+now installs them itself (it asks first; `--yes` / `-y` answers for you). Without the
+rights to install, it prints the exact command to run and the command to carry on.
+Before, a missing git only showed up as "Installing dependencies failed", with the
+real reason buried in the evidence log.
+
+### `renest start` installs a missing C compiler and starts the app again
+When the app started by `renest start` fails because a C compiler (or git, or git-lfs)
+is missing -- triton's "Failed to find C compiler" the first time a model runs is the
+usual case -- `renest start` now installs it the same way a restore does (it asks
+first; `--yes` / `-y` answers for you) and then starts the app again. ComfyUI keeps
+running when one picture fails, so this happens without waiting for it to exit. Without
+the rights to install, it prints the exact command and leaves the app running.
+
+### `renest pack` downloads Git LFS files a node folder is missing
+A custom node cloned without its Git LFS files holds small placeholder files instead of
+the real ones. `renest pack` used to refuse the whole nest over them, even when every
+one was an example picture or video, and said the code would be missing, which was
+not true. Now it offers to run `git lfs pull` in that folder (it asks first; `--yes` /
+`-y` answers for you; it installs git-lfs first when that is missing and it has the
+rights). When the files cannot be downloaded, placeholders for pictures, videos and
+documents are left out of the nest, in one line that names them. Placeholders that
+could be code or model weights still stop the pack, with the reason and the exact
+command to run.
+
+### Clearer wording for packages that are compiled on the restore machine
+The note about a package pinned to a source archive used to read "ujson come(s) as
+source code and is built on this machine". It now reads "ujson is pinned to a source
+archive, so it is compiled on this machine" (and "... are pinned to source archives,
+so they are ..." for several).
+
+### The test render after a restore sends the workflow the way ComfyUI's editor does
+After a restore, `renest` re-runs the workflow that worked to prove the environment
+still produces something. On several community workflows that re-run failed although
+the restored environment was fine. Three causes, all fixed:
+- Some custom nodes write `NaN` into the recipe; the re-run refused to send it
+  ("Out of range float values are not JSON compliant", exit 50). It is now sent as written.
+- A list setting such as an empty LoRA list was sent bare, so ComfyUI took it for a
+  broken link, skipped every node that saves a picture, and reported success with
+  nothing written. Lists are now wrapped exactly as the editor wraps them.
+- Nodes that read their settings from the editor's copy of the workflow (KJNodes'
+  WidgetToString) stopped with "'NoneType' object is not subscriptable". When the
+  nest carries that copy, it now goes along with the re-run, as it does from the editor.
+
+### Nest names in other scripts stay readable in ComfyUI's Workflows list
+A nest named in Chinese (or any non-Latin script) no longer loses those characters in
+the sidebar workflow name. Slashes and characters that are unsafe in file names are
+still removed.
+
+### Packing on our template image records which image it was
+`pack --auto`, `pack --workflow` and the ComfyUI panel now write the nest's image line
+when the machine runs the Renest template image (it names its own version). Before, only
+a hand-written pack-spec could carry it, so a restore that hit a missing system library
+could not say which image to boot from. On any other image the line is still left out:
+a container cannot see its own image name, and we do not guess.
+
+### Restricted models get a download address whenever one can be proven
+A restricted model never travels to someone you hand a nest to; they fetch it from its
+source. `renest pack` now records that source by itself when it can be proven: the
+Hugging Face model cache, the known-file list, or an address your ComfyUI workflow gives
+for the file that Hugging Face confirms serves exactly these bytes. When there is none,
+the pack output names each such file and the line to add one by hand — the new
+`--download-url PATH=URL` flag.
+
+### No more "restricted by default" for models the known-file list clears
+`pack --auto` no longer keeps saying a model's licence is unknown after the known-file
+list has cleared it as shareable.
+
+
+### The machine check mentions CPU instructions the packing machine had and this one lacks
+`renest pack` now records which instruction-set extensions (AVX2, AVX-512, AMX and
+similar) the packing machine's CPU supports (nest format 2.13). Before a rebuild, if
+this machine's CPU lacks some of them, the machine check adds a note: most software
+runs fine without them, but a few prebuilt libraries assume them and can stop at
+start-up with "Illegal instruction" -- so if the app does not start, a machine whose
+CPU supports them is one thing to check. It is a note only: nothing is stopped and no
+exit code changes. Nests packed before this record nothing and get no note.
+
+### Packages installed from git or a direct download address travel inside the nest
+A package installed from a git repository (like `sam-2 @ git+https://github.com/...`) or
+from a direct download address (a GitHub release wheel, for example) now has the wheel
+that was installed in your environment stored inside the nest, with its original source
+kept beside it. A restore installs that wheel when it fits the machine's Python version
+and platform, so it no longer needs git, a compiler or that website to be up, and the
+step that installs missing git or a compiler skips such packages. When the wheel does
+not fit, the restore installs from the original source and says why. If the wheel cannot
+be obtained at pack time, packing still succeeds and says so in one line. Packages from
+PyPI and the official PyTorch download site are not stored. Nests made this way are
+format 2.13; older versions of Renest still restore them, from the original source.
+
+### Wheel-pinning messages no longer point at a switch that does nothing
+When pinning a vendor-only package (like `torch==2.4.1+cu124`) failed at pack time, or
+its pinned wheel had vanished at restore time, the message suggested turning on
+`wheels_archived` to store the wheel files inside the nest. That switch was never built —
+it only recorded a flag, and it is now retired. The messages now say plainly that wheels
+installed from a package index are not stored in the nest and a restore downloads them
+again, and offer steps that work today: make the
+index reachable and run `renest pack` again, or install the needed build by hand in the
+restored environment.
+
+### `renest pack` carries the models your run used, whichever node loaded them
+
+- A model named anywhere in the workflow now travels when that file is in your
+  models folder: inside a node's nested settings (rgthree's Power Lora Loader rows),
+  in a list, or as a `<lora:name:weight>` tag in the prompt text. These used to be
+  left out without a word. A LoRA row switched off in the node is named, not packed.
+- IPAdapter's unified loaders (`IPAdapterUnifiedLoader`, `…FaceID`, `…Community`)
+  take a preset name, not a file name. `pack` now asks the IPAdapter node pack itself
+  which files that preset means, by running your ComfyUI's own Python (found in
+  `.venv`, or given with `--env-python`) in a separate process, and packs them. When
+  it can't ask, it names the files those loaders read from instead.
+- New `--add PATH` (repeatable; a folder adds everything in it) packs a model on top
+  of the ones the workflow names, checked and restored like any other. When `pack`
+  finds a model this run may have used but could not confirm, it names the file and
+  prints the full command with `--add` filled in, ready to paste.
+- Every model file left behind is now named, whatever its size (smaller ones in one
+  line, all of them in `--json` under `unreferenced_model_files`), not only those over
+  128 MB.
+
 ## 0.1.19 — 2026-10-07
 
 ### `renest watch` works again

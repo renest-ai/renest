@@ -10,7 +10,9 @@ escape hatch ``restore.sh`` needs no change; going online is opt-in (`--pin-whee
 
 Restore side: a pinned URL that 404/410s falls back to plain `name==base_version`,
 **warned loudly, never silently** -- not the original bytes, and the CUDA variant may
-differ (pack with ``wheels_archived`` to resist that rot). An unresolvable pin fails
+differ (wheels installed from an index are not stored inside the nest -- only git and
+direct-URL installs are, see ``vendored.py`` -- so nothing resists that rot here).
+An unresolvable pin fails
 hard: a dead lock still passes a full sha256 check -- how a useless nest looks fine.
 """
 
@@ -346,9 +348,11 @@ def find_wheel_url(
             f"{name}=={version}+{local_label}: cannot reach the index {index_url} "
             f"({type(e).__name__})."
             f"\n  This build is not on PyPI and the vendor's index is out of reach —"
-            f" a rebuild would fail."
-            f"\n  Way out: pack the wheel file itself instead"
-            f" (python_lock.wheels_archived)."
+            f" a rebuild would fail. renest does not store index-installed wheels inside"
+            f" the nest: a restore downloads them again, so this one needs a direct"
+            f" address on that index."
+            f"\n  Way out: make sure this machine can reach {urlparse(index_url).netloc}"
+            f" (network, proxy, firewall) and run `renest pack` again."
         ) from e
 
     dist = name.replace("-", "_")
@@ -376,8 +380,11 @@ def find_wheel_url(
     raise WheelPinError(
         f"{name}=={version}+{local_label}: the index has no wheel matching "
         f"{python_tag} / {'|'.join(platform_tags)} ({index_url})."
-        f"\n  Way out: pack the wheel file itself instead"
-        f" (python_lock.wheels_archived)."
+        f"\n  renest does not store index-installed wheels inside the nest, so without an address"
+        f" on that index a restore cannot install this build."
+        f"\n  Way out: if this package came from somewhere other than that index,"
+        f" install a build the index does carry (or the plain PyPI version) and run"
+        f" `renest pack` again."
     )
 
 
@@ -595,8 +602,10 @@ def dead_wheel_fallback(
             f"{pin.name}: the wheel pinned at pack time is gone (HTTP {r.status_code}). "
             f"Falling back to the plain {pin.name}=={pin.base_version} to keep going — "
             f"these are not the same bytes as the machine you packed from (the CUDA build "
-            f"may differ). If it does not run, pack the nest again with wheels_archived "
-            f"turned on"
+            f"may differ). If it does not run: renest does not store index-installed "
+            f"wheels inside the nest, so the original bytes cannot come from it. Install the build you "
+            f"need by hand in the restored environment, or run `renest pack` again on a "
+            f"machine where it works — a fresh pack pins addresses that exist today"
         )
     if not replacements:
         return lock_text, warnings

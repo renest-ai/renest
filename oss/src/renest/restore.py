@@ -90,6 +90,9 @@ from .roots import (
     unsafe_relpath,
 )
 from .wheels import audit_lock_urls, dead_wheel_fallback, unfingerprinted_packages
+from . import systools
+from .envlock import canonical_name
+from .vendored import substitute_vendored, vendored_requirement, wheel_fit
 from .uvbin import uv_executable
 
 __all__ = [
@@ -125,13 +128,13 @@ __all__ = [
     "restore",
 ]
 
-FORMAT_VERSION = "2.12"
+FORMAT_VERSION = "2.13"
 # 2.0 made `code_deps[].role` mandatory and dropped 1.3, so that the consumer
 # side need not sniff /custom_nodes/ paths forever. 2.1 through 2.11 only added
 # fields or relaxed required ones, so **every 2.x package still reads** —
 # nothing here may tighten without a version bump.
 SUPPORTED_FORMAT_VERSIONS = ("2.0", "2.1", "2.2", "2.3", "2.4", "2.5", "2.6", "2.7", "2.8",
-                             "2.9", "2.10", "2.11", "2.12")
+                             "2.9", "2.10", "2.11", "2.12", "2.13")
 
 
 def _highest_version(versions: tuple[str, ...]) -> str:
@@ -159,6 +162,7 @@ EVIDENCE_REL = ".renest/evidence"  # one evidence dir per run
 ARCHIVES_REL = f"{STAGING_REL}/archives"
 LOCK_REL = f"{STAGING_REL}/requirements.lock"  # working copy uv sync reads from
 RECIPE_REL = f"{STAGING_REL}/workflow.json"  # the recipe of the run that worked
+WHEELS_REL = f"{STAGING_REL}/wheels"  # v2.13: the wheels a nest carries, under their own names
 START_REL = ".renest/start.json"  # facts `renest start` re-runs the entrypoint from
 
 #: Which adapters keep a re-runnable recipe, and where its bytes land. The core
@@ -1465,6 +1469,11 @@ class RestorePlan:
     #: which one the working run's copy came from and that file's fingerprint as
     #: installed. Read after the dependency install; absent = older nest, no-op.
     contested_modules: list[dict] = field(default_factory=list)
+    #: v2.13 `python_lock.vendored_wheels`, each entry with one extra key, `_unfit`:
+    #: None when the stored wheel fits this machine (it is then in `items` and gets
+    #: installed in place of the lock line), else why it does not (the lock line's
+    #: original source is used, and S3 says why). Absent field = older nest, no-op.
+    vendored_wheels: list[dict] = field(default_factory=list)
 
     @property
     def total_bytes(self) -> int:
@@ -1551,6 +1560,29 @@ class RestorePlan:
                 label="requirements.lock",
             )
         )
+        # Stored wheels (2.13): only the ones that fit this machine are fetched; the
+        # rest fall back to the lock line's original source, and S3 says why.
+        vendored: list[dict] = []
+        for _vw in (manifest["python_lock"].get("vendored_wheels") or []):
+            if not (isinstance(_vw, dict) and isinstance(_vw.get("wheel"), dict)
+                    and isinstance(_vw.get("filename"), str) and _vw.get("name")):
+                continue
+            _fn = _vw["filename"]
+            if "/" in _fn or "\\" in _fn or _fn.startswith("."):
+                continue  # a name that would land outside the wheel folder is not used
+            _unfit = wheel_fit(_fn, str(manifest["runtime"].get("python_version") or ""))
+            vendored.append({**_vw, "_unfit": _unfit})
+            if _unfit is None:
+                items.append(
+                    PlanItem(
+                        sha256=_vw["wheel"]["sha256"],
+                        size_bytes=int(_vw["wheel"]["size_bytes"]),
+                        dest=target / WHEELS_REL / _fn,
+                        sources=mk_sources(_vw["wheel"]),
+                        role="vendored_wheel",
+                        label=_fn,
+                    )
+                )
         # The recipe of the run that worked. **Packed into every nest and, until
         # 2026-08-11, never fetched back**: the download plan covered files[] and
         # the lockfile only, while this blob sits outside files[] under adapters.
@@ -1625,6 +1657,7 @@ class RestorePlan:
                 e for e in ((manifest.get("runtime") or {}).get("contested_modules") or [])
                 if isinstance(e, dict)
             ],
+            vendored_wheels=vendored,
         )
 
 
@@ -1652,6 +1685,12 @@ class LaunchHandle:
     #: call shape breaks them silently. Absent = do not look around (say the plain
     #: "no recipe" line); it must never become a guess.
     target: Path | None = None
+    #: The editor-form workflow the nest carries, if any. The re-run sends it the
+    #: way the editor does (``extra_pnginfo.workflow``): some nodes read their
+    #: settings from it at run time (KJNodes' WidgetToString), and without it they
+    #: stop with "'NoneType' object is not subscriptable" (seen 2026-10-07 on a
+    #: community workflow that rendered fine where it was packed).
+    editor_path: Path | None = None
 
 
 @dataclass
@@ -1990,7 +2029,14 @@ class ComfyUILauncher:
         base = f"http://127.0.0.1:{handle.port}"
         recipe = json.loads(handle.recipe_path.read_text(encoding="utf-8"))
         started = time.monotonic()
-        r = httpx.post(f"{base}/prompt", json={"prompt": recipe}, timeout=60.0)
+        from .comfy_prompt import HEADERS, prompt_body
+
+        editor = None
+        if handle.editor_path is not None:
+            with contextlib.suppress(OSError, ValueError):
+                editor = json.loads(handle.editor_path.read_text(encoding="utf-8"))
+        r = httpx.post(f"{base}/prompt", content=prompt_body(recipe, editor=editor),
+                       headers=HEADERS, timeout=60.0)
         if r.status_code != 200:
             raise RuntimeError(f"the app refused the recipe: HTTP {r.status_code} {r.text[:300]}")
         prompt_id = (r.json() or {}).get("prompt_id")
@@ -2145,6 +2191,14 @@ class RestoreOptions:
     oneshot_runner: Any = None  # injection seam (tests); None = default OneshotRunner
     client: httpx.Client | None = None
     event_sink: Callable[[dict], None] | None = None
+    #: ``--yes``: install missing system tools (git, a C compiler, git-lfs) and the
+    #: libraries the working run loaded, without asking, when this account may.
+    assume_yes: bool = False
+    #: The exact command the person ran, for "then run this again" lines. Empty when
+    #: restore() is called as a library; the wording then falls back to a description.
+    rerun_command: str = ""
+    #: Injection seam for the system-tools step (tests); None = this machine.
+    machine: Any = None
 
 
 @dataclass
@@ -2185,6 +2239,10 @@ class RestoreReport:
     #: Packages whose pinned wheel was withdrawn and that were installed from a
     #: generic build instead. Warn in plain language, never silently.
     wheel_fallbacks: list[str] = field(default_factory=list)
+    #: v2.13: per stored wheel (by package name), `nest` = installed from the wheel
+    #: the nest carries, `source` = it did not fit this machine (or did not land), so
+    #: the lock line's original source was used. Empty = the nest stores none.
+    vendored_wheels: dict = field(default_factory=dict)
     oneshot: dict | None = None  # kind=oneshot result (exit code / duration / log)
     #: Spots the user must point back at their own data after the rebuild
     redactions: list[str] = field(default_factory=list)
@@ -2273,6 +2331,7 @@ class RestoreReport:
             "blobs_cached": self.blobs_cached,
             "integrity_warnings": self.integrity_warnings,
             "wheel_fallbacks": self.wheel_fallbacks,
+            "vendored_wheels": self.vendored_wheels,
             "oneshot": self.oneshot,
             "redactions": self.redactions,
             "reanchored": self.reanchored,
@@ -2541,6 +2600,73 @@ def _resolve_grant(grant: Grant, client: httpx.Client) -> tuple[dict, dict[str, 
             f"Refusing — a code for one nest must never restore a different one.",
         )
     return manifest, dict(grant.blobmap)
+
+
+def _lock_without_fitting_wheels(lock_text: str, vendored: list[dict]) -> str:
+    """The lock with the line of every package whose stored wheel fits this machine
+    turned into a comment -- what the system-tools check should read (format 2.13).
+    Only the question "what will this install need from the machine" sees this copy."""
+    fitting = {canonical_name(str(v["name"])): f"# {v['name']}: installed from the wheel "
+               f"this nest carries" for v in vendored if v.get("_unfit") is None}
+    if not fitting or not lock_text:
+        return lock_text
+    return substitute_vendored(lock_text, fitting)[0]
+
+
+def _swap_in_vendored_wheels(
+    vendored: list[dict],
+    lock_text: str,
+    lock_path: Path,
+    target: Path,
+    narrate: Callable[..., None],
+    report: RestoreReport,
+) -> tuple[str, Path]:
+    """Point each stored wheel that fits this machine at its file in place of the lock
+    line (format 2.13); for one that does not, say why and leave the line alone.
+
+    Returns the lock text and path to install from. The nest's own lock is never
+    edited: a changed list goes to a separate working copy in staging.
+    """
+    if not vendored:
+        return lock_text, lock_path
+    swaps: dict[str, str] = {}
+    for vw in vendored:
+        name = str(vw["name"])
+        src = vw.get("source") or {}
+        said = (f"git+{src.get('url')}@{str(src.get('commit') or '')[:12]}"
+                if src.get("kind") == "git" else str(src.get("url") or "its lock line"))
+        wheel = target / WHEELS_REL / str(vw["filename"])
+        why = vw.get("_unfit")
+        if why is None and not wheel.is_file():
+            why = "its file did not land"
+        if why is None:
+            swaps[canonical_name(name)] = vendored_requirement(
+                name, wheel, vw["wheel"]["sha256"])
+            continue
+        report.vendored_wheels[name] = "source"
+        narrate(
+            f"{name}: not installing the wheel this nest carries ({vw['filename']}) -- "
+            f"{why}. Installing it from its original source instead: {said}.",
+            stage="S3", level="warning",
+        )
+    if not swaps:
+        return lock_text, lock_path
+    new_text, done = substitute_vendored(lock_text, swaps)
+    for vw in vendored:
+        if canonical_name(str(vw["name"])) in done:
+            report.vendored_wheels[str(vw["name"])] = "nest"
+    if not done:
+        return lock_text, lock_path
+    out = target / STAGING_REL / "requirements.vendored.lock"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(new_text, encoding="utf-8")
+    names = [str(vw["name"]) for vw in vendored if canonical_name(str(vw["name"])) in done]
+    narrate(
+        f"Installing {len(names)} package(s) from the wheels this nest carries "
+        f"({', '.join(names)}), so their original source is not contacted.",
+        stage="S3",
+    )
+    return new_text, out
 
 
 def _wheel_fallback(
@@ -4064,6 +4190,10 @@ def restore(
                 + " (--force goes ahead anyway; the report still records the truth)",
                 context={"checks": [c.name for c in rejects]},
             )
+        # The machine passed: now the programs it has to provide (git, a C compiler,
+        # git-lfs) and the libraries the working run loaded. Installed here when this
+        # account may, **before any model bytes move**.
+        s0_system_tools()
         # Only after the machine itself passed (or was forced past): can the
         # dependency lock resolve at all? Asked **before any model bytes move** —
         # the failure this catches used to surface at S3, after a 64 GB download
@@ -4076,6 +4206,86 @@ def restore(
             narrate("⚠ Failed checks are being ignored because you passed --force — the report still records them", stage="S0", level="warning")
             return "checks failed (forced through, recorded as such)"
         return f"machine check: {pr.overall}" + (f"; {_probe_note}" if _probe_note else "")
+
+    def _rerun() -> str:
+        return opts.rerun_command or "the same `renest restore` command"
+
+    def _say_to_terminal(text: str, level: str = "warning") -> None:
+        """Said to the person even through a pipe: a command they have to run is not
+        progress chatter, and a quiet pipe used to swallow it."""
+        em.clear_live()
+        for line in text.splitlines():
+            print(f"[restore] {sanitise_terminal(line)}", file=sys.stderr, flush=True)
+        em.log(text, stage="S0", level=level)
+
+    def s0_system_tools() -> None:
+        """git / a C compiler / git-lfs this nest will call on, plus the system
+        libraries the working run loaded that this machine lacks: install them when
+        this account may (root, or sudo without a password), after asking -- or
+        without asking under --yes. Otherwise print the one command to run and carry
+        on exactly as before. Needs are read only from what the nest records
+        (see :mod:`renest.systools` for what it cannot see)."""
+        assert plan is not None
+        lock_text = ""
+        lock_item = next((i for i in plan.items if i.role == "python_lock"), None)
+        if lock_item is not None:
+            try:
+                fetch_one(lock_item, stage="S0")
+                lock_text = lock_item.dest.read_text(encoding="utf-8", errors="replace")
+            except (NestFailure, OSError):
+                lock_text = ""  # S1 reports a fetch problem properly
+        # A package whose stored wheel fits this machine (2.13) is installed from that
+        # file: it needs neither git nor a compiler here, so its line must not ask for
+        # them. One that does not fit keeps its line -- it falls back to its source.
+        lock_text = _lock_without_fitting_wheels(lock_text, plan.vendored_wheels)
+        needs = systools.needs_from_nest(lock_text, mani)
+        measured = dict((plan.native_libs or {}).get("packages") or {})
+        lib_pkgs: dict[str, str] = {}
+        for lib in _libs_the_working_run_used_but_this_machine_lacks(report.precheck):
+            pkg = measured.get(lib) or _SO_PACKAGE.get(lib.lower())
+            if pkg and not _DRIVER_OWNED.match(lib):
+                lib_pkgs[lib] = pkg
+        machine = opts.machine or systools.Machine()
+        sp = systools.plan_system_install(needs, lib_packages=lib_pkgs, machine=machine)
+        if sp is None:
+            return
+        if opts.plan_only:
+            narrate(
+                "This machine is missing what this nest needs: "
+                + ", ".join([systools.LABEL[n.tool] for n in sp.missing] + list(sp.lib_packages))
+                + (f". A real run offers to install them: {sp.command()}" if sp.command() else ""),
+                stage="S0", level="warning",
+            )
+            return
+        from .syslibs import missing_native_libs, this_platform_tag
+
+        def _recheck(libs: list[str]) -> list[str]:
+            return missing_native_libs(libs, this_platform_tag())
+
+        outcome = systools.ensure_system_tools(
+            sp, assume_yes=opts.assume_yes, say=_say_to_terminal, rerun=_rerun(),
+            machine=machine, recheck_libs=_recheck,
+        )
+        if outcome.failed:
+            if opts.force:
+                narrate("⚠ Carrying on without them because you passed --force.",
+                        stage="S0", level="warning")
+                return
+            # S0 has no class for this, and a new one is a format change: it rides the
+            # stage's unclassified slot (exit 60), and the words carry the attribution.
+            raise NestFailure("S0", ErrorClass.UNKNOWN, outcome.message)
+
+    def _tool_failure(stage: str, klass: ErrorClass, text: str | None) -> NestFailure | None:
+        """A later failure that comes down to git / git-lfs / a C compiler not being
+        here: name the tool, the command that installs it, and the command to rerun."""
+        tool = systools.missing_tool_in(text)
+        if tool is None:
+            return None
+        return NestFailure(
+            stage, klass,
+            systools.missing_tool_advice(tool, _rerun(), opts.machine or systools.Machine()),
+            detail=(text or "")[-400:], context={"missing_tool": tool},
+        )
 
     def s0_lock_probe() -> str | None:
         """Ask uv whether this nest's dependency lock can resolve, before S1 moves
@@ -4644,6 +4854,10 @@ def restore(
             if post and _setup_allowed(f"{name}'s setup commands", post):
                 r = runner(["bash", "-c", post], cwd=str(install))
                 if r.returncode != 0:
+                    _tf = _tool_failure("S2", ErrorClass.UNKNOWN,
+                                        (r.stderr or "") + (r.stdout or ""))
+                    if _tf is not None:
+                        raise _tf
                     raise NestFailure(
                         "S2",
                         ErrorClass.UNKNOWN,
@@ -4849,6 +5063,12 @@ def restore(
                 stage="S3",
                 level="warning",
             )
+        # Stored wheels (2.13). Swapped in **after** the source gate above has judged
+        # the lock as written: a stored wheel is still code from that source. What
+        # changes is only that the install no longer needs git, a compiler or that
+        # host. The nest's own lock is never edited -- this is a working copy.
+        lock_text, lock_path = _swap_in_vendored_wheels(
+            plan.vendored_wheels, lock_text, lock_path, target, narrate, report)
         # idempotence: wipe first (uv hard-fails on a half-dead dir, --clear is a placebo)
         shutil.rmtree(venv, ignore_errors=True)
         r = runner([uv_executable(), "venv", "--python", plan.python_version, str(venv)])
@@ -4913,6 +5133,9 @@ def restore(
                 r = runner([uv_executable(), "pip", "sync", str(fallback)], env=_deps_env)
         if r.returncode != 0:
             stderr = r.stderr or ""
+            _tf = _tool_failure("S3", ErrorClass.SYSLIB_MISSING, stderr)
+            if _tf is not None:
+                raise _tf
             klass, why = classify_deps_failure(stderr)
             raise NestFailure("S3", klass, why, detail=stderr[-400:])
         # When installing is slow, **volunteer that this switch exists** — the
@@ -5212,6 +5435,7 @@ def restore(
                 # re-running that would report a false failure, not a broken rebuild.
                 if (mani.get("adapters") or {}).get("comfyui", {}).get("verified_run"):
                     handle_box["h"].recipe_path = _recipe
+                    handle_box["h"].editor_path = editor_workflow_file(mani, plan.target)
                 else:
                     handle_box["h"].unverified_note = (
                         "this nest carries no record of this recipe ever having produced "
@@ -5286,6 +5510,13 @@ def restore(
                     detail=_tail(_slog) if _slog.exists() else None,
                     context={"missing_system_library": _slib},
                 ) from e
+            # A program the machine has to provide (triton's "Failed to find C
+            # compiler", batch 22): name it, the command that installs it, the rerun.
+            _tf = _tool_failure("S5", ErrorClass.SYSLIB_MISSING, str(e)) or _tool_failure(
+                "S5", ErrorClass.SYSLIB_MISSING,
+                _tail(_slog, _SYSLIB_SCAN_CHARS) if _slog.exists() else None)
+            if _tf is not None:
+                raise _tf from e
             # Then the three named S5 causes. Without this the wrong GPU, an
             # out-of-memory and a raising node all came back as one unnamed
             # failure, which is the one report nobody can act on.
@@ -5671,6 +5902,14 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--force", action="store_true", help="carry on even if this machine failed the checks")
     parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="install the system tools this nest needs and this machine lacks (git, a C "
+             "compiler, git-lfs, and system libraries the working run loaded) without "
+             "asking. Only when this account is root or can use sudo without a password; "
+             "otherwise the command to run is printed",
+    )
+    parser.add_argument(
         "--resume", action=argparse.BooleanOptionalAction, default=True, help="carry on where a previous run stopped (on by default)"
     )
     parser.add_argument("--reverify", action="store_true", help="re-check files an earlier run already confirmed")
@@ -5779,6 +6018,8 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
         retry_rounds=args.retry_rounds,
         ssim_threshold=args.ssim_threshold,
         no_report=args.no_report,
+        assume_yes=getattr(args, "yes", False),
+        rerun_command=rerun_command_line(),
     )
     source = args.manifest if args.manifest else args.grant
     report = restore(source, args.dir, opts)
@@ -5809,6 +6050,17 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
     if rules_note:
         print(rules_note, file=sys.stderr)
     return report.exit_code
+
+
+def rerun_command_line(argv: list[str] | None = None) -> str:
+    """The command this restore was started with, as the person would type it again.
+    Read off the real argument list so it is the exact command, not a reconstruction
+    from parsed options; the program is always spelled ``renest``, because the first
+    word of argv can be a path into a tool folder or ``python -m``'s module path."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args:
+        return ""
+    return "renest " + shlex.join(args)
 
 
 def quiet_config(args: argparse.Namespace):

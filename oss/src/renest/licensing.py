@@ -373,6 +373,21 @@ def _origin_host(url: str) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+def known_component_row(sha256: str) -> dict | None:
+    """The known-files table row for this exact sha256, or None (never raises)."""
+    sha = (sha256 or "").strip().lower()
+    if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
+        return None
+    try:
+        table = load_rules(KNOWN_COMPONENTS)
+    except (KeyError, RuntimeError, OSError):
+        return None
+    for entry in table.get("components") or []:
+        if isinstance(entry, dict) and str(entry.get("sha256") or "").strip().lower() == sha:
+            return entry
+    return None
+
+
 def known_component(sha256: str) -> LicenseVerdict | None:
     """A shared part already traced back to the repository that publishes it.
 

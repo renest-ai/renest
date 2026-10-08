@@ -189,8 +189,10 @@ _FACTORY_MODEL_REF_MAP: dict[str, list[tuple[str, str]]] = {
     # mapped and are left out on purpose: `IPAdapterUnifiedLoader` takes a preset
     # string ("PLUS (high strength)") and resolves it to a file at run time, and
     # `IPAdapterInsightFaceLoader` takes a name from a fixed list in another folder.
-    # A workflow built on either still packs nothing -- naming them here with a made-up
-    # input would be worse than the gap, because it would look answered.
+    # Naming them here with a made-up input would be worse than the gap, because it would
+    # look answered. Since 2026-10-07 the unified loaders' preset is asked of the pack
+    # itself in a child process (renest.presets); without an interpreter to ask, the
+    # files they read from are named with the --add command that packs them.
     "IPAdapterModelLoader":   [("ipadapter_file", "ipadapter")],
     # Added after measuring, 2026-08-13: across 475 official workflow templates (101 of
     # which load a model), 31 load points named a class missing from this table -- and
@@ -926,6 +928,201 @@ def _scan_unreferenced_large_files(
     return out
 
 
+# ------------------------------------------- every model the workflow names --
+# The loader table above recognises the loaders it lists, by input name. A node pack
+# can name a model anywhere else: nested in a dict (rgthree's Power Lora Loader writes
+# ``{"on": true, "lora": "x.safetensors", "strength": 1}``), in a list, or as a
+# ``<lora:name:weight>`` tag inside the prompt text. None of those reach the table, and
+# until 2026-10-07 such a model left the nest without one line said. So every string
+# anywhere in the workflow is compared against the files really sitting in the model
+# folders -- no table, no guess about what the node does: we looked, and it is there.
+
+
+@dataclass(frozen=True)
+class _ModelFile:
+    abs: Path          # where the bytes are now
+    path: str          # where the nest records it: <prefix>/models/<folder>/<rel>
+    folder: str        # the folder under models/ ("loras"); "" for a file right in models/
+    rel: str           # path inside that folder, as a workflow names it ("mine/x.safetensors")
+
+
+@dataclass
+class _ModelIndex:
+    files: list[_ModelFile]
+    by_rel: dict[str, list[_ModelFile]]
+    by_name: dict[str, list[_ModelFile]]
+    by_stem_rel: dict[str, list[_ModelFile]]
+    by_stem_name: dict[str, list[_ModelFile]]
+
+
+def _model_index(comfyui_dir: Path, prefix: str, emp: dict[str, list[Path]]) -> _ModelIndex:
+    """Every file under models/ and under each folder extra_model_paths adds.
+
+    A file found through extra_model_paths is recorded under the standard folder of
+    its kind, like everything else capture follows there."""
+    files: list[_ModelFile] = []
+    models = comfyui_dir / "models"
+    seen: set[Path] = set()
+
+    def walk(base: Path, folder: str, recorded_under: str) -> None:
+        if not base.is_dir():
+            return
+        for p in sorted(base.rglob("*")):
+            try:
+                if not p.is_file() or p.name.startswith("."):
+                    continue
+                real = p.resolve()
+            except OSError:
+                continue
+            if real in seen:
+                continue
+            seen.add(real)
+            rel = p.relative_to(base).as_posix()
+            files.append(_ModelFile(abs=p, path=f"{recorded_under}/{rel}", folder=folder, rel=rel))
+
+    if models.is_dir():
+        for child in sorted(models.iterdir()):
+            if child.is_dir():
+                walk(child, child.name, f"{prefix}/models/{child.name}")
+            elif child.is_file() and not child.name.startswith("."):
+                seen.add(child.resolve())
+                files.append(_ModelFile(abs=child, path=f"{prefix}/models/{child.name}",
+                                        folder="", rel=child.name))
+    for key, dirs in sorted(emp.items()):
+        for d in dirs:
+            walk(d, key, f"{prefix}/models/{key}")
+    idx = _ModelIndex(files, {}, {}, {}, {})
+    for f in files:
+        name = f.rel.rsplit("/", 1)[-1]
+        idx.by_rel.setdefault(f.rel, []).append(f)
+        idx.by_name.setdefault(name, []).append(f)
+        if _names_weights(name):
+            idx.by_stem_rel.setdefault(f.rel.rsplit(".", 1)[0], []).append(f)
+            idx.by_stem_name.setdefault(name.rsplit(".", 1)[0], []).append(f)
+    return idx
+
+
+#: A dict switched off by the node's own toggle: rgthree writes ``"on": false`` for a
+#: LoRA row the user unticked, and that LoRA is not loaded by the run.
+_TOGGLE_KEYS = ("on", "enabled", "enable")
+
+
+def _string_leaves(inputs: dict) -> Iterable[tuple[tuple[str, ...], str, bool]]:
+    """(key path, string, switched off) for every string in a node's inputs, at any
+    depth. A top-level ``[node_id, slot]`` pair is a link between nodes, not a value."""
+    def walk(v: object, path: tuple[str, ...], off: bool):
+        if isinstance(v, str):
+            yield path, v, off
+        elif isinstance(v, dict):
+            off = off or any(v.get(k) is False for k in _TOGGLE_KEYS)
+            for k, x in v.items():
+                yield from walk(x, (*path, str(k)), off)
+        elif isinstance(v, list):
+            if (len(path) == 1 and len(v) == 2 and isinstance(v[0], str)
+                    and isinstance(v[1], int) and not isinstance(v[1], bool)):
+                return
+            for i, x in enumerate(v):
+                yield from walk(x, (*path, str(i)), off)
+    for k, v in inputs.items():
+        yield from walk(v, (str(k),), False)
+
+
+#: ``<lora:name:0.8>`` -- the prompt-text form several node packs load from (rgthree's
+#: Power Prompt among them), the name normally written without its suffix.
+_LORA_TAG = re.compile(r"<lora:([^:>]+)(?::[^>]*)?>", re.IGNORECASE)
+
+
+def _match_name(idx: _ModelIndex, value: str) -> tuple[str, list[_ModelFile]]:
+    """How a string names a model file, if it does:
+
+    ``exact``  -- the path inside a model folder, as ComfyUI lists it;
+    ``name``   -- the file name with its suffix, found in another subfolder;
+    ``stem``   -- the name without its suffix. Plain words land here too ("blurry"),
+                  so a stem match is only ever named, never packed on its own.
+    """
+    s = value.strip().replace("\\", "/")
+    if not s or len(s) > 512 or "\n" in s:
+        return "", []
+    parts = s.split("/")
+    foreign = s.startswith("/") or ".." in parts or (len(s) > 1 and s[1] == ":")
+    if not foreign and idx.by_rel.get(s):
+        return "exact", idx.by_rel[s]
+    name = parts[-1]
+    if "." in name and idx.by_name.get(name):
+        return ("stem" if foreign else "name"), idx.by_name[name]
+    stem = s.rsplit(".", 1)[0] if _names_weights(s) else s
+    hits = idx.by_stem_rel.get(stem) or idx.by_stem_name.get(stem.rsplit("/", 1)[-1])
+    return ("stem", hits) if hits else ("", [])
+
+
+def _lora_tag_hits(idx: _ModelIndex, name: str) -> list[_ModelFile]:
+    s = name.strip().replace("\\", "/")
+    in_loras = [f for f in idx.files if f.folder == "loras"]
+    for key in (lambda f: f.rel, lambda f: f.rel.rsplit(".", 1)[0],
+                lambda f: f.rel.rsplit("/", 1)[-1], lambda f: f.rel.rsplit("/", 1)[-1].rsplit(".", 1)[0]):
+        hits = [f for f in in_loras if key(f) == s]
+        if hits:
+            return hits
+    return []
+
+
+def _record_path(comfyui_dir: Path, prefix: str, emp: dict[str, list[Path]],
+                 found: Path) -> tuple[str, Path | None] | None:
+    """(path the nest records, where to read the bytes when that is elsewhere)."""
+    p = Path(found).resolve()
+    with contextlib.suppress(ValueError):
+        return f"{prefix}/{p.relative_to(comfyui_dir).as_posix()}", None
+    for key, dirs in emp.items():
+        for d in dirs:
+            with contextlib.suppress(ValueError):
+                return f"{prefix}/models/{key}/{p.relative_to(d).as_posix()}", p
+    return None
+
+
+def _files_under(comfyui_dir: Path, prefix: str, rel_dirs: Iterable[str],
+                 emp: dict[str, list[Path]]) -> list[tuple[str, int]]:
+    """(recorded path, size) of every file in these ComfyUI folders, extra_model_paths
+    folders of the same name included."""
+    out: list[tuple[str, int]] = []
+    for rd in rel_dirs:
+        bases = [(comfyui_dir / rd, f"{prefix}/{rd}")]
+        bases += [(d, f"{prefix}/{rd}") for d in emp.get(Path(rd).name, [])]
+        for base, rec in bases:
+            if not base.is_dir():
+                continue
+            for p in sorted(base.rglob("*")):
+                with contextlib.suppress(OSError):
+                    if p.is_file() and not p.name.startswith(".") and not p.name.startswith("put_"):
+                        out.append((f"{rec}/{p.relative_to(base).as_posix()}", p.stat().st_size))
+    return out
+
+
+def _standard_model_folders(program_root: Path) -> set[str]:
+    """The model folders ComfyUI registers itself, read off its folder_paths.py as text."""
+    try:
+        text = (program_root / "folder_paths.py").read_text(errors="ignore")
+    except OSError:
+        return set()
+    return set(re.findall(r"""os\.path\.join\(models_dir,\s*["']([^"']+)["']\)""", text))
+
+
+def _group_by_folder(items: list[dict]) -> list[tuple[str, list[dict]]]:
+    """Group by the first folder under models/ ("ComfyUI/models/LLM")."""
+    out: dict[str, list[dict]] = {}
+    for c in items:
+        parts = c["path"].split("/")
+        key = "/".join(parts[:3]) if len(parts) > 3 and parts[1] == "models" else ""
+        out.setdefault(key, []).append(c)
+    return list(out.items())
+
+
+def _human_size(n: int) -> str:
+    for unit, k in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+        if n >= k:
+            return f"{n / k:.1f} {unit}"
+    return f"{n} bytes"
+
+
 # ------------------------------------------------------------- main flow ----
 
 @dataclass
@@ -966,7 +1163,8 @@ def capture(workflow: dict, comfyui_dir: Path,
             workflow_relpath: str | None = None,
             large_file_bytes: int | None = None,
             hash_cache: Any = None,
-            program_dir: Path | None = None) -> CaptureResult:
+            program_dir: Path | None = None,
+            env_python: str | os.PathLike[str] | None = None) -> CaptureResult:
     """Static capture: a workflow (API-format dict) plus a ComfyUI directory ->
     a pack-spec draft and a report.
 
@@ -984,6 +1182,11 @@ def capture(workflow: dict, comfyui_dir: Path,
     supplies ComfyUI's identity and files, ``comfyui_dir`` still supplies the
     nodes and models, and the nest is an ordinary single-tree install. Left
     out, everything below behaves exactly as before.
+
+    ``env_python`` is the interpreter this ComfyUI runs on. It is used for one thing
+    only: asking a node pack which file a "pick a preset" loader means (see
+    :mod:`renest.presets`) -- in a child process, never in this one. Without it those
+    files are named with the command that packs them, not packed.
     """
     if large_file_bytes is None:
         large_file_bytes = LARGE_FILE_BYTES
@@ -1168,6 +1371,159 @@ def capture(workflow: dict, comfyui_dir: Path,
                     entry["integrity_warning"] = bad
                     gaps.append(f"Doesn't look like a complete file: {bad}")
                 recognized.append(entry)
+
+    # ---- 2d. every model named anywhere in the workflow (see _model_index) ----
+    dir_kind_by_folder = {Path(sd).name: kind for sd, kind in dir_kind.items()
+                          if sd.startswith("models/")}
+    index = _model_index(comfyui_dir, prefix, emp)
+    # Files this run may well have used that are NOT packed: named one by one, with
+    # the flag that packs them. {recorded path: {...}}
+    possibly: dict[str, dict] = {}
+
+    def _maybe(path: str, size: int, why: str) -> None:
+        if path not in seen_paths:
+            possibly.setdefault(path, {"path": path, "size_bytes": size, "why": why})
+
+    def _take(found: Path, rec: tuple[str, Path | None], base: dict, found_by: str) -> bool:
+        rel_to_root, source = rec
+        if rel_to_root in seen_paths:
+            return False
+        seen_paths.add(rel_to_root)
+        possibly.pop(rel_to_root, None)
+        sha, size = _sha256_file(found, hash_cache)
+        folder = rel_to_root.split("/")[2] if rel_to_root.count("/") >= 3 else ""
+        entry = {**base, "path": rel_to_root, "size_bytes": size, "sha256": sha,
+                 "kind": dir_kind_by_folder.get(folder) or folder or "other",
+                 "found_by": found_by}
+        if source is not None:
+            entry["source_abs"] = str(source)
+        bad = probe_model_bytes(found, size)
+        if bad:
+            entry["integrity_warning"] = bad
+            gaps.append(f"Doesn't look like a complete file: {bad}")
+        recognized.append(entry)
+        return True
+
+    covered = {(r["node_id"], r["input"]) for r in refs}
+    for node_id, node in sorted(nodes.items()):
+        cls = node["class_type"]
+        _inputs = node.get("inputs", {}) if isinstance(node.get("inputs"), dict) else {}
+        for keypath, value, off in _string_leaves(_inputs):
+            if len(keypath) == 1 and (node_id, keypath[0]) in covered:
+                continue        # the loader table answered this one, found or missing
+            if len(keypath) == 1 and cls not in BUILTIN_CLASSES and _names_weights(value):
+                continue        # 2b answered this one, found or said why not
+            where = ".".join(keypath)
+            base = {"node_id": node_id, "class_type": cls, "input": where, "value": value,
+                    "category": "found_by_name"}
+            for tag in _LORA_TAG.findall(value) if "<lora:" in value.lower() else ():
+                hits = _lora_tag_hits(index, tag)
+                if off or len(hits) > 1:
+                    for h in hits:
+                        _maybe(h.path, h.abs.stat().st_size,
+                               f"node {node_id} ({cls}) has <lora:{tag}> in {where}"
+                               + (", switched off" if off else
+                                  f", and {len(hits)} files carry that name"))
+                elif hits:
+                    rec = _record_path(comfyui_dir, prefix, emp, hits[0].abs)
+                    if rec and _take(hits[0].abs, rec, {**base, "value": tag}, "name_in_workflow"):
+                        gaps.append(f"{rec[0]} is packed because node {node_id} ({cls}) loads "
+                                    f"<lora:{tag}> from its {where} text")
+                else:
+                    gaps.append(f"Node {node_id} ({cls}) loads <lora:{tag}> from its {where} "
+                                f"text, but no LoRA of that name is under {prefix}/models/loras. "
+                                f"Without it the rebuilt recipe draws without that LoRA — put "
+                                f"the file back and pack again")
+            how, hits = _match_name(index, value)
+            if not hits:
+                if len(keypath) > 1 and _names_weights(value) and not off:
+                    gaps.append(f"Node {node_id} ({cls}) names {value} in {where}, but no such "
+                                f"file is under {prefix}/models. Without it the nest can't run "
+                                f"this recipe — put the file back and pack again")
+                continue
+            if off or how == "stem" or len(hits) > 1:
+                for h in hits:
+                    why = (f"node {node_id} ({cls}) names it in {where}, switched off"
+                           if off else
+                           f"node {node_id} ({cls}) has {value!r} in {where}"
+                           + (f", and {len(hits)} files match that name" if len(hits) > 1
+                              else ", which matches this file's name without its ending"))
+                    _maybe(h.path, h.abs.stat().st_size, why)
+                continue
+            h = hits[0]
+            rec = _record_path(comfyui_dir, prefix, emp, h.abs)
+            if rec and _take(h.abs, rec, base, "name_in_workflow"):
+                gaps.append(f"{rec[0]} is packed because node {node_id} ({cls}) names it in "
+                            f"{where} — found by its file name in your models folder")
+
+    # ---- 2e. loaders that take a preset name, not a file name ----
+    # Asked of the node pack itself, in this ComfyUI's own interpreter (renest.presets).
+    from .presets import PRESET_RESOLVERS, ask_pack
+
+    _node_dirs_all = _scan_custom_node_dirs(comfyui_dir)
+    by_pack: dict[Path | None, list[tuple[str, str, Any, str]]] = {}
+    for node_id, node in sorted(nodes.items()):
+        res = PRESET_RESOLVERS.get(node["class_type"])
+        _inputs = node.get("inputs", {}) if isinstance(node.get("inputs"), dict) else {}
+        preset = _inputs.get(res.input) if res else None
+        if res is None or not isinstance(preset, str) or not preset:
+            continue
+        owner = next((d for d in _node_dirs_all if _dir_defines_class(d, node["class_type"])),
+                     None)
+        by_pack.setdefault(owner, []).append((node_id, node["class_type"], res, preset))
+    _emp_yaml_paths = [comfyui_dir / y for y in ("extra_model_paths.yaml", "extra_model_paths.yml")
+                       if _names_a_file(comfyui_dir / y)]
+    for owner, items in by_pack.items():
+        if owner is None:
+            answers = [None] * len(items)
+            why_not = "no folder under custom_nodes/ defines that node"
+        else:
+            answers = ask_pack(env_python, program_dir or comfyui_dir, comfyui_dir, owner,
+                               [(res, preset) for _, _, res, preset in items],
+                               extra_model_paths=_emp_yaml_paths)
+            why_not = ""
+        for (node_id, cls, res, preset), ans in zip(items, answers):
+            reason = why_not or (ans.error if ans is not None else "")
+            if ans is not None and not reason and not ans.files:
+                reason = ("the node pack answered, but none of the files it would load is in "
+                          "this install")
+            if reason:
+                for rec_path, size in _files_under(comfyui_dir, prefix, res.reads_from, emp):
+                    _maybe(rec_path, size, f"node {node_id} ({cls}) picks from this folder by "
+                                           f"its preset {preset!r}")
+                gaps.append(
+                    f"Node {node_id} ({cls}) picks its model by the preset {preset!r}, not by a "
+                    f"file name, and we could not ask the node pack which files that means: "
+                    f"{reason}. It reads from {', '.join(f'{prefix}/{d}' for d in res.reads_from)}; "
+                    f"those files are listed below as not packed — add the ones this run "
+                    f"used with --add")
+                continue
+            took: list[str] = []
+            base = {"node_id": node_id, "class_type": cls, "input": res.input, "value": preset,
+                    "category": "preset"}
+            for f in ans.files:
+                rec = _record_path(comfyui_dir, prefix, emp, Path(f))
+                if rec is None:
+                    gaps.append(f"Node {node_id} ({cls}) loads {f} for the preset {preset!r}, "
+                                f"which is outside {prefix} and every extra_model_paths folder, "
+                                f"so it is NOT packed")
+                    continue
+                if _take(Path(f), rec, base, "preset_lookup"):
+                    took.append(rec[0])
+            if took:
+                gaps.append(f"Node {node_id} ({cls}) picks its model by the preset {preset!r}; "
+                            f"the node pack says that means {', '.join(took)}, so "
+                            f"{'they are' if len(took) > 1 else 'it is'} packed")
+            alts = {tuple(ans.by_call[i]) for i in res.alternatives
+                    if i < len(ans.by_call) and ans.by_call[i]}
+            if res.ambiguity and len(alts) > 1:
+                gaps.append(f"Node {node_id} ({cls}): {res.ambiguity}")
+            if res.flag_reads_from is not None:
+                pos, folder = res.flag_reads_from
+                if any(len(fl) > pos and fl[pos] for fl in ans.flags):
+                    for rec_path, size in _files_under(comfyui_dir, prefix, (folder,), emp):
+                        _maybe(rec_path, size, f"node {node_id} ({cls}) also loads from "
+                                               f"{prefix}/{folder} for the preset {preset!r}")
 
     for m in missing:
         # ComfyUI's picker writes the folder it read from into the value itself
@@ -1420,18 +1776,53 @@ def capture(workflow: dict, comfyui_dir: Path,
         # cross-check, not a source — packing hashes the file again and refuses to
         # continue if it has changed since capture. The hash that reaches the nest is
         # always the one packing measured, so no hash is ever "filled in by hand".
-        files.append({"path": r["path"], "license": lic, "kind": r["kind"],
-                      "expected_sha256": r["sha256"]})
+        fentry = {"path": r["path"], "license": lic, "kind": r["kind"],
+                  "expected_sha256": r["sha256"]}
+        if r.get("source_abs"):
+            # Found in an extra_model_paths folder, possibly in a subfolder there: read
+            # the bytes where they are, land them at the standard path.
+            fentry["source_path"] = r["source_abs"]
+        files.append(fentry)
 
     if workflow_relpath is None:
         workflow_relpath = "<fill in the path to the workflow JSON you ran, relative to the environment root>"
         gaps.append("The workflow file isn't inside the environment root (or no path was "
                     "given) — fill workflow_path in by hand")
 
-    # ---- 6. advisory: big models are installed that this workflow never uses
-    #         (informs, never blocks) ----
-    unreferenced_large = _scan_unreferenced_large_files(
-        comfyui_dir, prefix, seen_paths, large_file_bytes)
+    # ---- 6. models this run may use that are NOT packed, and every other model left
+    #         behind -- named, never silently dropped, never packed on a guess ----
+    # A folder under models/ that ComfyUI itself never reads is read by some node pack.
+    # When this workflow uses node packs, what sits there may be part of the run.
+    if unknown_classes:
+        std = _standard_model_folders(program_dir or comfyui_dir) | {
+            Path(sd).name for sds, _ in CATEGORIES.values() for sd in sds}
+        for f in index.files:
+            if f.folder and f.folder not in std and not f.rel.startswith("put_"):
+                with contextlib.suppress(OSError):
+                    _maybe(f.path, f.abs.stat().st_size,
+                           f"it is in models/{f.folder}, a folder ComfyUI itself never reads; "
+                           f"a node pack this workflow uses may load it from there")
+    possibly_used = sorted(possibly.values(), key=lambda c: c["path"])
+    for _folder, _group in _group_by_folder(possibly_used):
+        if len(_group) > 3 and _folder:
+            total = sum(c["size_bytes"] for c in _group)
+            gaps.append(f"{_folder}/ holds {len(_group)} files ({_human_size(total)}) this run may "
+                        f"use that are NOT packed: {_group[0]['why']}. If this run needs them, "
+                        f"pack again with --add {_folder}")
+            continue
+        for c in _group:
+            gaps.append(f"{c['path']} ({_human_size(c['size_bytes'])}) may be used by this run "
+                        f"but is NOT packed: {c['why']}. If this run needs it, pack again with "
+                        f"--add {c['path']}")
+
+    unreferenced_models: list[dict] = []
+    for f in index.files:
+        if f.path in seen_paths or f.path in possibly or not _names_weights(f.rel):
+            continue
+        with contextlib.suppress(OSError):
+            unreferenced_models.append({"path": f.path, "size_bytes": f.abs.stat().st_size})
+    unreferenced_large = [u for u in _scan_unreferenced_large_files(
+        comfyui_dir, prefix, seen_paths, large_file_bytes) if u["path"] not in possibly]
     for u in unreferenced_large:
         # The old wording here said "we pack the whole folder either way". It was
         # simply untrue -- this scan only looks under models/, and models/ is on the
@@ -1439,8 +1830,15 @@ def capture(workflow: dict, comfyui_dir: Path,
         # strength of that sentence would have been told the opposite of the truth.
         gaps.append(f"{u['path']} ({u['size_bytes']} bytes) is a big model this recipe "
                     f"never loads, so it is NOT packed — only the models the recipe "
-                    f"names travel with the nest. If you want it in there too, load it "
-                    f"in your workflow, run it once in ComfyUI and pack again")
+                    f"names travel with the nest. If you want it in there too, pack again "
+                    f"with --add {u['path']}")
+    _big = {u["path"] for u in unreferenced_large}
+    _small = [u for u in unreferenced_models if u["path"] not in _big]
+    if _small:
+        shown = ", ".join(u["path"] for u in _small[:5]) + ("…" if len(_small) > 5 else "")
+        gaps.append(f"{len(_small)} smaller model file(s) this recipe never names are NOT packed "
+                    f"({shown}). If this run loads any of them, pack again with --add <path> "
+                    f"for each; `--json` lists them all under unreferenced_model_files")
 
     # A container cannot answer these about itself (it cannot even see its own image
     # name), so they have to come from outside. **The digest is not on this list** --
@@ -1502,6 +1900,9 @@ def capture(workflow: dict, comfyui_dir: Path,
         },
         "unrecognized_string_inputs": unrecognized_inputs,
         "unreferenced_large_files": unreferenced_large,
+        # Every model file left behind, any size; and the ones this run may use.
+        "unreferenced_model_files": unreferenced_models,
+        "possibly_used_files": possibly_used,
         "needs_manual_fill": needs_manual,
         "gaps": gaps,
     }

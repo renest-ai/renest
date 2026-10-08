@@ -1,4 +1,4 @@
-# manifest v2.12 · Nest manifest specification
+# manifest v2.13 · Nest manifest specification
 
 <!-- Version tripwire: the line "current version **x.y**" below is parsed by
      oss/tests/consistency/test_format_version_pinned.py and must agree with
@@ -6,11 +6,11 @@
      top line of the change log. This is the fifth place the version appears --
      the prose is not allowed to drift from the other four. -->
 
-> Status: **current version 2.12** (2026-09-13). Any field change is a format
+> Status: **current version 2.13** (2026-10-07). Any field change is a format
 > change: bump the version and update `manifest.schema.json`, `restore.sh` and
 > `renest lint` in the same change.
 >
-> **Readable versions**: `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` / `2.10` / `2.11` / `2.12`, plus **any future minor
+> **Readable versions**: `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` / `2.10` / `2.11` / `2.12` / `2.13`, plus **any future minor
 > version of the same major** (a reader meeting a newer minor number warns and
 > continues; it does not reject the nest -- see §2).
 > **1.x is refused outright** (a one-time clean break taken while there were no
@@ -27,7 +27,9 @@
 > 2.10 in §17 (how much system memory the packing machine could use),
 > 2.11 in §18 (where a recorded claim came from, and whether anyone ever saw
 > this nest work), 2.12 in §19 (what each custom node's own compiled files
-> need the machine to provide).
+> need the machine to provide), 2.13 in §20 (which instruction-set extensions
+> the packing machine's CPU had, and the wheels of packages installed from a git
+> repository or a direct download address travelling inside the nest).
 > **Every 2.x nest still reads**: no version after 2.0 tightened anything.
 >
 > This document is the **frozen description** of the format: written field by
@@ -73,7 +75,7 @@ have restored perfectly into a brick.
 
 | Field | Required | Type | One line |
 |---|---|---|---|
-| `format_version` | ✔ | enum `2.0` … `2.12` | Format version (the schema enum is the only source of truth) |
+| `format_version` | ✔ | enum `2.0` … `2.13` | Format version (the schema enum is the only source of truth) |
 | `id` | ✔ | string (ULID) | Nest identifier, 26-character Crockford base32 |
 | `created_at` | ✔ | date-time | When it was packed |
 | `name` | | string ≤120 | Human-chosen name |
@@ -117,7 +119,7 @@ of truth.
 
 ## 2. Identity and metadata
 
-### `format_version` — enum `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` / `2.10` / `2.11` / `2.12` `[schema]`
+### `format_version` — enum `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` / `2.10` / `2.11` / `2.12` / `2.13` `[schema]`
 
 **The `enum` in the schema is the only source of truth.** Everywhere else,
 including this document, is a restatement. Changing the version means changing
@@ -229,6 +231,7 @@ Bare-metal and container-less packing: see §9. Since 2.3 that case has an answe
 | `contested_modules` | | **Added in 2.8**: for every folder several installed packages write into, which package the working run's copy came from |
 | `system_memory` | | **Added in 2.10**: how much system memory the machine that packed the nest could use, so a rebuild onto a lower ceiling can warn before it loads |
 | `node_native_libs` | | **Added in 2.12**: machine libraries each custom node package's own compiled files declare they need -- covers nodes the working run never loaded. Warn only, never refuse |
+| `cpu_flags` | | **Added in 2.13**: which instruction-set extensions (AVX2, AVX-512, AMX, ...) the packing machine's CPU had. A reader may only mention a gap as something to check, never refuse |
 
 `gpu_model` is explicitly marked as not a rebuild constraint -- rebuilding on a
 different card is legitimate.
@@ -274,6 +277,26 @@ consumer **may only warn on it, never refuse** -- the user's workflow may never
 load these nodes at all. Absent means nothing was collected (nest older than
 2.12, no compiled files, or nothing the machine must provide), never "needs
 none".
+
+**`cpu_flags` (2.13)** -- `["avx", "avx2", "avx512f", …]`, sorted, in the
+lower-case spelling of the `flags` line of `/proc/cpuinfo`. Which
+instruction-set extensions the packing machine's CPU had. Measured 2026-10-07:
+a custom node's dependency shipped a prebuilt library compiled to assume
+AVX-512; packed on an Intel CPU that has it and restored onto an AMD CPU that
+does not, every file verified and the application stopped at start-up with
+`Illegal instruction`, with nothing pointing at the cause. **Only the
+extensions compiled code can be built to assume are recorded** (the x86-64
+levels compilers target -- SSE4.x, POPCNT, AVX, AVX2, FMA, F16C, BMI, MOVBE,
+AVX-512 -- plus AMX, AVX-VNNI and the crypto/GF extensions); the rest of the
+line describes the kernel and the hypervisor and differs between two virtual
+machines on the same chip, so comparing it would put a note on nearly every
+rented machine. A reader compares whatever names are present. **A gap is a
+lead, not a verdict**: most software runs fine without these instructions,
+and only a few prebuilt libraries assume them, so a consumer may only mention
+it, in neutral terms, as one thing to check if the application does not
+start -- never refuse, never change an exit code over it, never phrase it as
+a prediction. Written only on Intel/AMD Linux machines; absent means not
+recorded, and a reader says nothing.
 
 **`contested_modules` (2.8)** -- an array; each entry describes one top-level
 module that several packages in the lock all write into:
@@ -581,7 +604,8 @@ installer this project standardises on.
 | `lockfile` | | blob | The lockfile itself (§7). **Optional since 2.3** |
 | `lockfile_path` | | relpath | **Added in 2.6**: where that lockfile sat in the environment |
 | `pinned_wheel_urls` | | integer ≥0 | **How many packages are pinned to a direct wheel URL** (a count, not a list) |
-| `wheels_archived` | | boolean (default false) | true = the wheels are archived too (resists link rot, costs size) |
+| `wheels_archived` | | boolean (default false) | **Retired in 2.13; it never stored anything.** Packers up to 2.12 wrote `true` when asked, but no wheel file ever travelled with it and nothing read it. Readers ignore it; packers from 2.13 on do not write it. The wheels a nest really carries are in `vendored_wheels` |
+| `vendored_wheels` | | array | **Added in 2.13**: the installed wheel of each package that came from a git repository or a direct download address off the public index and the PyTorch download site, stored as a blob with its original source kept beside it (§20) |
 | `local_version_sources` | | object | **Added in 2.11**: which index each still-bare vendor-only pin came from (§18) |
 | `hosts` | | array of string | **Added in 2.2**: which hosts installing dependencies will contact. **Widened in 2.11**: it also covers the indexes named by `local_version_sources` |
 
@@ -689,6 +713,18 @@ field records which index that package was installed from, per package.
   dependency-confusion attacks are made of, and the installer's refusal to do it
   must not be loosened on a nest's say-so. Show it to the person repairing the
   lock and let them decide.
+
+**`vendored_wheels` (2.13) -- the wheels a nest carries itself.** One entry per
+package that was installed from a git repository (any host) or from a direct
+download address on a host other than the public index and the official PyTorch
+download site. Each entry carries `name` (as the lock spells it), `version`,
+`filename` (the PEP 427 wheel name -- its last three fields are the tags a reader
+matches), `wheel` (the blob, §7), `source` (the original source: `kind: git` with
+the repository `url` and the installed `commit`, plus `subdirectory` when the lock
+named one; or `kind: url` with the exact `url` and the `sha256` of the file there),
+`obtained` (`installer_cache` / `built_from_commit` / `downloaded`) and, when the
+wheel's own metadata states one, `metadata_license`. The lock line is **not edited**;
+it keeps the original source, and is what a reader falls back to. Full rules in §20.
 
 ### 4.3 `entrypoint` (optional) `[schema]`
 
@@ -1740,3 +1776,78 @@ may never load, and refusing on it would turn a working restore away.
 | No merge into `native_libs.names` | The two lists are different kinds of statement: one says what the working run loaded (may block), the other what a node's bytes declare (may only warn). Merging them would either strip the first of its authority or hand the second a power its evidence does not carry |
 | No `apt`/package-name mapping for these names | The package a soname belongs to differs per distribution and per release; `native_libs.packages` records the answer measured on the packing machine, and the same rule applies here |
 | No refusal, no new exit code, no change in the escape hatch | Same as every declared-level fact: the escape hatch informs, it does not block (2026-07-15 ruling) |
+
+## 20. What 2.13 changed (2026-10-07)
+
+Two optional fields: `runtime.cpu_flags` and `python_lock.vendored_wheels`.
+Purely additive -- every 2.0–2.12 nest reads unchanged, and old nests simply carry
+nothing for the new reader to read. The boolean `python_lock.wheels_archived`,
+reserved since 1.x and never built, is retired: kept in the schema so older nests
+stay valid, ignored by readers, no longer written.
+
+| What | Breaking? | Why |
+|---|---|---|
+| `runtime.cpu_flags` -- instruction-set extensions the packing machine's CPU had | No (additive, optional) | The third member of the "every byte restored, still not usable" class after machine libraries (2.6) and system memory (2.10): a prebuilt library compiled to assume AVX-512 restored byte for byte onto a CPU without it and the application stopped at start-up with `Illegal instruction` (measured 2026-10-07, Intel Xeon Gold 6342 to AMD EPYC 7763) |
+| `python_lock.vendored_wheels` -- the wheel installed in the environment, for each package that came from a git repository or a direct download address off the public index and the PyTorch download site, plus that package's original source | No (additive, optional) | A lock line like `sam-2 @ git+https://github.com/facebookresearch/sam2@<commit>` needs git, often a compiler, and that host to be up on the machine that restores it. Measured 2026-10-07: on a template image without git, the dependency install stopped with "Git executable not found" while every byte of the nest verified green |
+
+**Reading rule for `cpu_flags`:** an `observed_machine` fact (see `$defs.evidence_source`).
+A gap may only be **mentioned**, neutrally, as something to check if the
+application does not start; it never refuses and never changes an exit code.
+
+### 20.1 What goes in, and where the wheel comes from
+
+- **In scope**: `name @ git+<url>@<ref>` on any host, and `name @ https://<host>/...`
+  where the host is neither `pypi.org` / `files.pythonhosted.org` nor
+  `download.pytorch.org`. **Out**: everything from those two (they keep every
+  release, and storing their wheels would only duplicate gigabytes), and `file://`
+  installs -- the framework's own checkout travels as code in `code_deps`.
+- **The wheel is the one that was installed, never a re-resolution.** In order: the
+  installer caches on the packing machine (uv keeps the wheel it built from a git
+  commit; pip keeps wheels built from a commit-pinned URL); for a git source, a build
+  of the installed commit with the environment's own interpreter and **no build
+  isolation** (an isolated build resolves its build dependencies afresh -- for sam-2
+  that is a different torch); for a direct wheel address, that exact address, checked
+  against the sha256 the lock or the installer recorded.
+- **Checked against what is installed before it is accepted.** The wheel's files
+  must be the installed package's files (its RECORD), with the same bytes for every
+  file -- except that a wheel rebuilt on the packing machine may differ in the bytes
+  of compiled extensions (a compiler does not promise the same bytes twice), which
+  must still be present. `obtained` says which route was taken.
+- **Cannot be obtained -> today's behaviour.** The package is left out of this list,
+  the lock line is installed as before, and packing says so in one line. Packing
+  never stops here.
+- `metadata_license` is copied from the wheel's own METADATA (License-Expression,
+  else a one-line License, else the License classifiers). It is the authors'
+  statement, not an adjudication.
+
+### 20.2 Reading rules
+
+1. **Install the stored wheel only when it fits.** A wheel fits when its Python tag
+   matches the version being installed (exactly `cpXY`, or `py3`, or `pyXY` at or
+   below it, or `abi3` at or below it) **and** one of its platform tags is `any` or
+   names this machine's operating system and architecture. Then the lock line is
+   replaced, in a working copy, by `name @ file://<where the wheel landed>
+   --hash=sha256:<its sha256>`.
+2. **When it does not fit, fall back to the original source and say why** -- what
+   the wheel was built for and what this machine needs. Do not download a wheel that
+   does not fit.
+3. **The source allow-list judges the lock as written**, before any swap: a stored
+   wheel is still code from that source.
+4. **A reader that does not know this field installs from the lock line.** That is
+   the designed fallback, not a failure: an older Renest restores a 2.13 nest exactly
+   as it restored a 2.12 one.
+5. Both restore paths (the agent and the escape hatch) apply rules 1-3 with the same
+   verdicts; `oss/tests/consistency/test_both_legs_agree_on_vendored_wheels.py`
+   compares them case by case.
+
+### Explicitly not done (2.13)
+
+| Not done | Why |
+|---|---|
+| Not the whole `flags` line | Most of it describes the kernel and the hypervisor and differs between virtual machines on the same chip; comparing it would put a note on nearly every rented machine |
+| For `cpu_flags`: no refusal, no new exit code, nothing in the escape hatch | Most software runs fine without these instructions; only a few prebuilt libraries assume them, so a gap is a lead, not a finding. The escape hatch informs, it does not block (2026-07-15 ruling) |
+| No scan of which installed binaries use which instructions | That would be reading machine code to predict a crash; this records a fact about the packing machine and leaves the judgement to the person |
+| No wheels from PyPI or download.pytorch.org | Those hosts keep every release; a nest already records the exact version and, when packing was online, its fingerprint. Decided 2026-10-07 |
+| No wheels for vendor-only pins (`torch==…+cu124`) | They come from an index, not from a direct address, and are handled by pinning (`pinned_wheel_urls`) |
+| No editing of the lock in the nest | The lock keeps the original source; the swap happens in a working copy at restore time, so the byte check of the lock is unaffected and an older reader sees what it always saw |
+| No glibc-version check in "fits" | The same matching the pinning step uses. A `manylinux_2_28` wheel on an older glibc is refused by the installer with its own message; the lock in the nest still names the original source for a manual retry. Stored wheels are built on the packing machine, so in practice their glibc floor is that machine's |

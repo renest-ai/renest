@@ -25,12 +25,14 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -43,6 +45,7 @@ from .envlock import (
     COMPILE_REQUIRED_VERDICT,
     LOCK_FROM_ENV_HEADER,
     LOCK_FROM_INSTALLED_HEADER,
+    canonical_name,
     compile_required_evidence,
     conda_owned_evidence,
     env_dir_of,
@@ -115,6 +118,7 @@ from .wheels import (
     wheel_os_family,
     wheel_platform_tags,
 )
+from .vendored import obtain_wheels, vendor_candidates
 
 __all__ = [
     "CROCKFORD",
@@ -771,6 +775,37 @@ def _empty_submodule_dirs(src_dir: Path) -> list[str]:
             if d.is_dir() and not any(d.iterdir()):
                 out.append(rel)
     return sorted(out)
+
+
+def _settle_lfs(src_dir: Path, install_path: str, exclude: list[str], *, dry_run: bool,
+                warnings: list[str], lfs: dict | None) -> list[str]:
+    """Git LFS placeholders in one code folder (:mod:`renest.lfs`): offer
+    ``git lfs pull``, then leave example material out and refuse on the rest.
+    Returns the paths to add to this folder's excludes."""
+    from . import lfs as _lfs
+
+    opts = lfs or {}
+    settled = _lfs.settle_placeholders(
+        src_dir, install_path, lambda: _lfs_pointer_files(src_dir, exclude),
+        dry_run=dry_run, assume_yes=bool(opts.get("assume_yes")),
+        may_ask=bool(opts.get("may_ask")), say=opts.get("say"),
+        rerun=opts.get("rerun") or "the same `renest pack` command",
+        machine=opts.get("machine"),
+    )
+    if settled.pulled and not settled.dropped and not settled.needed:
+        warnings.append(f"{install_path}: downloaded its Git LFS files with `git lfs pull`.")
+    if settled.dropped:
+        warnings.append(_lfs.dropped_line(install_path, settled.dropped))
+    if settled.needed:
+        msg = _lfs.refusal_message(install_path, settled.needed, src_dir, why=settled.why,
+                                   install_first=settled.install_first,
+                                   is_checkout=settled.is_checkout, dry_run=dry_run)
+        if dry_run:
+            # A dry run downloads nothing; the real pack offers to, and stops if it can't.
+            warnings.append(msg)
+        else:
+            raise PackError(msg, exit_code=int(ExitCode.USAGE))
+    return list(settled.dropped)
 
 
 def _refuse_undownloaded_code(src_dir: Path, install_path: str, exclude=()) -> None:
@@ -1646,6 +1681,136 @@ def _base_image_for_manifest(spec_img: object, warnings: list[str]) -> dict | No
     return out
 
 
+#: Largest saved workflow read for model addresses; a workflow is a few hundred KB.
+_SAVED_WORKFLOW_MAX = 8 << 20
+
+
+def _saved_editor_workflows(root: Path) -> list[dict]:
+    """ComfyUI's saved workflows (editor form) under this environment, best effort."""
+    out: list[dict] = []
+    for base in (root / "ComfyUI" / "user", root / "user"):
+        if not base.is_dir():
+            continue
+        for p in sorted(base.glob("*/workflows/**/*.json"))[:500]:
+            try:
+                if p.stat().st_size > _SAVED_WORKFLOW_MAX:
+                    continue
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeDecodeError):
+                continue
+            if is_editor_workflow(data):
+                out.append(data)
+    return out
+
+
+def _is_restricted(entry: dict) -> bool:
+    lic = entry.get("license") or {}
+    return lic.get("serving_scope") == "gated" or lic.get("shareable") is False
+
+
+def download_address_hint(paths: list[str]) -> str:
+    """The one line naming restricted files with no address, and how to give each one."""
+    lines = "; ".join(f"--download-url {p}=https://…" for p in paths[:10])
+    more = f" (and {len(paths) - 10} more)" if len(paths) > 10 else ""
+    return (
+        f"{len(paths)} restricted file(s) have no download address, so whoever you hand "
+        f"this nest to gets only their fingerprint and has to find them on their own: "
+        f"{', '.join(paths[:10])}{more}. If you know where one downloads from, pack again "
+        f"with {lines} — or, packing from a pack-spec, put \"origin_url\": \"https://…\" on "
+        f"that file's entry."
+    )
+
+
+def _fill_download_addresses(
+    manifest: dict, spec: dict, root: Path, warnings: list[str], *, online: bool,
+    client: httpx.Client | None, declared: dict[str, str] | None,
+) -> None:
+    """Write ``origin_url`` for files that will not travel with a hand-off.
+
+    Sources, in order: what the person packing typed (``--download-url``); the model
+    cache path; our known-files table; addresses the environment's ComfyUI workflows
+    give for the file, kept only when Hugging Face confirms the sha256. See
+    renest.origins for why nothing else counts. Never fails a pack.
+    """
+    from .origins import (
+        editor_model_urls,
+        hf_address_from_cache_path,
+        known_component_address,
+        verify_hf_address,
+    )
+
+    declared = dict(declared or {})
+    files = [f for f in manifest.get("files") or [] if isinstance(f, dict)]
+    by_path = {f.get("path"): f for f in files}
+    own_client: httpx.Client | None = None
+
+    def http() -> httpx.Client:
+        nonlocal own_client
+        if client is not None:
+            return client
+        if own_client is None:
+            own_client = httpx.Client(timeout=15.0)
+        return own_client
+
+    try:
+        for path, url in declared.items():
+            entry = by_path.get(path)
+            if entry is None:
+                warnings.append(
+                    f"--download-url names {path}, but no file in this nest has that path "
+                    f"(paths are as the pack output lists them), so it was not recorded.")
+                continue
+            sha = (entry.get("blob") or {}).get("sha256", "")
+            verdict = verify_hf_address(url, sha, client=http())[0] if online else "unknown"
+            if verdict == "mismatch":
+                warnings.append(
+                    f"--download-url for {path}: Hugging Face says {url} serves a different "
+                    f"file (its sha256 is not this file's), so it was not recorded.")
+                continue
+            entry["origin_url"] = url
+
+        candidates: dict[str, list[str]] | None = None
+        for entry in files:
+            if entry.get("origin_url") or not _is_restricted(entry):
+                continue
+            path = str(entry.get("path") or "")
+            sha = str((entry.get("blob") or {}).get("sha256") or "")
+            url = ""
+            if entry.get("root") == "hf_hub":
+                url = hf_address_from_cache_path(path)
+            if not url:
+                url = known_component_address(sha)
+            if not url and online:
+                if candidates is None:
+                    graphs = [spec.get("_workflow_ui")] + _saved_editor_workflows(root)
+                    candidates = editor_model_urls(g for g in graphs if g)
+                for cand in candidates.get(path.rsplit("/", 1)[-1], []):
+                    verdict, pinned = verify_hf_address(cand, sha, client=http())
+                    if verdict == "match":
+                        url = pinned
+                        break
+            if url:
+                entry["origin_url"] = url
+    finally:
+        if own_client is not None:
+            own_client.close()
+
+    missing = [str(f.get("path")) for f in files
+               if _is_restricted(f) and not f.get("origin_url")]
+    if missing:
+        warnings.append(download_address_hint(missing))
+
+
+def _base_image_of_this_machine(*, online: bool) -> tuple[dict | None, str | None]:
+    """The image block this machine can vouch for by itself (see renest.baseimage).
+
+    A seam of its own so tests can stand in for a machine booted from the template
+    image without writing to /opt."""
+    from .baseimage import detect_base_image
+
+    return detect_base_image(online=online)
+
+
 def _site_packages_for(
     root: Path, env_python: str | None, program_dir: Path | None = None
 ) -> Path | None:
@@ -1742,6 +1907,83 @@ def _created_at_ts(created_at: str) -> float | None:
         return None
 
 
+def _store_vendored_wheels(
+    lock_text: str,
+    site_packages: Path | None,
+    env_python: str | None,
+    work: Path,
+    *,
+    place: Callable[..., dict],
+    dry_run: bool,
+    online: bool,
+    client: httpx.Client | None,
+    warnings: list[str],
+    emitter: EventEmitter | None = None,
+) -> list[dict]:
+    """Put the installed wheel of each git / direct-URL package into the nest (2.13).
+
+    Returns the ``python_lock.vendored_wheels`` entries (empty = write nothing). A
+    package whose wheel cannot be obtained keeps today's behaviour -- the lock's own
+    source line -- and gets one plain line in the warnings; packing never stops here.
+    """
+    cands = vendor_candidates(lock_text)
+    if not cands:
+        return []
+    if dry_run:
+        warnings.append(
+            f"{len(cands)} package(s) come from a git repository or a direct download "
+            f"address ({', '.join(c.name for c in cands[:4])}). The real pack stores the "
+            f"wheel installed here for each one in the nest, so a restore does not depend "
+            f"on that source; a dry run fetches and builds nothing."
+        )
+        return []
+    own_client = None
+    if online and client is None:
+        own_client = client = httpx.Client(follow_redirects=True, timeout=60.0)
+    say = (lambda m: emitter.log(m)) if emitter is not None else None
+    try:
+        got, misses = obtain_wheels(
+            lock_text, site_packages, env_python, work / "vendored",
+            online=online, client=client, say=say,
+        )
+    finally:
+        if own_client is not None:
+            own_client.close()
+    warnings.extend(misses)
+    entries: list[dict] = []
+    for w in got:
+        blob = place(w.path, hardlink=False)
+        c = w.candidate
+        if c.kind == "git":
+            source: dict = {"kind": "git", "url": c.url, "commit": w.commit}
+            if c.subdirectory:
+                source["subdirectory"] = c.subdirectory
+        else:
+            source = {"kind": "url", "url": c.url, "sha256": w.source_sha256}
+        entry: dict = {
+            "name": c.name,
+            "version": w.version,
+            "filename": w.filename,
+            "wheel": blob,
+            "source": source,
+            "obtained": w.obtained,
+        }
+        if w.license:
+            entry["metadata_license"] = w.license
+        entries.append(entry)
+    if entries:
+        total = sum(e["wheel"]["size_bytes"] for e in entries)
+        names = ", ".join(e["name"] for e in entries[:4])
+        warnings.append(
+            f"Stored the installed wheel of {len(entries)} package(s) that came from a "
+            f"git repository or a direct download address ({names}"
+            f"{' and more' if len(entries) > 4 else ''}; {total / 1e6:.1f} MB). A restore "
+            f"installs these from the nest when they fit that machine's Python and "
+            f"platform, and from their original source otherwise."
+        )
+    return entries
+
+
 def _build_manifest(
     root: Path,
     spec: dict,
@@ -1766,6 +2008,8 @@ def _build_manifest(
     emitter: EventEmitter | None = None,
     cache: HashCache | None = None,
     program_dir: Path | None = None,
+    download_urls: dict[str, str] | None = None,
+    lfs: dict | None = None,
 ) -> tuple[dict, list[dict]]:
     """P1 + P2: scan/hash + assemble the v1 manifest. Returns (manifest, inventory).
 
@@ -1779,7 +2023,7 @@ def _build_manifest(
     # from "hung".
     tracker = _ProgressTracker(emitter, root, spec) if (emitter and not dry_run) else None
     manifest: dict = {
-        "format_version": "2.12",
+        "format_version": "2.13",
         "id": nest_id,
         "created_at": _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "runtime": spec["runtime"],
@@ -1797,6 +2041,15 @@ def _build_manifest(
     _said = len(warnings)
     _img = _base_image_for_manifest(spec.get("base_image"), warnings)
     _image_said_precisely = len(warnings) > _said
+    if _img is None and not _image_said_precisely:
+        # Nobody named an image (every --auto / --workflow / panel pack, and a spec
+        # left at its placeholder). Our own template image names itself in a file it
+        # carries; anything else stays unknown and the block stays out.
+        _img, _img_note = _base_image_of_this_machine(
+            online=bool(pin_wheels) or not no_licence_lookup)
+        if _img_note:
+            warnings.append(_img_note)
+            _image_said_precisely = True
     if _img is not None:
         manifest["base_image"] = _img
     for k in ("name", "post_install", "api_deps", "creation", "entrypoint"):
@@ -1889,6 +2142,19 @@ def _build_manifest(
         if _sysmem:
             rt = dict(manifest.get("runtime") or {})
             rt.setdefault("system_memory", _sysmem)
+            manifest["runtime"] = rt
+        # Which instruction-set extensions this machine's CPU had (format 2.13).
+        # Third member of the same class: a prebuilt library compiled to assume
+        # AVX-512 restores byte for byte onto a CPU without it and the app stops
+        # at start-up with "Illegal instruction" (batch 22, 2026-10-07). The
+        # rebuild side only ever mentions a gap, never stops on it.
+        # Read nothing (not Linux Intel/AMD) -> write nothing.
+        from .doctor import collect_packing_cpu_flags
+
+        _cpu = collect_packing_cpu_flags()
+        if _cpu is not None:
+            rt = dict(manifest.get("runtime") or {})
+            rt.setdefault("cpu_flags", _cpu)
             manifest["runtime"] = rt
         # Which operating-system libraries this run needed the machine to provide
         # (format 2.6). They cannot be packed, so a machine missing one restores every
@@ -2018,6 +2284,12 @@ def _build_manifest(
                 f"code folder ({shown}). They are left out of its archive — each one travels "
                 f"on its own, and packing them twice would make the nest twice the size."
             )
+
+        # Git LFS placeholders: download them for the user when we can; what stays a
+        # placeholder is left out when it is example material, refused otherwise.
+        if src_dir.is_dir():
+            dep_ex += _settle_lfs(src_dir, dep["install_path"], dep_ex, dry_run=dry_run,
+                                  warnings=warnings, lfs=lfs)
 
         # -- "strip by default, tell the user to recompile": node .so routing --
         raw_excludes: list[str] = []
@@ -2451,7 +2723,27 @@ def _build_manifest(
         # verdict, stated at pack time, that the restore machine must recompile. We read
         # the arch this run was built for out of the gpu block already assembled above
         # (no new field, no format bump) so the note names the target it was built against.
-        compile_ev = compile_required_evidence(lock_text)
+        # Stored wheels (format 2.13): a package installed from a git repository or a
+        # direct URL off the public index travels as the wheel that is installed here,
+        # with its original source kept beside it -- so a restore needs neither git,
+        # nor a compiler, nor that host to be up. Read off the lock before pinning:
+        # pinning only rewrites `name==version+local` lines, never `name @ url` ones.
+        _vendored = _store_vendored_wheels(
+            lock_text, _plumbing_sp, _plumbing_py or _env_python_for(root, env_python),
+            work, place=place, dry_run=dry_run, online=pin_wheels, client=client,
+            warnings=warnings, emitter=emitter,
+        )
+        if _vendored:
+            manifest["python_lock"]["vendored_wheels"] = _vendored
+            for _vw in _vendored:
+                inventory.append({"role": "vendored_wheel", "path": _vw["filename"],
+                                  **_vw["wheel"]})
+        _vendored_names = {canonical_name(v["name"]) for v in _vendored}
+        compile_ev = [
+            ln for ln in compile_required_evidence(lock_text)
+            if canonical_name(re.split(r"\s+@\s+|===|==|>=|<=|~=|!=|<|>|@", ln, maxsplit=1)[0]
+                              .split("[", 1)[0].strip()) not in _vendored_names
+        ]
         if compile_ev:
             names = ", ".join(ln.split("==")[0].split(" @ ")[0].strip() for ln in compile_ev[:6])
             more = f" and {len(compile_ev) - 6} more" if len(compile_ev) > 6 else ""
@@ -2527,10 +2819,11 @@ def _build_manifest(
                         f"{len(pinned)} package(s) carry a vendor-only version PyPI doesn't "
                         f"have; they now point at direct wheel URLs: "
                         + ", ".join(name for name, _ in pinned)
-                        + ". From here on this lock is betting that wheel host stays up. "
-                        "(The wheels_archived switch that would bundle the wheel files into "
-                        "the nest is designed but NOT built yet — setting it only records "
-                        "your intent in the manifest, it does not archive anything.)"
+                        + ". From here on this lock is betting that wheel host stays up: "
+                        "renest does not store index-installed wheels inside the nest "
+                        "(only packages installed from a git repository or a direct "
+                        "download address travel as stored wheels), so every restore "
+                        "downloads these again from those addresses."
                     )
                 # Machine reconciliation, not memory: every vendor-only pin must now
                 # be a direct address. Re-scan the text that actually ships — a
@@ -2774,8 +3067,8 @@ def _build_manifest(
         if pinned:
             # Write this field only when something was really rewritten.
             manifest["python_lock"]["pinned_wheel_urls"] = len(pinned)
-        if pl.get("wheels_archived"):
-            manifest["python_lock"]["wheels_archived"] = True
+        # The old boolean flag is retired (2.13): it was never built, and the wheels a
+        # nest really carries are listed one by one in `vendored_wheels` above.
         # Contested modules (format 2.8): several packages in this lock write the
         # same folder, and the installer decides who writes last -- **not stably**
         # (measured 2026-08-17: one lock, one machine, a different survivor on
@@ -2924,6 +3217,11 @@ def _build_manifest(
         with ThreadPoolExecutor(max_workers=jobs) as ex:
             manifest["files"] = [e for e in ex.map(do_file, files) if e is not None]
         _attach_licence_texts(manifest, place, dry_run, root)
+    # Addresses for what will not travel with a hand-off -- after the licence verdicts,
+    # since only those say which files are restricted.
+    _fill_download_addresses(
+        manifest, spec, root, warnings, online=not no_licence_lookup, client=client,
+        declared=download_urls)
 
     # The escape hatch travels with the nest (format 2.3). Doing it **after** the
     # licence-text step is deliberate: it is our own script, and it should not
@@ -3087,6 +3385,105 @@ def _hash_record(cache: HashCache | None, env_root: Path, full_rehash: bool) -> 
     return cache
 
 
+def _apply_add(root: Path, spec: dict, adds: list[str], warnings: list[str]) -> str | None:
+    """Put each ``--add`` path into ``spec["files"]``. Returns why it cannot, or None.
+
+    A folder adds every file under it. A path is looked for under the environment
+    root first, then where the command was run. A file the nest already carries --
+    named by the workflow, or inside a code folder's archive -- is said once and not
+    added twice. Outside the environment only extra_model_paths folders count: those
+    are recorded under the standard models folder, like capture does."""
+    from .capture import CATEGORIES, INPUT_ASSET_LICENCE_DEFAULT, UNKNOWN_LICENCE_DEFAULT
+
+    files = spec.setdefault("files", [])
+    have = {f.get("path") for f in files if isinstance(f, dict)}
+    deps = [d for d in spec.get("code_deps") or [] if isinstance(d, dict) and d.get("install_path")]
+    host = next((d for d in deps if d.get("role") == "host"), None)
+    host_dir = str(host["install_path"]).strip("/") if host else "ComfyUI"
+    emp = _parse_extra_model_paths(root / host_dir)
+    dir_kind = {sd: kind for sds, kind in CATEGORIES.values() for sd in sds}
+    added: list[str] = []
+    for raw in adds:
+        given = Path(raw).expanduser()
+        cands = [given] if given.is_absolute() else [root / given, Path.cwd() / given]
+        src = next((c for c in cands if c.exists()), None)
+        if src is None:
+            return (f"--add {raw}: no such file or folder (looked under {root} and in the "
+                    f"current folder)")
+        targets = [src] if src.is_file() else sorted(
+            p for p in src.rglob("*") if p.is_file() and not p.name.startswith("."))
+        for t in targets:
+            rel, source = None, None
+            with contextlib.suppress(ValueError):
+                rel = Path(os.path.abspath(t)).relative_to(root).as_posix()
+            if rel is None:
+                real = t.resolve()
+                for key, dirs in emp.items():
+                    for d in dirs:
+                        with contextlib.suppress(ValueError):
+                            rel = f"{host_dir}/models/{key}/{real.relative_to(d).as_posix()}"
+                            source = real
+                    if rel:
+                        break
+            if rel is None:
+                return (f"--add {raw}: {t} is outside the environment being packed ({root}) "
+                        f"and outside every extra_model_paths folder, so a rebuild would have "
+                        f"nowhere to put it. Move it under {root / host_dir / 'models'} and "
+                        f"pack again")
+            if rel in have:
+                continue
+            owner = None
+            for d in deps:
+                ip = str(d["install_path"]).strip("/")
+                if rel.startswith(ip + "/"):
+                    inner = rel[len(ip) + 1:]
+                    excl = [str(e).strip("/") for e in d.get("exclude") or []]
+                    if not any(inner == e or inner.startswith(e + "/") for e in excl):
+                        owner = d.get("name") or ip
+            if owner is not None:
+                warnings.append(f"--add {rel}: already travels inside the {owner} archive, so "
+                                f"nothing was added for it")
+                have.add(rel)
+                continue
+            parts = rel.split("/")
+            sub = "/".join(parts[1:3]) if len(parts) > 3 else ""
+            if len(parts) > 1 and parts[1] == "input":
+                kind = "input_asset"
+            else:
+                kind = dir_kind.get(sub) or (
+                    parts[2] if len(parts) > 3 and parts[1] == "models" else "other")
+            lic = INPUT_ASSET_LICENCE_DEFAULT if kind == "input_asset" else UNKNOWN_LICENCE_DEFAULT
+            entry: dict = {"path": rel, "license": dict(lic), "kind": kind}
+            if source is not None:
+                entry["source_path"] = str(source)
+            files.append(entry)
+            have.add(rel)
+            added.append(rel)
+    if added:
+        shown = ", ".join(added[:5]) + ("…" if len(added) > 5 else "")
+        warnings.append(f"Packed because you asked with --add: {len(added)} file(s) ({shown})")
+    return None
+
+
+def _add_command(argv: list[str], possibly_used: list[dict]) -> str | None:
+    """The pack command to paste so the files capture could only name go in too: the
+    same command, plus one --add per file -- or per folder, where several sit together."""
+    if not possibly_used:
+        return None
+    by_folder: dict[str, list[str]] = {}
+    for c in possibly_used:
+        parts = str(c["path"]).split("/")
+        key = "/".join(parts[:3]) if len(parts) > 3 and parts[1] == "models" else ""
+        by_folder.setdefault(key, []).append(str(c["path"]))
+    adds: list[str] = []
+    for folder, paths in by_folder.items():
+        adds += [folder] if folder and len(paths) > 3 else paths
+    flags = [x for p in adds for x in ("--add", p)]
+    if argv[:1] == ["pack"]:
+        return shlex.join(["renest", *argv, *flags])
+    return "renest pack <the options you just used> " + shlex.join(flags)
+
+
 def infer_spec(
     target: str | os.PathLike[str],
     workflow: dict | str | os.PathLike[str],
@@ -3134,7 +3531,8 @@ def infer_spec(
 
     hashes = _hash_record(hash_cache, env_root, full_rehash)
     result = capture(wf_json, cdir, workflow_relpath=wf_rel, hash_cache=hashes,
-                     program_dir=Path(program_dir).resolve() if program_dir else None)
+                     program_dir=Path(program_dir).resolve() if program_dir else None,
+                     env_python=env_python or find_env_python(venv_python_candidates(cdir, env_root)))
     if persist_hashes:
         hashes.save()
     spec, report = result.pack_spec, result.report
@@ -3294,7 +3692,8 @@ def infer_spec_current_state(
 
     hashes = _hash_record(hash_cache, env_root, full_rehash)
     result = capture(wf_json, cdir, workflow_relpath=wf_rel, hash_cache=hashes,
-                     program_dir=Path(program_dir).resolve() if program_dir else None)
+                     program_dir=Path(program_dir).resolve() if program_dir else None,
+                     env_python=env_python or find_env_python(venv_python_candidates(cdir, env_root)))
     if persist_hashes:
         hashes.save()
     spec, report = result.pack_spec, result.report
@@ -3505,9 +3904,19 @@ def pack(
     mine: set[str] | None = None,
     full_rehash: bool = False,
     hash_cache: HashCache | None = None,
+    add: Iterable[str] | None = None,
+    download_urls: dict[str, str] | None = None,
     # Said while the user can still act on it. The report's findings are read
     # after the run is over, which is too late for "this needs twice the disk".
     notice: Callable[[str], None] | None = None,
+    # Git LFS placeholders in a code folder (renest.lfs): may we ask the person at the
+    # keyboard before running `git lfs pull`, or run it without asking (--yes)? Off for
+    # every caller but the command line: a panel or server has nobody to ask.
+    assume_yes: bool = False,
+    may_ask: bool = False,
+    say: Callable[[str], None] | None = None,
+    rerun_command: str = "",
+    machine: object | None = None,
 ) -> PackReport:
     """Pack a working environment into a nest. Never raises for a pack failure —
     the report's ``exit_code`` carries the verdict.
@@ -3531,6 +3940,12 @@ def pack(
     ``workflow_ui``: the same workflow as ComfyUI's editor saves it (a dict, or a
     path to one). It travels as a files[] entry of kind ``workflow`` so the restored
     app's Workflows sidebar can open it; ``--auto`` finds it in the run's picture.
+
+    ``add``: files or folders to pack on top of what the workflow names (``--add``),
+    each a path inside the environment (or inside an extra_model_paths folder). They
+    become ordinary ``files[]`` entries: hashed, licence-checked and restored like any
+    other model. For the ones capture could only name -- a model a node pack picks at
+    run time -- this is how they get into the nest.
 
     ``workflow_name``: what the caller calls this nest (the panel's name field,
     ``--nest-name``); written, cleaned, as ``adapters.comfyui.workflow_name`` -- the
@@ -3641,6 +4056,23 @@ def pack(
             _safe = sidebar_safe_name(workflow_name)
             if _safe:
                 _cui["workflow_name"] = _safe
+    if add and isinstance(spec, dict):
+        _why = _apply_add(root, spec, list(add), warnings)
+        if _why is not None:
+            report.exit_code = int(ExitCode.USAGE)
+            report.findings = warnings + [_why]
+            return report
+        # What --add just put in is no longer "possibly used, not packed": withdraw those
+        # lines, so the closing command does not ask for the same files again.
+        _now = {f.get("path") for f in spec.get("files") or [] if isinstance(f, dict)}
+        _cap = report.capture_report or {}
+        _gone = [c for c in _cap.get("possibly_used_files") or [] if c.get("path") in _now]
+        if _gone:
+            _cap["possibly_used_files"] = [
+                c for c in _cap["possibly_used_files"] if c.get("path") not in _now]
+            _said = {f"pack again with --add {c['path']}" for c in _gone}
+            warnings[:] = [w for w in warnings
+                           if not ("is NOT packed" in w and any(w.endswith(s) for s in _said))]
     if isinstance(spec, dict) and spec.get("_workflow_ui") is not None:
         # The API form of the same graph, for the credential scan below only.
         twin = workflow
@@ -3739,6 +4171,8 @@ def pack(
     # record but never writes it — a dry run changes nothing on disk. (A no-op
     # when capture already attached it: same object, same file.)
     hash_cache.attach(root / HASH_CACHE_REL)
+    _lfs_opts = {"assume_yes": assume_yes, "may_ask": may_ask, "say": say,
+                 "rerun": rerun_command, "machine": machine}
 
     try:
         with tempfile.TemporaryDirectory() as _work:
@@ -3751,6 +4185,7 @@ def pack(
                     unrestorable=unrestorable,
                     pin_wheels=pin_wheels, client=client, no_licence_lookup=no_licence_lookup,
                     mine=mine, cache=hash_cache, program_dir=_program_dir,
+                    download_urls=download_urls, lfs=_lfs_opts,
                 )
                 # The same last gate as a real pack. A dry run that waves an
                 # unresolved placeholder through lets "the dry run was green"
@@ -3811,6 +4246,8 @@ def pack(
                 unrestorable=unrestorable,
                 pin_wheels=pin_wheels, client=client, no_licence_lookup=no_licence_lookup,
                 mine=mine, emitter=emitter, cache=hash_cache, program_dir=_program_dir,
+                download_urls=download_urls,
+                lfs=_lfs_opts,
             )
             # Saved as soon as the reading is done: what was read stays true even
             # if a later stage fails, and a retry should not pay for it twice.
@@ -4065,6 +4502,28 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
              "restricted model",
     )
     parser.add_argument(
+        "--add",
+        action="append",
+        metavar="PATH",
+        default=[],
+        help="Pack this file too, on top of the models the workflow names — a path inside "
+             "the environment (ComfyUI/models/loras/my_lora.safetensors), or a folder for "
+             "everything in it. Repeat for more. For a model a node loads in a way we can't "
+             "read from the workflow; the pack output names those and prints the command",
+    )
+    parser.add_argument(
+        "--download-url",
+        action="append",
+        metavar="PATH=URL",
+        default=[],
+        help="Record where a file can be downloaded from, by its path inside the "
+             "environment as the pack output lists it (ComfyUI/models/clip/clip_l.safetensors"
+             "=https://…). Repeat for more. A restricted file never travels to someone you "
+             "hand the nest to; this address is what they fetch it from instead. A Hugging "
+             "Face address is checked against the file's fingerprint and refused if it "
+             "serves a different file",
+    )
+    parser.add_argument(
         "--i-know",
         action="store_true",
         help="Pack even though something in your code folder looks like a credential. "
@@ -4072,6 +4531,14 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
              "code folder as-is, to whoever you hand it to",
     )
     parser.add_argument("--dry-run", action="store_true", help="Only show the manifest and a size estimate; pack nothing")
+    parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="When a code folder holds Git LFS placeholders instead of the real files, "
+             "download them with `git lfs pull` without asking (and install git-lfs first "
+             "when it is missing and this account is root or can use sudo without a "
+             "password)",
+    )
     parser.add_argument(
         "--pin-wheels",
         action="store_true",
@@ -4121,6 +4588,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         help="Don't report pack progress (by default the same token reports progress to your "
              "Renest drive; reporting never holds up the pack)",
     )
+
+
+def _pack_rerun_command() -> str:
+    """The command this pack was started with, spelled as the person would type it."""
+    args = sys.argv[1:]
+    return ("renest " + shlex.join(args)) if args else ""
 
 
 def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
@@ -4305,6 +4778,20 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
         for note in kind_advice(spec.get("files")):
             print(f"! {note}", file=sys.stderr)
 
+    download_urls: dict[str, str] = {}
+    for item in getattr(args, "download_url", None) or ():
+        _path, _sep, _url = str(item).partition("=")
+        _path, _url = _path.strip(), _url.strip()
+        if not _sep or not _path or not _url.startswith("https://") or " " in _url:
+            print(
+                f"✗ --download-url takes PATH=URL with an https address, e.g. "
+                f"--download-url ComfyUI/models/clip/clip_l.safetensors=https://huggingface.co/"
+                f"<owner>/<repo>/resolve/main/clip_l.safetensors (got: {item})",
+                file=sys.stderr,
+            )
+            return int(ExitCode.USAGE)
+        download_urls[_path] = _url
+
     _pin, _no_licence = offline_effects(
         getattr(args, "offline", False),
         getattr(args, "pin_wheels", False),
@@ -4332,10 +4819,16 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
         i_know=getattr(args, "i_know", False),
         no_licence_lookup=_no_licence,
         mine=set(getattr(args, "mine", None) or ()),
+        add=list(getattr(args, "add", None) or ()),
+        download_urls=download_urls or None,
         full_rehash=getattr(args, "full_rehash", False),
         # Printed the moment it is known, not with the findings at the end: by
         # then the second copy has either fitted or filled the disk.
         notice=lambda m: print(f"⚠ {m}", file=sys.stderr, flush=True),
+        assume_yes=getattr(args, "yes", False),
+        may_ask=True,
+        say=lambda m: print(m, file=sys.stderr, flush=True),
+        rerun_command=_pack_rerun_command(),
     )
     # Pack succeeded → record "this folder → this nest" in the target
     # directory's state area, so the next pack picks up where this one left off.
@@ -4368,6 +4861,14 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
         for w in report.findings:
             if w:
                 print(f"⚠ {w}", file=sys.stderr)
+        _cmd = _add_command(
+            sys.argv[1:], (report.capture_report or {}).get("possibly_used_files") or [])
+        if _cmd and report.ok:
+            # Said as a command to paste, not as advice: the files are named above, and
+            # the one thing left for the reader is to say "yes, those too".
+            print("→ To pack the files named above as possibly used by this run, run:",
+                  file=sys.stderr)
+            print(f"  {_cmd}", file=sys.stderr)
         if report.ok and not report.dry_run:
             print(sealed_summary(report), file=sys.stderr)
             if args.workflow and not getattr(args, "workflow_ui", None):

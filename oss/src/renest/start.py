@@ -18,8 +18,10 @@ import os
 import shlex
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
+from . import systools
 from .errors import ExitCode
 from .restore import (
     PASTE_NOTE,
@@ -42,6 +44,7 @@ __all__ = [
     "run_from_args",
     "load_start_facts",
     "start_command",
+    "run_watching",
 ]
 
 
@@ -186,6 +189,128 @@ def start_command(
     return cmd, cwd, env_extra
 
 
+#: How much of the application's error output is kept to look for a missing tool in.
+_TAIL_BYTES = 8192
+
+
+def _stop(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def _say_lines(text: str) -> None:
+    for line in text.splitlines():
+        print(f"[start] {line}", file=sys.stderr, flush=True)
+
+
+def run_watching(
+    cmd: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    *,
+    assume_yes: bool = False,
+    may_ask: bool = False,
+    rerun: str = "renest start",
+    machine: systools.Machine | None = None,
+    say: Callable[[str], None] | None = None,
+) -> int:
+    """Run the application; if it fails because git, git-lfs or a C compiler is not
+    on this machine, install it (same question and privilege rules as a restore,
+    :mod:`renest.systools`) and start it once more.
+
+    Real case, batch 22 (2026-10): the first picture after a restore died on triton's
+    "Failed to find C compiler", and the user had to find build-essential himself.
+    A server like ComfyUI does not exit when one picture fails, so its error output
+    is watched while it runs: on a match the tool is installed, the application
+    stopped and started again. Without permission to install, the exact command is
+    printed and the application keeps running as it was. Only the error stream is
+    watched (passed through unchanged); standard output is left alone."""
+    m = machine or systools.Machine()
+    tell = say or _say_lines
+    handled: set[str] = set()
+    restarted = False
+    while True:
+        try:
+            proc = subprocess.Popen(cmd, cwd=cwd, env=env, stderr=subprocess.PIPE)  # noqa: S603
+        except OSError as e:
+            print(f"[start] Could not run it: {e}", file=sys.stderr, flush=True)
+            return int(ExitCode.USAGE)
+        assert proc.stderr is not None
+        fd = proc.stderr.fileno()
+        tail = b""
+        restart = False
+        try:
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                _pass_through(chunk)
+                tail = (tail + chunk)[-_TAIL_BYTES:]
+                tool = systools.missing_tool_in(tail.decode("utf-8", "replace"))
+                if tool is None or tool in handled:
+                    continue
+                handled.add(tool)
+                tail = b""
+                if _offer_tool(tool, assume_yes=assume_yes, may_ask=may_ask, rerun=rerun,
+                               machine=m, say=tell) and not restarted:
+                    tell(f"Starting it again so it finds {systools.LABEL[tool]}.")
+                    _stop(proc)
+                    restart = True
+                    break
+            proc.wait()
+        except KeyboardInterrupt:
+            _stop(proc)
+            return 130
+        finally:
+            proc.stderr.close()
+        if restart:
+            restarted = True
+            continue
+        # A signal death arrives as a negative returncode; -N is the honest "128+N".
+        rc = proc.returncode
+        return rc if rc >= 0 else 128 - rc
+
+
+def _pass_through(chunk: bytes) -> None:
+    try:
+        sys.stderr.buffer.write(chunk)
+        sys.stderr.buffer.flush()
+    except (AttributeError, ValueError):
+        sys.stderr.write(chunk.decode("utf-8", "replace"))
+        sys.stderr.flush()
+
+
+_WHY_FAILED = {
+    systools.TOOL_CC: "the application just failed because it could not find a C compiler "
+                      "(triton builds a small helper with one the first time a model runs)",
+    systools.TOOL_GIT: "the application just failed because git is not installed",
+    systools.TOOL_LFS: "the application just failed because git-lfs is not installed",
+}
+
+
+def _offer_tool(tool: str, *, assume_yes: bool, may_ask: bool, rerun: str,
+                machine: systools.Machine, say: Callable[[str], None]) -> bool:
+    """Install ``tool`` when this machine lets us. True when it is now here."""
+    plan = systools.plan_system_install([systools.Need(tool, _WHY_FAILED[tool])],
+                                        machine=machine)
+    if plan is None:
+        return False
+    if not (may_ask or assume_yes):
+        # Nobody to ask: name the command, change nothing.
+        say(systools.missing_tool_advice(tool, rerun, machine))
+        return False
+    outcome = systools.ensure_system_tools(
+        plan, assume_yes=assume_yes, say=say, rerun=rerun, machine=machine,
+        before="The application is still running without it. ")
+    return outcome.status == "installed"
+
+
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dir", default=".",
@@ -204,6 +329,13 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dry-run", action="store_true",
         help="print the command that would run, then stop",
+    )
+    parser.add_argument(
+        "--yes", "-y", action="store_true",
+        help="if the application fails because git, git-lfs or a C compiler is not "
+             "installed, install it without asking and start the application again "
+             "(only when this account is root or can use sudo without a password; "
+             "otherwise the command to run is printed)",
     )
 
 
@@ -291,12 +423,8 @@ def run_from_args(args: argparse.Namespace, emitter) -> int:  # noqa: ANN001
         )
     if args.dry_run:
         return int(ExitCode.OK)
-    try:
-        proc = subprocess.run(cmd, cwd=cwd, env=env)
-    except KeyboardInterrupt:
-        return 130
-    except OSError as e:
-        print(f"[start] Could not run it: {e}", file=sys.stderr, flush=True)
-        return int(ExitCode.USAGE)
-    # A signal death arrives as a negative returncode; -N is the honest "128+N".
-    return proc.returncode if proc.returncode >= 0 else 128 - proc.returncode
+    return run_watching(
+        cmd, cwd, env, assume_yes=bool(getattr(args, "yes", False)), may_ask=True,
+        rerun=("renest " + shlex.join(sys.argv[1:])) if sys.argv[1:] else "renest start",
+        machine=getattr(args, "machine", None),
+    )

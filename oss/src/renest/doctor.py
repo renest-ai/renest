@@ -59,6 +59,10 @@ __all__ = [
     "PrecheckReport",
     "check_driver",
     "check_cpu_flags",
+    "check_cpu_vs_packed",
+    "collect_packing_cpu_flags",
+    "cpu_isa_flags",
+    "CPU_ISA_FLAGS",
     "check_egress",
     "check_proxy",
     "proxy_env_present",
@@ -149,7 +153,11 @@ _LOCK_CHECKS: frozenset[str] = frozenset(
 #: the JSON, and **never move the exit code**: a verdict about a nest must not
 #: turn yellow over how the tool itself happens to be installed — that trains
 #: people to reach for --force, and --force fixes nothing about it anyway.
-_ADVICE_ONLY_CHECKS: frozenset[str] = frozenset({"tool_isolation"})
+#: ``cpu_vs_packed`` is here for the same reason from the other side: it is a
+#: lead to keep in mind if the app does not start, not a finding about this nest
+#: (founder, 2026-10-07: neutral reference, never a conclusion), so it must not
+#: turn a clean verdict into a warning exit code either.
+_ADVICE_ONLY_CHECKS: frozenset[str] = frozenset({"tool_isolation", "cpu_vs_packed"})
 
 #: Names of the Intel/AMD chip family — every spelling ``platform.machine()``
 #: uses for it across systems.
@@ -480,6 +488,149 @@ def check_cpu_flags(
         f"CPU has everything needed ({' '.join(required)})",
         reading,
     )
+
+
+# --------------------------------------------------------------------------
+# CPU instructions: this machine against the one the nest was packed on (2.13)
+# --------------------------------------------------------------------------
+#: Which CPU feature flags a nest records (``runtime.cpu_flags``, format 2.13):
+#: **only the instruction-set extensions compiled code can be built to assume**,
+#: not the whole ``flags`` line.
+#:
+#: Why a subset. The full line is ~100-150 words and most of it is about the
+#: kernel and the hypervisor (``hypervisor``, ``vmx``, ``constant_tsc``, mitigation
+#: markers ...), which differ between two VMs on the *same* chip. Comparing those
+#: would put a note on nearly every rented machine and teach people to skip it.
+#: What can actually stop a program is an instruction its machine code uses and
+#: this CPU lacks, so the list is the x86-64 levels compilers target
+#: (``-march=x86-64-v2/v3/v4``: SSE4.x, POPCNT, AVX, AVX2, FMA, F16C, BMI, MOVBE,
+#: AVX-512) plus the newer families prebuilt wheels are seen to use (AMX, AVX-VNNI,
+#: crypto/GF extensions). ``sse``/``sse2`` are left out: every x86-64 CPU has them.
+#:
+#: The case behind it (batch 22, cell C5, 2026-10-07): a custom node depended on
+#: pedalboard 0.9.25, whose official manylinux wheel carries ~20,000 AVX-512
+#: instructions (0.9.24 and 0.9.22 carry none; counted with objdump). On an AMD
+#: EPYC 7763 (no avx512f) ComfyUI died at start-up with "Illegal instruction"; on
+#: an Intel Xeon Gold 6342 (avx512) it ran. Packed on the Intel, restored on the
+#: AMD: every file correct, the app would not start, and nothing said why.
+#:
+#: This is a writer-side format contract, not a world fact: a reader compares
+#: whatever names the nest carries, so widening this set later needs no reader change.
+CPU_ISA_FLAGS: frozenset[str] = frozenset({
+    "pni", "ssse3", "sse4_1", "sse4_2", "sse4a", "popcnt", "abm",
+    "avx", "avx2", "fma", "fma4", "xop", "f16c", "bmi1", "bmi2", "movbe",
+    "aes", "pclmulqdq", "sha_ni", "vaes", "vpclmulqdq", "gfni",
+    "avx_vnni", "avx_vnni_int8", "avx_ifma", "avx_ne_convert",
+})
+#: Whole families recorded by prefix: every AVX-512 and AMX sub-feature.
+CPU_ISA_PREFIXES: tuple[str, ...] = ("avx512", "amx")
+
+_FLAGS_LINE = re.compile(r"^\s*flags\s*:\s*(.*)$", re.IGNORECASE | re.MULTILINE)
+
+
+def cpu_isa_flags(text: str) -> list[str] | None:
+    """The recorded subset (see :data:`CPU_ISA_FLAGS`) of the first ``flags``
+    line in ``/proc/cpuinfo`` or ``lscpu`` output, sorted.
+
+    ``None`` when no flags line is there at all -- never an empty list, which
+    would claim "read it, and this CPU has none of them".
+    """
+    m = _FLAGS_LINE.search(text or "")
+    if not m:
+        return None
+    words = set(m.group(1).lower().split())
+    return sorted(w for w in words
+                  if w in CPU_ISA_FLAGS or w.startswith(CPU_ISA_PREFIXES))
+
+
+def collect_packing_cpu_flags(cpuinfo: str | os.PathLike[str] = "/proc/cpuinfo",
+                              machine: str | None = None) -> list[str] | None:
+    """What the packing machine's CPU supports, shaped for ``runtime.cpu_flags``
+    (format 2.13), or ``None`` when it cannot be read.
+
+    Intel/AMD on Linux only: ``/proc/cpuinfo`` is a Linux file, and these names
+    mean nothing on other chip families. **Read nothing -> write nothing**: an
+    absent field means "not recorded", and a reader stays silent on it.
+    Never raises -- a pack must not stop over an optional reading.
+    """
+    arch = (platform.machine() if machine is None else machine).strip().lower()
+    if arch not in X86_ARCH_NAMES:
+        return None
+    try:
+        text = Path(cpuinfo).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return cpu_isa_flags(text)
+
+
+def _isa_family(flag: str) -> str:
+    if flag.startswith("avx512"):
+        return "AVX-512"
+    if flag.startswith("amx"):
+        return "AMX"
+    return flag.upper()
+
+
+def check_cpu_vs_packed(nest_runtime: dict | None, this_flags_text: str,
+                        *, arch: str = "x86_64") -> CheckResult:
+    """This CPU against the instruction-set extensions the packing machine had.
+
+    **Advisory, and phrased as a lead, never a verdict** (founder, 2026-10-07:
+    record it, but say it carefully and neutrally -- give the user something to
+    check, do not conclude for them). Most software never uses these
+    instructions, or picks a code path at run time; only a few prebuilt
+    libraries assume them. So a gap is a note to keep in mind *if* the app does
+    not start, not a prediction that it won't. It never rejects and never moves
+    the exit code (listed in ``_ADVICE_ONLY_CHECKS``).
+
+    Silent (``skip``) whenever there is nothing honest to compare: a nest that
+    never recorded the field, a machine that is not Intel/AMD (the chip-family
+    check owns that question), or a machine whose own feature list is unreadable.
+    """
+    rt = nest_runtime if isinstance(nest_runtime, dict) else {}
+    raw = rt.get("cpu_flags")
+    packed = sorted({f.lower() for f in raw if isinstance(f, str)}) if isinstance(raw, list) else None
+    reading: dict = {"packed": packed, "arch": arch}
+    if packed is None:
+        return CheckResult(
+            "cpu_vs_packed", "skip",
+            "This nest does not record which CPU instructions its packing machine had "
+            "(nests before format 2.13 don't), so there is nothing to compare.", reading)
+    known_arch = arch.strip().lower()
+    if known_arch and known_arch not in X86_ARCH_NAMES:
+        return CheckResult(
+            "cpu_vs_packed", "skip",
+            f"This machine's CPU is {arch}, not an Intel/AMD one, so the packing "
+            f"machine's instruction list does not apply here.", reading)
+    m = _FLAGS_LINE.search(this_flags_text or "")
+    if not m:
+        return CheckResult(
+            "cpu_vs_packed", "skip",
+            "Could not read this machine's CPU feature list, so it was not compared "
+            "with the machine this nest was packed on.", reading)
+    here = set(m.group(1).lower().split())
+    missing = [f for f in packed if f not in here]
+    reading["missing"] = missing
+    if not missing:
+        return CheckResult(
+            "cpu_vs_packed", LEVEL_PASS,
+            "This CPU has every instruction-set extension the packing machine's CPU "
+            "had.", reading)
+    families: list[str] = []
+    for f in missing:
+        if _isa_family(f) not in families:
+            families.append(_isa_family(f))
+    shown = ", ".join(missing[:6]) + ("…" if len(missing) > 6 else "")
+    return CheckResult(
+        "cpu_vs_packed", LEVEL_WARN,
+        f"The machine this nest was packed on supports {' and '.join(families[:3])}"
+        f"{' and more' if len(families) > 3 else ''} ({shown}); this one does not. "
+        f"Most software runs fine without these instructions, but a few prebuilt "
+        f"libraries assume them and can stop at start-up with 'Illegal instruction'. "
+        f"If the app does not start here, trying a machine whose CPU supports these "
+        f"instructions is one thing to check. For reference only: nothing is held "
+        f"back on this count.",
+        reading)
 
 
 #: The two forms GPU compute code takes inside a package — the distinction is
@@ -2668,11 +2819,18 @@ def run_precheck(
     report.checks.append(
         check_driver(collect_driver_version(), cuda_tag, expected_driver, floors=floors)
     )
+    _cpu_text = collect_cpu_flags()
     report.checks.append(
         check_cpu_flags(
-            collect_cpu_flags(), required=required_flags, arch=platform.machine()
+            _cpu_text, required=required_flags, arch=platform.machine()
         )
     )
+    # The packing machine's CPU against this one (format 2.13). Only when the
+    # nest recorded it: an older nest gets no row at all, not even a "skip" --
+    # there is nothing to say about a question the nest never asked.
+    if isinstance((nest_runtime or {}).get("cpu_flags"), list):
+        report.checks.append(
+            check_cpu_vs_packed(nest_runtime, _cpu_text, arch=platform.machine()))
     # Chip-family gate (blocking). **Its position here is deliberate**: it is
     # cheaper than every other check (one string compared against another), and
     # once it fails, the verdicts of all the later checks are meaningless — that

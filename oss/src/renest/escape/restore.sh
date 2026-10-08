@@ -2,10 +2,10 @@
 # =============================================================================
 # Renest restore.sh — the escape hatch
 #
-# Nest formats this copy reads: 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12  (and, with a warning,
+# Nest formats this copy reads: 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13  (and, with a warning,
 #   any later 2.x — a higher minor version only ever adds optional fields, and
 #   refusing one would turn a nest whose bytes restore perfectly into a brick).
-#   Written for format 2.12, 2026-09-13. Keep this line: from format 2.3 on a
+#   Written for format 2.13, 2026-10-07. Keep this line: from format 2.3 on a
 #   copy of this script travels inside every nest at .renest/escape/restore.sh,
 #   and this comment is how you tell which copy you are holding — there is no
 #   version field anywhere else.
@@ -351,10 +351,20 @@ FV=$(jq -r '.format_version' "$MANIFEST")
 # which the loaded list cannot see. This script only gets the bytes back and does
 # not start the application or import any node, so there is nothing here to act
 # on. Every 2.0–2.11 nest restores unchanged: the field is absent there.
+# 2.13 (2026-10-07) adds two optional fields. runtime.cpu_flags, the
+# instruction-set extensions (AVX2, AVX-512, ...) the packing machine's CPU had:
+# the agent side mentions a gap as one thing to check if the application does
+# not start; it never refuses on it. This script does not start the application,
+# so there is nothing here to act on. And python_lock.vendored_wheels: the built
+# wheel of each package that was installed from a git repository or a direct
+# download address, stored in the nest with its original source kept beside it.
+# Section 5a below installs the stored wheel when it fits this machine and falls
+# back to the lock line when it does not, saying why. Every 2.0–2.12 nest
+# restores unchanged: both fields are absent there.
 case "$FV" in
-  2.0|2.1|2.2|2.3|2.4|2.5|2.6|2.7|2.8|2.9|2.10|2.11|2.12) ;;
+  2.0|2.1|2.2|2.3|2.4|2.5|2.6|2.7|2.8|2.9|2.10|2.11|2.12|2.13) ;;
   2.*)
-    warn "This nest says format $FV; this script knows up to 2.12. Same major version, so it only adds optional fields this script does not use — carrying on. A newer Renest will make full use of them." ;;
+    warn "This nest says format $FV; this script knows up to 2.13. Same major version, so it only adds optional fields this script does not use — carrying on. A newer Renest will make full use of them." ;;
   *)
     # Same three facts the agent side gives, in the same order: how old this nest is,
     # that there is no upgrade path and why, and that the files themselves are fine.
@@ -362,7 +372,7 @@ case "$FV" in
     # is not (the manifest still lists every one of them, with fingerprints).
     _WHEN=$(jq -r '.created_at // empty' "$MANIFEST" 2>/dev/null | cut -c1-10)
     _NFILES=$(jq -r '(.files // []) | length' "$MANIFEST" 2>/dev/null)
-    die FORMAT-VERSION "Unrecognised nest format version: $FV — this script reads format 2.x (knows 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11 and 2.12).${_WHEN:+ This nest was packed on ${_WHEN}.} Nests in the older 1.x format cannot be read here, and **there is no upgrade path**: format 2.0 made it compulsory to say which parts of a nest are the application and which are your own code, and nobody can work that out after the fact.${_NFILES:+ **Your files are not lost** — this nest still lists all ${_NFILES} of them with their fingerprints, so they can be fetched one by one even though the environment cannot be rebuilt automatically.} If you still have the environment, pack it again with a current Renest." ;;
+    die FORMAT-VERSION "Unrecognised nest format version: $FV — this script reads format 2.x (knows 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12 and 2.13).${_WHEN:+ This nest was packed on ${_WHEN}.} Nests in the older 1.x format cannot be read here, and **there is no upgrade path**: format 2.0 made it compulsory to say which parts of a nest are the application and which are your own code, and nobody can work that out after the fact.${_NFILES:+ **Your files are not lost** — this nest still lists all ${_NFILES} of them with their fingerprints, so they can be fetched one by one even though the environment cannot be rebuilt automatically.} If you still have the environment, pack it again with a current Renest." ;;
 esac
 
 # ---- Where the files may land ------------------------------------------------
@@ -410,8 +420,10 @@ root_dir() {
 #      nest cannot smuggle your training data into them.
 #   4. no file may land somewhere it would be RUN rather than read. Staying
 #      inside $TARGET is not enough: a ".pth" dropped into site-packages runs
-#      on every interpreter start, and a ".py" dropped into the app's folder
-#      gets imported at launch. files[] holds assets — models, LoRAs, inputs —
+#      on every interpreter start (the folder rule catches that), and a ".py"
+#      dropped into the app's folder gets imported at launch. A ".pth" anywhere
+#      else is a PyTorch weights file (SAM, upscalers, face models) and is data:
+#      Python only runs ".pth" files that sit in a site folder. files[] holds assets — models, LoRAs, inputs —
 #      never program code, which travels in code_deps instead. This check is
 #      what enforces that, and it looks only at the path: since format 2.7 the
 #      category beside it is free text, so trusting it would trust the nest.
@@ -428,7 +440,7 @@ BADPATH=$(jq -r '
           then "a path that is not allowed in the model cache: \($p)"
         elif ($r == "env") and ($p | test("(^|/)(\\.venv|venv|site-packages|bin|Scripts)/"))
           then "a path where files get run as code, not read as data: \($p)"
-        elif ($r == "env") and ($p | test("\\.(py|pth|pyc|pyd)$"))
+        elif ($r == "env") and ($p | test("\\.(py|pyc|pyd)$"))
           then "a path that is program code, not an asset: \($p)"
         else empty end),
     (.code_deps[]? | (.install_path // "") as $p
@@ -1333,6 +1345,89 @@ while read -r dep; do
   fi
 done < <(jq -c '.code_deps[]' "$MANIFEST")
 
+# BEGIN wheel-fits -- the both-legs test runs exactly these lines (format 2.13)
+# wheel_fits <wheel file name> <python tag, e.g. cp311> <x86_64|aarch64> <linux-gnu|linux-musl|macos|windows>
+#   Prints nothing when the wheel installs here; otherwise "<python tags> / <platform
+#   tags>" it was built for. The same test the Renest agent uses (wheels.py,
+#   _wheel_matches): the python tag is this exact one, py3, pyXY at or below this
+#   version, or abi3 at or below it; one platform tag is "any", or names this
+#   operating system and ends in this architecture. Compared case by case against the
+#   agent in oss/tests/consistency/test_both_legs_agree_on_vendored_wheels.py.
+_wf_minor() { # cp311 / py39 / pp310 -> 11 / 9 / 10; anything else -> nothing
+  case "$1" in
+    cp3[0-9]*|py3[0-9]*|pp3[0-9]*) _m="${1#??3}"; case "$_m" in *[!0-9]*) ;; *) printf '%s' "$_m" ;; esac ;;
+  esac
+}
+wheel_fits() {
+  local fn="$1" want="$2" arch="$3" osf="$4" stem py abi plat q t tos b w ok_plat=0 ok_py=0
+  case "$fn" in *.whl) ;; *) printf '%s' "$fn"; return 0 ;; esac
+  stem="${fn%.whl}"
+  if [ "$(printf '%s' "$stem" | awk -F- '{print NF}')" -lt 5 ]; then printf '%s' "$fn"; return 0; fi
+  plat="${stem##*-}"; stem="${stem%-*}"
+  abi="${stem##*-}"; stem="${stem%-*}"
+  py="${stem##*-}"
+  for q in $(printf '%s' "$plat" | tr '.' ' '); do
+    if [ "$q" = "any" ]; then ok_plat=1; break; fi
+    tos=""
+    case "$(printf '%s' "$q" | tr '[:upper:]' '[:lower:]')" in
+      manylinux*) tos=linux-gnu ;;
+      musllinux*) tos=linux-musl ;;
+      linux_*) tos=linux-gnu ;;
+      macosx*) tos=macos ;;
+      win32*|win_*|win-*) tos=windows ;;
+    esac
+    [ -n "$tos" ] && [ "$tos" = "$osf" ] || continue
+    case "$q" in "$arch"|*"_$arch") ok_plat=1; break ;; esac
+  done
+  if [ "$ok_plat" = 1 ]; then
+    for t in $(printf '%s' "$py" | tr '.' ' '); do
+      if [ "$t" = "$want" ]; then ok_py=1; break; fi
+      case "$want" in cp3*|pp3*|py3*) ;; *) continue ;; esac
+      if [ "$t" = "py3" ]; then ok_py=1; break; fi
+      b=$(_wf_minor "$t"); w=$(_wf_minor "$want")
+      [ -n "$b" ] && [ -n "$w" ] || continue
+      case "$t" in
+        py*) [ "$b" -le "$w" ] && { ok_py=1; break; } ;;
+        *) case ".$abi." in *.abi3.*) [ "$b" -le "$w" ] && { ok_py=1; break; } ;; esac ;;
+      esac
+    done
+  fi
+  [ "$ok_plat" = 1 ] && [ "$ok_py" = 1 ] && return 0
+  printf '%s / %s' "$py" "$plat"
+  return 0
+}
+_wf_arch() { case "$(uname -m | tr '[:upper:]' '[:lower:]')" in x86_64|amd64) echo x86_64 ;; aarch64|arm64) echo aarch64 ;; *) echo x86_64 ;; esac; }
+_wf_os() {
+  case "$(uname -s)" in
+    Darwin) echo macos ;;
+    Linux) if ls /lib/ld-musl-* >/dev/null 2>&1; then echo linux-musl; else echo linux-gnu; fi ;;
+    *) uname -s | tr '[:upper:]' '[:lower:]' ;;
+  esac
+}
+# _vw_swap <lockfile> <package name> <replacement line>
+#   Replaces that package's line (and the lines a trailing backslash continues it
+#   onto) in place. Names compare the way installers compare them: case and the
+#   runs of - _ . do not matter. Prints "swapped" when it found the line.
+_vw_swap() {
+  awk -v want="$2" -v rep="$3" '
+    function canon(s) { s = tolower(s); gsub(/[-_.]+/, "-", s); return s }
+    BEGIN { want = canon(want); done = 0; skip = 0 }
+    {
+      if (skip) { skip = ($0 ~ /\\[ \t]*$/); next }
+      if (!done && match($0, /^[ \t]*[A-Za-z0-9][A-Za-z0-9._-]*/)) {
+        nm = substr($0, RSTART, RLENGTH); sub(/^[ \t]+/, "", nm)
+        rest = substr($0, RSTART + RLENGTH)
+        if (canon(nm) == want && rest ~ /^[ \t]*(\[[^]]*\])?[ \t]*(==|@)/) {
+          print rep; done = 1; skip = ($0 ~ /\\[ \t]*$/); next
+        }
+      }
+      print
+    }
+    END { if (done) print "swapped" > "/dev/stderr" }' "$1" > "$1.tmp" 2> "$1.said" && mv "$1.tmp" "$1"
+  cat "$1.said"; rm -f "$1.said"
+}
+# END wheel-fits
+
 # ---- 5. Rebuild the Python environment from the lockfile --------------------
 STAGE="S3-deps"
 log "Rebuilding the Python environment…"
@@ -1420,6 +1515,54 @@ $(printf '%s\n' "$UNSAFE_URLS" | head -5 | sed -e 's/?.*//' -e 's/^/       /')
   fi
 fi
 # END deps-source-gate
+# ---- 5a. Wheels this nest carries (format 2.13) -----------------------------
+# A package installed from a git repository or a direct download address travels as
+# the wheel that was installed on the packing machine. When it fits this machine
+# (Python tag and platform), install that file instead of the lock line, so the
+# install needs neither git, nor a compiler, nor that host. When it does not fit, say
+# why and leave the line alone: the original source is the fallback. Done **after**
+# the source check above judged the lock as written -- a stored wheel is still code
+# from that source. The nest's own lock is never edited; uv gets a working copy.
+# BEGIN vendored-swap -- the both-legs test runs these lines through the whole script
+VW_N=$(jq -r '(.python_lock.vendored_wheels // []) | length' "$MANIFEST")
+if [ "$VW_N" -gt 0 ]; then
+  VW_PYTAG="cp$(printf '%s' "$PYVER" | cut -d. -f1)$(printf '%s' "$PYVER" | cut -d. -f2)"
+  VW_ARCH=$(_wf_arch)
+  VW_OS=$(_wf_os)
+  VW_ROOT="$(cd "$TARGET" 2>/dev/null && pwd -P)" || VW_ROOT="$TARGET"
+  VW_LOCK="$TARGET/.renest/requirements.vendored.lock"
+  cp "$LOCK_FOR_UV" "$VW_LOCK"
+  VW_USED=""
+  VW_COUNT=0
+  _i=0
+  while [ "$_i" -lt "$VW_N" ]; do
+    _VW_NAME=$(jq -r ".python_lock.vendored_wheels[$_i].name // empty" "$MANIFEST")
+    _VW_FILE=$(jq -r ".python_lock.vendored_wheels[$_i].filename // empty" "$MANIFEST")
+    _VW_SHA=$(jq -r ".python_lock.vendored_wheels[$_i].wheel.sha256 // empty" "$MANIFEST")
+    _VW_SRC=$(jq -r ".python_lock.vendored_wheels[$_i].source // {} | if .kind == \"git\" then \"git+\" + (.url // \"\") + \"@\" + ((.commit // \"\")[0:12]) else (.url // \"its lock line\") end" "$MANIFEST")
+    _i=$((_i + 1))
+    if [ -z "$_VW_NAME" ] || [ -z "$_VW_FILE" ] || [ -z "$_VW_SHA" ]; then continue; fi
+    case "$_VW_FILE" in */*|.*) continue ;; esac
+    _VW_BUILT=$(wheel_fits "$_VW_FILE" "$VW_PYTAG" "$VW_ARCH" "$VW_OS")
+    if [ -n "$_VW_BUILT" ]; then
+      warn "$_VW_NAME: not installing the wheel this nest carries ($_VW_FILE) -- it is built for $_VW_BUILT, and this machine needs $VW_PYTAG / $VW_OS $VW_ARCH. Installing it from its original source instead: $_VW_SRC."
+      continue
+    fi
+    fetch_blob "$_VW_SHA" "$TARGET/.renest/staging/wheels/$_VW_FILE"
+    _VW_URI="$VW_ROOT/.renest/staging/wheels/$_VW_FILE"
+    _VW_URI="${_VW_URI//\%/%25}"
+    _VW_URI="file://${_VW_URI// /%20}"
+    if [ "$(_vw_swap "$VW_LOCK" "$_VW_NAME" "$_VW_NAME @ $_VW_URI --hash=sha256:$_VW_SHA")" = "swapped" ]; then
+      VW_USED="${VW_USED:+$VW_USED, }$_VW_NAME"
+      VW_COUNT=$((VW_COUNT + 1))
+    fi
+  done
+  if [ -n "$VW_USED" ]; then
+    LOCK_FOR_UV="$VW_LOCK"
+    log "Installing $VW_COUNT package(s) from the wheels this nest carries ($VW_USED), so their original source is not contacted."
+  fi
+fi
+# END vendored-swap
 # Re-running has to be safe: anyone who hits a failure will try again. uv fails
 # hard when the directory exists but is not a venv, and --clear does not save it,
 # so remove it first. Only the .venv this script created — nothing else.

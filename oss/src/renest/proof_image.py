@@ -194,7 +194,9 @@ def render_recorded_workflow(
     out_dir.mkdir(parents=True, exist_ok=True)
     base = f"http://127.0.0.1:{port}"
     with httpx.Client(timeout=30.0) as client:
-        resp = client.post(f"{base}/prompt", json={"prompt": workflow})
+        from .comfy_prompt import HEADERS, prompt_body
+
+        resp = client.post(f"{base}/prompt", content=prompt_body(workflow), headers=HEADERS)
         if resp.status_code >= 400:
             raise RuntimeError(
                 f"The rebuilt app refused to run the workflow ({resp.status_code}): "

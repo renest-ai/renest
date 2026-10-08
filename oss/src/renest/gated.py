@@ -126,6 +126,30 @@ def find_token(env: dict[str, str] | None = None, home: Path | None = None) -> s
 _PAGE_TYPES = frozenset({"text/html", "application/xhtml+xml", "text/plain"})
 
 
+#: The only hosts the user's Hugging Face token is ever sent to. ``origin_url``
+#: comes from the nest, and whoever packed the nest wrote it: a nest naming some
+#: other host must not be able to collect the receiver's token. Redirects off
+#: these hosts already drop the header (httpx strips it on a cross-host hop); this
+#: covers the first request.
+_TOKEN_HOSTS = ("huggingface.co", "hf.co")
+
+
+def token_may_go_to(url: str) -> bool:
+    """Is ``url`` an https address on Hugging Face, the issuer of the token?"""
+    try:
+        u = httpx.URL(url)
+    except Exception:
+        return False
+    host = (u.host or "").lower()
+    return u.scheme == "https" and any(
+        host == h or host.endswith("." + h) for h in _TOKEN_HOSTS
+    )
+
+
+def _auth_headers(url: str, token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"} if token and token_may_go_to(url) else {}
+
+
 def check_reach(asset: GatedAsset, *, token: str, client: httpx.Client) -> GatedAsset:
     """Probe whether this asset can be got right now, **on this machine, with
     your own credentials**.
@@ -138,7 +162,7 @@ def check_reach(asset: GatedAsset, *, token: str, client: httpx.Client) -> Gated
         asset.reach = Reach.NO_SOURCE
         asset.detail = "we do not know where this one came from"
         return asset
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    headers = _auth_headers(asset.origin_url, token)
     try:
         r = client.head(asset.origin_url, headers=headers, follow_redirects=True, timeout=20.0)
         code = r.status_code
@@ -174,7 +198,13 @@ def check_reach(asset: GatedAsset, *, token: str, client: httpx.Client) -> Gated
         asset.reach = Reach.FREE
         return asset
     if code in (401, 403):
-        if not token:
+        if token and not token_may_go_to(asset.origin_url):
+            asset.reach = Reach.ERROR
+            asset.detail = (
+                "this host asks for a sign-in; your Hugging Face token is only ever "
+                "sent to huggingface.co, so get this file from that site yourself"
+            )
+        elif not token:
             asset.reach = Reach.NO_TOKEN
             asset.detail = "needs your own account, and this machine has no token"
         elif asset.gated_form == "manual":
@@ -263,7 +293,7 @@ def fetch_from_origin(
     the spot** instead of surfacing as an incomprehensible error when the
     application starts.
     """
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    headers = _auth_headers(asset.origin_url, token)
     tmp = dest.with_suffix(dest.suffix + ".part")
     dest.parent.mkdir(parents=True, exist_ok=True)
     h = hashlib.sha256()

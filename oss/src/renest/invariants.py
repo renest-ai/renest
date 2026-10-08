@@ -137,8 +137,9 @@ def i2_code_bytes_never_downloaded(
 
     tar happily archives Git LFS pointer text and empty submodule folders,
     sha256 matches on restore, and the rebuilt environment is missing the code.
-    Error level — pack has always hard-refused this; the messages below are the
-    exact text pack raised before the judgment moved here (behavior unchanged).
+    Error level. Pack first downloads what it can and leaves example material
+    (pictures, videos, documents) out of the archive (:mod:`renest.lfs`, 0.1.20), so
+    what reaches this check is a placeholder that could be code or model weights.
 
     Judged from the directories about to be archived, so only callers that have
     them (pack) can check it; a manifest alone cannot say.
@@ -146,6 +147,7 @@ def i2_code_bytes_never_downloaded(
     # Lazy import: pack imports this module at its archive step, so a top-level
     # import back into pack would be a cycle. The walkers stay in pack — they are
     # archive plumbing shared with the size preview — the *judgment* lives here.
+    from .lfs import refusal_message
     from .pack import _empty_submodule_dirs, _lfs_pointer_files
 
     out: list[Violation] = []
@@ -156,11 +158,8 @@ def i2_code_bytes_never_downloaded(
                 Violation(
                     "error",
                     "code-bytes-never-downloaded",
-                    f"{d.install_path} has {len(pointers)} file(s) that are only Git LFS "
-                    f"pointer text, not the real files — this copy never downloaded them, "
-                    f"so the nest would verify fine and rebuild with the code missing.\n"
-                    f"  For example: {', '.join(pointers[:3])}\n"
-                    f"  Run `git lfs pull` inside {d.install_path}, then pack again.",
+                    refusal_message(d.install_path, pointers, d.path,
+                                    is_checkout=(d.path / ".git").exists()),
                 )
             )
             # Same order as the original refusal: pointers first, and a directory

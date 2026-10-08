@@ -949,6 +949,16 @@ def capture_training(
         "digest": "sha256:<fill in the image digest>",
     }
     base_image.update({k: v for k, v in (run_record.get("base_image") or {}).items() if v})
+    if str(base_image["ref"]).startswith("<"):
+        # The record names no image: our own template image names itself (see
+        # renest.baseimage); any other image stays unknown.
+        from .baseimage import detect_base_image
+
+        _found, _note = detect_base_image()
+        if _found:
+            base_image = dict(_found)
+        elif _note:
+            gaps.append(_note)
     # When the image name is known, **look the digest up ourselves** instead of making someone
     # copy 64 hex characters by hand.
     if str(base_image["digest"]).startswith("sha256:<") and not str(

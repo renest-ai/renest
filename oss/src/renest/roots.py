@@ -109,10 +109,15 @@ def unsafe_relpath(p: object) -> bool:
 #:   every start** -- nobody has to import it.
 #: - ``bin``: executables on PATH.
 _CODE_DIRS = frozenset({".venv", "venv", "site-packages", "bin", "Scripts"})
-#: Suffixes: the file is code in itself. ``.pth`` as above; a ``.py`` landing
-#: in the host app's or an extension's directory runs as soon as the app
-#: imports it at startup.
-_CODE_SUFFIXES = (".py", ".pth", ".pyc", ".pyd")
+#: Suffixes: the file is code in itself -- a ``.py`` landing in the host app's
+#: or an extension's directory runs as soon as the app imports it at startup.
+#: ``.pth`` is **not** here: Python only executes ``.pth`` files that sit in a
+#: site directory, which the folder rule above already refuses. Anywhere else a
+#: ``.pth`` is PyTorch weights (SAM, upscalers, face models); refusing it by
+#: suffix left those models out of every nest (measured 2026-10-07: a SAM
+#: model a workflow loaded was dropped as "program code", and the restore could
+#: not run the workflow).
+_CODE_SUFFIXES = (".py", ".pyc", ".pyd")
 
 
 def code_position(p: str) -> str | None:
