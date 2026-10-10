@@ -31,6 +31,10 @@ __all__ = [
     "scrub_events",
     "machine_facts",
     "disclosure",
+    "disclosure_brief",
+    "PACK_SIDE_FIELDS",
+    "NEST_IS_STORED",
+    "REPORTS_DELETABLE",
     "USER_AGENT",
 ]
 
@@ -168,6 +172,41 @@ NEVER_UPLINKED = (
     "anything about the models, datasets or images themselves",
 )
 
+#: Which of the whitelisted fields the **pack** side (``hosted.py``) fills in. The
+#: whitelist above is shared by both pipes and is the restore side's list as it stands;
+#: the pack side sends a subset, and its disclosure names that subset and nothing else
+#: (a test runs the real uploader and checks every field it sent is in here).
+PACK_SIDE_FIELDS: dict[str, frozenset[str]] = {
+    "stage_start": frozenset({"stage", "blobs_total", "blobs_to_upload", "declared_bytes"}),
+    "progress": frozenset({"stage", "bytes", "seconds", "mbps"}),
+    "stage_done": frozenset(
+        {"stage", "duration_s", "challenge_verified", "challenge_unproven",
+         "challenge_bytes_saved"}
+    ),
+    "error": frozenset({"stage", "exit_code"}),
+    "result": frozenset(
+        {"ok", "exit_code", "uploaded_blobs", "skipped_blobs", "uploaded_bytes", "seconds"}
+    ),
+}
+
+#: The "never" list is true of the **progress report** only. A nest stored on the drive
+#: holds the user's own files -- their names, the models, and workflow files with the
+#: prompts in them -- so the text must say where that list stops (E2 measured 2026-10-08:
+#: an unscoped "never" reads as "Renest never holds your file names").
+NEST_IS_STORED = (
+    "That is the report only. A nest stored on a Renest drive is kept there whole: "
+    "its files, their names, and the prompts inside its workflows."
+)
+
+#: The reports themselves can be deleted (the console's Settings page carries the
+#: button, and account deletion takes them too). No web address
+#: here on purpose: a service address outside the few allowed modules is how a sign-up
+#: pitch gets in, and a guard (test_cli_stays_quiet_about_selling) holds that line.
+REPORTS_DELETABLE = (
+    "You can delete these reports any time under Settings → Run reports on your drive; "
+    "deleting your account deletes them too."
+)
+
 
 # --------------------------------------------------------------------------
 # The gate itself
@@ -267,8 +306,10 @@ MACHINE_FIELDS: dict[str, str] = {
     "driver": "GPU driver version",
     "driver_cuda": "the newest CUDA that driver can carry",
     "cpu_features": "which of the CPU instruction sets torch needs are present",
-    "disk_free_gb": "free space where it is rebuilding (the amount, never the path)",
-    "cloud": "which cloud it looks like, guessed from environment variables only",
+    "disk_free_gb": "free disk space (the amount, never the path)",
+    # Sent only when one of the markers below is set. Over ssh on RunPod none is (E2,
+    # 2026-10-08: no ``cloud`` field at all), so the words must not read as "always".
+    "cloud": "which cloud it is, only if an environment variable names it (otherwise left out)",
 }
 
 #: The CPU instruction sets torch and kornia need; without them ComfyUI dies with
@@ -424,8 +465,32 @@ def machine_facts(target: str | os.PathLike[str] | None = None) -> dict[str, Any
 # --------------------------------------------------------------------------
 # The list meant for people to read
 # --------------------------------------------------------------------------
-def disclosure_brief() -> str:
-    """The four lines a person actually reads while waiting for a rebuild.
+_SIDES = ("restore", "pack")
+
+
+def _check_side(side: str) -> None:
+    if side not in _SIDES:
+        raise ValueError(f"unknown side: {side!r} (expected one of {_SIDES})")
+
+
+def _fields_for(side: str) -> list[str]:
+    """The human sentences for the fields ``side`` sends, in whitelist order, once each.
+
+    One source: the sentences live in :data:`UPLINK_FIELDS`; the pack side only filters
+    them through :data:`PACK_SIDE_FIELDS`, it never carries a second copy."""
+    _check_side(side)
+    out: list[str] = []
+    for etype, fields in UPLINK_FIELDS.items():
+        for key, (_kind, why) in fields.items():
+            if side == "pack" and key not in PACK_SIDE_FIELDS.get(etype, frozenset()):
+                continue
+            if why not in out:
+                out.append(why)
+    return out
+
+
+def disclosure_brief(side: str = "restore") -> str:
+    """The six lines a person actually reads while waiting for a rebuild or an upload.
 
     **Why a short form exists at all.** The full list below is deliberately printed in the
     terminal rather than hidden behind a website link -- its whole credibility is being
@@ -434,47 +499,54 @@ def disclosure_brief() -> str:
     disclosure scrolled past and the founder could not tell whether the command was working.
     A wall of text nobody finishes is not disclosure either.
 
-    So: four lines every time, and the complete field-by-field list one flag away and still
+    So: six lines every time, and the complete field-by-field list one flag away and still
     **inside the tool** (``--verbose``) -- never "see our website".
     """
+    _check_side(side)
+    lead = "Upload progress goes" if side == "pack" else "Progress goes back"
     return (
-        "Progress goes back to your drive so you can watch it there, and so we can help "
+        f"{lead} to your drive so you can watch it there, and so we can help "
         "if it fails.\n"
         "  Sent: which step it is on, how many bytes moved and how fast, and this "
         "machine's hardware and versions.\n"
-        "  Never sent: credentials, your file names or paths, or anything about the "
-        "models, data or images themselves.\n"
+        "  Never in this report: credentials, your file names or paths, or anything "
+        "about the models, data or images themselves.\n"
+        f"  {NEST_IS_STORED}\n"
+        f"  {REPORTS_DELETABLE}\n"
         "  Turn it off with --no-report; see every single field with --verbose.\n"
     )
 
 
-def disclosure() -> str:
-    """A note short enough to finish on the spot: what goes up, what never goes up,
-    and how to switch it off.
+def disclosure(side: str = "restore") -> str:
+    """A note short enough to finish on the spot: what the progress report carries,
+    what it never carries, and how to switch it off.
 
-    Never replaced by "see the link on our website" -- all of its credibility is in
-    being readable right here.
+    ``side`` is ``"restore"`` (the whole whitelist) or ``"pack"`` (the subset in
+    :data:`PACK_SIDE_FIELDS`). Never replaced by "see the link on our website" -- all
+    of its credibility is in being readable right here.
     """
-    sends: list[str] = []
-    seen: set[str] = set()
-    for fields in UPLINK_FIELDS.values():
-        for _key, (_kind, why) in fields.items():
-            if why not in seen:
-                seen.add(why)
-                sends.append(f"    - {why}")
+    sends = [f"    - {why}" for why in _fields_for(side)]
     machine = ", ".join(MACHINE_FIELDS.values())
     never = "\n".join(f"    - {what}" for what in NEVER_UPLINKED)
+    lead = (
+        "While this uploads, progress goes to your drive so you can watch it there,\n"
+        if side == "pack"
+        else "While this runs, progress goes back to your drive so you can watch it there,\n"
+    )
     return (
-        "While this runs, progress goes back to your drive so you can watch it there,\n"
-        "and so we can help if it fails.\n"
+        lead
+        + "and so we can help if it fails.\n"
         "\n"
-        "  What goes back:\n"
+        "  What the progress report carries:\n"
         + "\n".join(sends)
         + "\n"
         f"    - about the machine: {machine}\n"
         "\n"
-        "  What never goes back:\n"
+        "  What the progress report never carries:\n"
         f"{never}\n"
+        "\n"
+        f"  {NEST_IS_STORED}\n"
+        f"  {REPORTS_DELETABLE}\n"
         "\n"
         "  To turn it off for this run, add --no-report.\n"
     )

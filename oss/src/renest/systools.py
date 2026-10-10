@@ -33,6 +33,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 
 __all__ = [
     "MANAGERS",
@@ -45,6 +46,8 @@ __all__ = [
     "SystemPlan",
     "Outcome",
     "needs_from_nest",
+    "needs_from_code",
+    "programs_called_in",
     "tool_present",
     "package_manager",
     "privilege",
@@ -59,9 +62,13 @@ __all__ = [
 TOOL_GIT = "git"
 TOOL_LFS = "git-lfs"
 TOOL_CC = "c-compiler"
+#: A program a custom node runs by name through ``subprocess`` (probe H, 2026-10-08:
+#: a node calling ``ffmpeg`` restored byte for byte and then died on
+#: ``FileNotFoundError: 'ffmpeg'`` -- nothing at pack or restore said a word).
+TOOL_FFMPEG = "ffmpeg"
 
 #: How a tool is named to a person.
-LABEL = {TOOL_GIT: "git", TOOL_LFS: "git-lfs", TOOL_CC: "a C compiler"}
+LABEL = {TOOL_GIT: "git", TOOL_LFS: "git-lfs", TOOL_CC: "a C compiler", TOOL_FFMPEG: "ffmpeg"}
 
 #: The package managers we drive, in the order they are looked for. ``dnf`` before
 #: ``yum``: on machines that have both, ``yum`` is a compatibility shim.
@@ -69,10 +76,16 @@ MANAGERS: tuple[str, ...] = ("apt-get", "dnf", "yum", "apk")
 
 #: Which packages bring each tool, per package manager.
 PACKAGES: dict[str, dict[str, tuple[str, ...]]] = {
-    "apt-get": {TOOL_GIT: ("git",), TOOL_LFS: ("git-lfs",), TOOL_CC: ("build-essential",)},
-    "dnf": {TOOL_GIT: ("git",), TOOL_LFS: ("git-lfs",), TOOL_CC: ("gcc", "gcc-c++", "make")},
-    "yum": {TOOL_GIT: ("git",), TOOL_LFS: ("git-lfs",), TOOL_CC: ("gcc", "gcc-c++", "make")},
-    "apk": {TOOL_GIT: ("git",), TOOL_LFS: ("git-lfs",), TOOL_CC: ("build-base",)},
+    # ffmpeg is in Debian/Ubuntu and Alpine main; Fedora/RHEL ship it only from an extra
+    # repository (RPM Fusion), so there it is named, never installed for the user.
+    "apt-get": {TOOL_GIT: ("git",), TOOL_LFS: ("git-lfs",), TOOL_CC: ("build-essential",),
+                TOOL_FFMPEG: ("ffmpeg",)},
+    "dnf": {TOOL_GIT: ("git",), TOOL_LFS: ("git-lfs",), TOOL_CC: ("gcc", "gcc-c++", "make"),
+            TOOL_FFMPEG: ()},
+    "yum": {TOOL_GIT: ("git",), TOOL_LFS: ("git-lfs",), TOOL_CC: ("gcc", "gcc-c++", "make"),
+            TOOL_FFMPEG: ()},
+    "apk": {TOOL_GIT: ("git",), TOOL_LFS: ("git-lfs",), TOOL_CC: ("build-base",),
+            TOOL_FFMPEG: ("ffmpeg",)},
 }
 
 #: Packages that compile something with the machine's C compiler when they first run.
@@ -175,6 +188,63 @@ def needs_from_nest(lock_text: str | None, manifest: dict | None) -> list[Need]:
     return [Need(t, "; ".join(reasons[t])) for t in order if t in reasons]
 
 
+#: Programs a custom node may run by name that a nest cannot carry and a package
+#: manager can install. Kept tiny and evidence-led: each entry is a program real nodes
+#: shell out to (video nodes call ffmpeg / ffprobe), mapped to the tool that brings it.
+_CALLED_PROGRAMS = {"ffmpeg": TOOL_FFMPEG, "ffprobe": TOOL_FFMPEG}
+#: The program name as a string literal on its own -- ``"ffmpeg"`` or ``'ffprobe'`` --
+#: which is how ``subprocess.run(["ffmpeg", ...])`` and ``shutil.which("ffmpeg")`` spell
+#: it. A name inside a longer string (a path, a sentence) does not count.
+_PROGRAM_LITERAL = re.compile(r"""["'](ffmpeg|ffprobe)["']""")
+#: Only files that can start a program at all.
+_RUNS_PROGRAMS = re.compile(
+    r"\bsubprocess\b|\bos\.(?:system|popen|exec\w*|spawn\w*)\b|\bshutil\.which\b")
+#: Folders inside a code tree that are somebody else's installed code, not the node's.
+_SKIP_DIRS = frozenset({".git", "__pycache__", "node_modules", "site-packages", ".venv", "venv"})
+_MAX_SOURCE_BYTES = 2 << 20
+
+
+def programs_called_in(code_dir: Path) -> dict[str, list[str]]:
+    """``{program: [files that call it]}`` for the programs in ``_CALLED_PROGRAMS`` that
+    the Python files under ``code_dir`` start by name. Read off the source: a node's
+    call to ffmpeg happens only when it runs, long after packing and restoring."""
+    found: dict[str, list[str]] = {}
+    if not code_dir.is_dir():
+        return found
+    for dirpath, dirnames, filenames in os.walk(code_dir):
+        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS)
+        for fn in sorted(filenames):
+            if not fn.endswith(".py"):
+                continue
+            f = Path(dirpath) / fn
+            try:
+                if f.stat().st_size > _MAX_SOURCE_BYTES:
+                    continue
+                text = f.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if not _RUNS_PROGRAMS.search(text):
+                continue
+            for prog in sorted(set(_PROGRAM_LITERAL.findall(text))):
+                found.setdefault(prog, []).append(f.relative_to(code_dir).as_posix())
+    return found
+
+
+def needs_from_code(code_dirs: Sequence[tuple[str, Path]]) -> list[Need]:
+    """System programs the restored code will start by name, from ``(label, folder)``
+    pairs -- one per code folder. Unlike :func:`needs_from_nest` this reads the code
+    itself, so it can only run once the code is on disk."""
+    reasons: dict[str, list[str]] = {}
+    for label, d in code_dirs:
+        for prog, files in programs_called_in(d).items():
+            tool = _CALLED_PROGRAMS[prog]
+            why = f"{label} runs {prog} ({files[0]})"
+            reasons.setdefault(tool, [])
+            if why not in reasons[tool]:
+                reasons[tool].append(why)
+    return [Need(t, "; ".join(w)) for t, w in reasons.items()]
+
+
 # --------------------------------------------------------------------------
 # The machine
 # --------------------------------------------------------------------------
@@ -245,6 +315,8 @@ def tool_present(tool: str, machine: Machine | None = None) -> bool:
         if cc and m.which(cc[0]):
             return True
         return any(m.which(c) for c in ("gcc", "clang", "cc"))
+    if tool == TOOL_FFMPEG:
+        return bool(m.which("ffmpeg"))
     raise ValueError(tool)
 
 

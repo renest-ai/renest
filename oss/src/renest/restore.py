@@ -37,7 +37,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import httpx
 
@@ -2804,6 +2804,52 @@ def _hosts_of(urls: list[str]) -> list[str]:
     return out
 
 
+def _local_folder_refusal(lock_text: str, untrusted: list[str]) -> str | None:
+    """The words for a lock whose refused sources include a ``file://`` folder.
+
+    Such a line is not a server: the packing machine installed that package from one
+    of its own folders (an editable or local-path install), and the nest carries the
+    line, not the folder. Probe F (2026-10-09): this was called "servers nobody
+    recognises" and told the reader to ``--trust-host file:///…``, which can never
+    fetch a folder that is not here. Same verdict -- stopped, nothing installed --
+    with the real cause and the real fix. The escape hatch says the same
+    (restore.sh, deps-source-gate). ``None`` when no refused source is a folder.
+    """
+    local = [u for u in untrusted if urlparse(u).scheme == "file"]
+    if not local:
+        return None
+    lines: list[str] = []
+    for u in local:
+        hit = next((ln.strip() for ln in lock_text.splitlines() if u in ln), u)
+        if hit not in lines:
+            lines.append(hit[:160])
+    here = [u for u in local
+            if not urlparse(u).netloc and Path(unquote(urlparse(u).path)).exists()]
+    others = len(untrusted) - len(local)
+    return (
+        "This nest installs a package from a folder on the machine it was packed on, "
+        "and that folder did not come with the nest.\n  Stopped — nothing was installed.\n"
+        "\n    " + "\n    ".join(lines[:5])
+        + ("\n    …and %d more" % (len(lines) - 5) if len(lines) > 5 else "")
+        + "\n"
+        "\n  That is not a server: the packing machine installed this package from one of"
+        "\n  its own folders (an editable or local-path install), and the nest carries only"
+        "\n  the line that points there, not the folder."
+        + ("\n  A folder by that name exists on this machine, but nothing shows it holds the"
+           "\n  same code, so it is not used."
+           if here else "\n  That folder is not on this machine either.")
+        + "\n"
+        "\n  To fix it, on the machine it was packed on, either:"
+        "\n    - pack again with the newest Renest, which carries such folders inside the"
+        "\n      nest; or"
+        "\n    - install that package from a published source (PyPI or a git address)"
+        "\n      instead of the folder, then pack again."
+        + (f"\n\n  This nest also installs from {others} other source(s) nobody recognises;"
+           "\n  the restore will ask about those once the folder above is dealt with."
+           if others else "")
+    )
+
+
 #: What uv prints when it cannot reach upstream, covering both break shapes:
 #: the hostname does not resolve, and the hostname resolves into a black hole.
 #: Taken from real uv output — do not extend this list from memory.
@@ -3321,6 +3367,68 @@ def no_kernels_for_this_gpu(text: str | None) -> bool:
     return any(m in low for m in _RUNTIME_ARCH_MARKERS)
 
 
+#: The GPU itself would not come up: CUDA failed to initialise, or found no device.
+#: Measured 2026-10-08 (E7, a vast RTX 3090 host): every file and package was back,
+#: and the app died at start-up on ``torch._C._cuda_init()`` with "CUDA unknown
+#: error" -- reported as a bare "The app would not start", which sent nobody to the
+#: one fix there was (another machine). The harness's own launch on that host died
+#: the same way, so it was the host, not the nest. Lowercased before matching.
+_GPU_DID_NOT_START_MARKERS = (
+    "cuda unknown error",
+    "cudaerrorunknown",
+    "cuda_error_unknown",
+    "cuda error: unknown error",
+    "cuda driver initialization failed",
+    "no cuda-capable device is detected",
+    "no cuda gpus are available",
+    "failed to initialize nvml",
+    "nvml_success == r internal assert failed",
+    "nvidia-smi has failed",
+    "couldn't communicate with the nvidia driver",
+)
+#: torch's own warning when the driver call underneath it answered 999 (unknown).
+_GPU_DID_NOT_START_RE = re.compile(r"cudagetdevicecount\(\).{0,400}?error 999\b", re.S)
+
+#: CUDA failing to start for a reason the product already names elsewhere: a driver
+#: too old for the packed build, or a forward-compatibility pairing the card does not
+#: support. Those are a version mismatch, not a broken GPU, and must not read as one.
+_CUDA_MISMATCH_MARKERS = (
+    "driver on your system is too old",
+    "cuda driver version is insufficient",
+    "cudaerrorinsufficientdriver",
+    "cuda_error_insufficient_driver",
+    "forward compatibility was attempted",
+    "unsupported display driver / cuda driver combination",
+)
+
+#: What to say when the GPU would not start. Neutral on purpose: we saw CUDA fail
+#: to initialise; we did not see why, so it says where that usually points and what
+#: usually fixes it, not what certainly happened.
+GPU_DID_NOT_START_SAY = (
+    "The GPU on this machine could not be started: CUDA failed to initialise when the "
+    "app tried to use it. Your nest's files and dependencies were checked and are in "
+    "place, so this usually points to this machine's GPU or its driver rather than to "
+    "your nest, and running again on the same machine usually ends the same way "
+    "(nvidia-smi can still look normal on a machine in this state). The usual fix is "
+    "to rent a different machine and run the same command again there."
+)
+
+
+def gpu_did_not_start(text: str | None) -> bool:
+    """Did the app die because CUDA could not bring this machine's GPU up at all?
+
+    Not when the same text says the card has no kernels for this build, or that the
+    driver is too old for it: those have their own, different remedy.
+    """
+    low = (text or "").lower()
+    if not low or no_kernels_for_this_gpu(low):
+        return False
+    if any(m in low for m in _CUDA_MISMATCH_MARKERS):
+        return False
+    return (any(m in low for m in _GPU_DID_NOT_START_MARKERS)
+            or bool(_GPU_DID_NOT_START_RE.search(low)))
+
+
 #: Ran out of GPU memory. Held apart from "a node raised" because the remedy is a
 #: bigger card or a smaller run, not the extension's issue tracker.
 _OOM_MARKERS = (
@@ -3350,6 +3458,12 @@ def classify_render_failure(text: str | None) -> tuple[ErrorClass, str] | None:
     low = (text or "").lower()
     if no_kernels_for_this_gpu(low):
         return (ErrorClass.ARCH_UNSUPPORTED_RUNTIME, ARCH_UNSUPPORTED_SAY)
+    # Before the node-raised test for the same reason as the line above: a GPU that
+    # never came up reaches us *as* a node raising, and the remedy is another machine.
+    # No class of its own at S5 (that would be a new exit code); the caller marks it
+    # in the error's context instead.
+    if gpu_did_not_start(low):
+        return (ErrorClass.UNKNOWN, GPU_DID_NOT_START_SAY)
     if any(m in low for m in _OOM_MARKERS):
         return (
             ErrorClass.OOM_OR_SLOW,
@@ -4275,6 +4389,30 @@ def restore(
             # stage's unclassified slot (exit 60), and the words carry the attribution.
             raise NestFailure("S0", ErrorClass.UNKNOWN, outcome.message)
 
+    def s2_called_programs() -> None:
+        """Programs the restored code starts by name (ffmpeg for video nodes) that this
+        machine lacks: install them the way S0 installs git or a compiler -- asked
+        first, ``--yes`` answers -- or print the command. Read off the code just
+        unpacked, so it runs here and not at S0. Never stops the restore: a missing
+        program breaks only the node that calls it, and the rest still runs.
+        Probe H (2026-10-08): restored byte for byte, then ``FileNotFoundError:
+        'ffmpeg'`` at the first run, and nothing before that said a word."""
+        dirs = [(f"custom node {d['name']}" if d.get("role") == "extension" else d["name"],
+                 target / d["install_path"])
+                for d in mani.get("code_deps") or [] if d.get("role") != "host"]
+        needs = systools.needs_from_code(dirs)
+        if not needs:
+            return
+        machine = opts.machine or systools.Machine()
+        sp = systools.plan_system_install(needs, machine=machine)
+        if sp is None:
+            return
+        outcome = systools.ensure_system_tools(
+            sp, assume_yes=opts.assume_yes, say=_say_to_terminal, rerun=_rerun(),
+            machine=machine)
+        if outcome.failed:
+            narrate(outcome.message, stage="S2", level="warning")
+
     def _tool_failure(stage: str, klass: ErrorClass, text: str | None) -> NestFailure | None:
         """A later failure that comes down to git / git-lfs / a C compiler not being
         here: name the tool, the command that installs it, and the command to rerun."""
@@ -4911,6 +5049,7 @@ def restore(
         # Re-anchored from recorded facts only (see training.reanchor_target); when the
         # arithmetic does not work out, nothing is touched and the sentence below stands
         # on its own, exactly as before.
+        s2_called_programs()
         report.reanchored = reanchor_recorded_paths(mani, target)
         for moved in report.reanchored:
             narrate(moved, stage="S2")
@@ -4984,6 +5123,12 @@ def restore(
         # to judge is the **person**, and making them type that name out by hand
         # lands exactly on that judgement.
         sender_ok = sender_named(handed_off_from, opts.trust_sender)
+        # A folder on the packing machine is not a host anybody can name: no
+        # --trust-host or --trust-sender fetches it, so say what it really is. The
+        # blanket bypass keeps its old reach (own nests only, as below).
+        _folder = _local_folder_refusal(lock_text, baseline_untrusted)
+        if _folder and (handed_off_from or not opts.trust_unsafe_urls):
+            raise NestFailure("S3", ErrorClass.UNTRUSTED_SOURCE, _folder)
         if baseline_untrusted and handed_off_from and not sender_ok:
             untrusted = baseline_untrusted
             hosts = _hosts_of(untrusted)
@@ -5330,6 +5475,18 @@ def restore(
                         context={"gpu_has_no_kernels": True,
                                  "exit_code": res.exit_code},
                     )
+                # The GPU never came up at all (E7, 2026-10-08): again not the run's
+                # fault, and again only another machine fixes it.
+                if gpu_did_not_start(_log_tail):
+                    raise NestFailure(
+                        "S4",
+                        ErrorClass.STARTUP_CRASH,
+                        GPU_DID_NOT_START_SAY
+                        + f" The run's own log: {res.log_path}",
+                        detail=_tail(res.log_path),
+                        context={"gpu_did_not_start": True,
+                                 "exit_code": res.exit_code},
+                    )
                 # We started this run offline on purpose, so a model file that never
                 # travelled with the nest now reads as "could not connect". Say which
                 # of the two it is, and how to let this one run fetch — the setting is
@@ -5420,6 +5577,17 @@ def restore(
                     + f" The app's own log: {_log}",
                     detail=_tail(_log) if _log.exists() else None,
                     context={"missing_system_library": _lib},
+                ) from e
+            # CUDA could not bring the GPU up (E7, 2026-10-08). Said as what it is, not
+            # as "would not start": the files are fine, and the fix is another machine.
+            if gpu_did_not_start(str(e)) or gpu_did_not_start(
+                    _tail(_log, _SYSLIB_SCAN_CHARS) if _log.exists() else None):
+                raise NestFailure(
+                    "S4",
+                    ErrorClass.STARTUP_CRASH,
+                    GPU_DID_NOT_START_SAY + f" The app's own log: {_log}",
+                    detail=_tail(_log) if _log.exists() else str(e),
+                    context={"gpu_did_not_start": True},
                 ) from e
             raise NestFailure("S4", ErrorClass.STARTUP_CRASH, f"The app would not start: {e}") from e
         # Hand the recipe to the smoke step **through the handle**, not through the
@@ -5520,16 +5688,23 @@ def restore(
             # Then the three named S5 causes. Without this the wrong GPU, an
             # out-of-memory and a raising node all came back as one unnamed
             # failure, which is the one report nobody can act on.
-            _verdict = classify_render_failure(str(e)) or classify_render_failure(
-                _tail(_slog, _SYSLIB_SCAN_CHARS) if _slog.exists() else None
-            )
+            _slog_tail = _tail(_slog, _SYSLIB_SCAN_CHARS) if _slog.exists() else None
+            # A GPU that never came up is read across the exception *and* the log
+            # together: the exception usually only says "a node raised", which the
+            # first classify below would take, while CUDA's own words sit in the log.
+            if gpu_did_not_start(f"{e}\n{_slog_tail or ''}"):
+                _verdict = (ErrorClass.UNKNOWN, GPU_DID_NOT_START_SAY)
+            else:
+                _verdict = classify_render_failure(str(e)) or classify_render_failure(
+                    _slog_tail)
             if _verdict is not None:
                 _klass, _say = _verdict
                 _where = f" The app's own log: {_slog}" if _slog.exists() else ""
                 raise NestFailure(
                     "S5", _klass, _say + _where,
                     detail=_tail(_slog) if _slog.exists() else str(e),
-                    context={"render_failure": str(e)[:400]},
+                    context={"render_failure": str(e)[:400]}
+                    | ({"gpu_did_not_start": True} if _say is GPU_DID_NOT_START_SAY else {}),
                 ) from e
             raise NestFailure("S5", ErrorClass.UNKNOWN, f"The test render failed: {e}") from e
 
@@ -5806,9 +5981,14 @@ def restore(
             )
     else:
         assert failure is not None
+        # "Carry on where it stopped" is wrong when the advice just given is "use a
+        # different machine": the same command there starts afresh, and here it only
+        # meets the same GPU again.
+        _again = ("" if (getattr(failure, "context", None) or {}).get("gpu_did_not_start")
+                  else " Run the same command again to carry on where it stopped.")
         closing(
             f"[{failure.stage}/{failure.error_class}] {failure.human}"
-            f"(exit {failure.exit_code}. Run the same command again to carry on where it stopped. Logs and evidence: {evidence})",
+            f"(exit {failure.exit_code}.{_again} Logs and evidence: {evidence})",
             level="error",
         )
         # Point the way, do not solicit: tell the user **that this thing exists**

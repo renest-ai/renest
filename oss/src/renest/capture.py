@@ -708,8 +708,9 @@ def _record_dir_identity(hits: list[Path], cls: str, matched_dirs: dict[str, dic
                         f"be listed or updated on its own")
         else:
             matched_dirs[d.name] = ident
-            # Hand-edited node code is not in the commit, so a rebuild that
-            # clones a clean copy would make those edits vanish silently.
+            # Hand-edited node code is not in the commit. The edits still travel
+            # (the archive is the folder as it stands); the node just no longer is
+            # the upstream version it names, and the user should hear that.
             dg = dirty_gap(f"custom_nodes/{d.name}", d)
             if dg:
                 gaps.append(dg)

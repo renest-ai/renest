@@ -365,9 +365,11 @@ def registry_identity(node_dir: Path) -> dict | None:
 def git_dirty(repo_dir: Path) -> dict | None:
     """Check whether a repository has uncommitted changes.
 
-    A rebuild re-clones a clean copy from repo_url+commit, so hand edits that were
-    never committed evaporate and the workflow mysteriously stops working. Report
-    it before packing and let people commit or revert it themselves.
+    A rebuild never clones: it unpacks the code archive, which is the working tree as
+    it stood on disk, so uncommitted edits travel. What they change is the code's
+    identity -- it no longer matches the repo_url+commit the nest names -- and that is
+    what gets reported (here at pack time, and as ``upstream_match`` for whoever
+    receives the nest).
     Returns {tracked: n, untracked: m, sample: [...]} or None (clean, or we could
     not check).
 
@@ -450,10 +452,17 @@ def dirty_gap(label: str, repo_dir: Path) -> str | None:
     endings = dirty.get("line_endings_only") or 0
     tail = (f" ({endings} more file(s) differ only in how lines end — normal for a "
             f"folder unpacked on Windows, nothing is lost there.)" if endings else "")
+    # Wording rule: a restore unpacks the archive packed from this very folder and
+    # never clones from git, so the edits arrive intact. Saying "they will be lost"
+    # (the wording until 2026-10) was false and pushed people into undoing work that
+    # would have travelled fine. What is true is the identity: this code is no
+    # longer the upstream commit it names, and whoever receives the nest is told so.
     return (f"{label} has {dirty['tracked']} uncommitted code change(s) "
-            f"(such as {', '.join(dirty['sample'])}) — a restore pulls a clean copy "
-            f"from git, so these hand edits will be lost. Commit or undo them before "
-            f"you pack, or accept losing them." + tail)
+            f"(such as {', '.join(dirty['sample'])}). They travel inside the nest as they "
+            f"are on this disk, so a restore gets your edited code — but it no longer "
+            f"matches the upstream commit it names, and the nest marks it as modified for "
+            f"whoever restores it. Commit the changes if you want the nest to point at a "
+            f"version others can look up." + tail)
 
 
 # --------------------------------------------------------------------------

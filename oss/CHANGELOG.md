@@ -2,6 +2,102 @@
 
 What changed for the person using `renest`. Dates are the release date.
 
+## 0.1.21 — 2026-10-09
+
+### `pack --dest hosted` now says that it reports progress, and what
+Uploading to your drive has always sent upload progress and facts about this machine
+(GPU, driver, free disk space) back to your drive, unless you add `--no-report`. Restore
+told you so; pack did not say a word. Pack now prints the same short note as restore when
+the upload starts, before anything is reported, and the full field-by-field list with
+`--verbose`. With `--no-report`, or when you are not uploading to your drive, it prints
+nothing, because nothing is sent.
+
+### The reporting note says exactly what it covers
+The note used to say file names and anything about your models "never go back". That is
+true of the progress report, and the note now says so. A nest stored on your drive is
+stored there whole, with its file names and the prompts inside its workflows, and the
+note now says that too. It also no longer reads as if the cloud you run on is always
+reported: it is only when an environment variable on the machine names it. Both notes,
+pack and restore, now also say that you can delete these reports under Settings → Run
+reports on your drive, and that deleting your account deletes them too.
+
+### When this machine's GPU will not start, restore says so
+On a rented machine whose GPU could not be started, restore used to download every file,
+install every dependency, and then report only "The app would not start", followed by
+advice to run the same command again on the same machine. When the app or the test render
+fails because CUDA could not initialise (for example "CUDA unknown error", "no
+CUDA-capable device is detected", or NVML failing), restore now says that the GPU on this
+machine could not be started, that your files and dependencies were checked and are in
+place, and that the usual fix is to rent a different machine and run the same command
+again. A card with no kernels for the packed build, or a driver too old for it, keeps its
+own message.
+
+The machine check before anything downloads now also asks the GPU driver directly
+whether it can start CUDA, without needing PyTorch (`nvidia-smi` can look normal on a
+machine in this state). If the driver answers "unknown error" or finds no GPU, and the
+nest needs a GPU, restore stops there with exit code 63; `--force` goes ahead anyway.
+Other answers only warn, and a machine where the driver cannot be asked is reported as
+unknown, never as a pass. `renest doctor` shows the same line but never stops on it.
+
+### A package installed in editable mode from outside the environment now travels
+If your environment had a local package installed with `pip install -e /some/other/folder`,
+pack used to only mention it, and both restore paths then refused the `file://` source and
+stopped. Pack now carries that folder in the nest and points the dependency list at it, so
+it is put back and installed on the new machine. renest's own development install and
+folders over 100 MiB are not carried; those are still named.
+
+### Programs a custom node calls, such as ffmpeg, are installed on restore
+A node that runs `ffmpeg` or `ffprobe` as a separate program used to fail after a restore
+with "file not found", and pack said nothing. Pack now names such programs, and restore
+installs the missing ones the same way it installs git or a C compiler: it asks first,
+`--yes` skips the question, and without permission it prints the command to run.
+
+The standalone `restore.sh` now names them too: after it puts the code back, if a node runs
+`ffmpeg` or `ffprobe` and this machine has no `ffmpeg`, it prints one line naming the node,
+the program and the command that installs it. It never installs anything and never stops.
+
+### A dependency installed from a folder on the packing machine is named as such
+When a nest's dependency list installs a package from a folder on the machine it was packed
+on (an editable or local-path install the nest does not carry), both `renest restore` and
+`restore.sh` used to call it "servers nobody recognises", suggest trusting a host, and in
+`restore.sh` print an empty `RENEST_TRUSTED_HOSTS=` line. No host setting can fetch a folder
+that is not there. Both now say what it is, say whether that folder is on this machine, and
+give the real fixes: pack again with the newest renest, which carries such folders, or
+install that package from a published source on the packing machine and pack again. Restore
+still stops before installing anything, as before.
+
+### Code a custom node compiled in its own folder is kept
+Compiled files built inside a node's folder (for example by `setup.py build_ext`) used to be
+left out of the nest whenever the folder had a `setup.py` or `requirements.txt`, but nothing
+rebuilt them on the new machine, so the node failed to load. They are now left out only when
+the node has a step that rebuilds them on restore; otherwise they travel as they are, and the
+GPU generations they were built for are recorded and checked before a restore.
+
+### Pack names data files a node reads from outside its folder, and files it keeps in your home cache
+If a node reads a file from elsewhere in the environment, pack now names it and gives the
+exact `--add` line to include it. It does not add it on its own, because only you know
+whether the node needs that file. If a node keeps files it downloaded in a cache under your
+home folder, pack now says that these files do not travel with the nest and will be
+downloaded again on the new machine.
+
+### The warning about hand edits says what really happens
+Pack warned that uncommitted edits in a node or ComfyUI folder "will be lost" because a
+restore pulls a clean copy from git. That was wrong: restore puts back the exact folder you
+packed, edits included. The warning now says the edits travel with the nest.
+
+### Models a custom node downloads into its own folder get their own licence check
+Some custom nodes download the models they need into their own folder the first time
+they run (comfyui_controlnet_aux keeps them under `ckpts/`). `renest pack` used to store
+those models inside the node's code archive, under the node's own licence, so a nest you
+handed to someone carried them as if the node's licence covered them -- including
+models whose licence forbids commercial use. Every model file inside a code folder
+(`.safetensors`, `.ckpt`, `.pt`, `.pth`, `.bin`, `.onnx`, `.gguf`, `.sft`) is now taken
+out of the archive and stored as a file of its own, with its own licence check. Any we
+cannot confirm are restricted: your own restores still get them, a hand-off does not.
+A restore puts each one back at the same path. A model file reached through a link to
+another folder is now stored as the real file instead of a link that is dead after a
+restore.
+
 ## 0.1.20 — 2026-10-07
 
 ### Your Hugging Face token only goes to Hugging Face

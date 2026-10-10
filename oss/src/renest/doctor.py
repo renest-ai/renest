@@ -87,6 +87,8 @@ __all__ = [
     "collect_gpu_alloc",
     "check_nvidia_smi_full",
     "collect_nvidia_smi_full",
+    "check_cuda_init",
+    "collect_cuda_init",
     "GPU_ALLOC_PROBE_MIB",
     "split_arch_list",
     "gpu_coverage",
@@ -137,7 +139,9 @@ REQUIRED_CPU_FLAGS: tuple[str, ...] = ("avx2",)
 #: no nest in hand. It never rejects, so listing it cannot turn `renest doctor`
 #: into a gate.
 _NEST_FREE_CHECKS: frozenset[str] = frozenset(
-    {"cpu_flags", "local_disk", "ram", "egress", "proxy", "gpu_alloc", "nvidia_smi_full"}
+    {"cpu_flags", "local_disk", "ram", "egress", "proxy", "gpu_alloc", "nvidia_smi_full",
+     # Can refuse only when a nest says it needs a GPU; with none named it is a note.
+     "cuda_init"}
 )
 
 #: The ``--lock`` checks. They read the lockfile the caller named plus this
@@ -288,6 +292,8 @@ PRECHECK_CLASS: dict[str, ErrorClass] = {
     "lock_cuda_family": ErrorClass.CUDA_BLOCK,
     "torch_runtime_cuda": ErrorClass.CUDA_BLOCK,
     "lock_cuda_vs_driver": ErrorClass.CUDA_BLOCK,
+    # The driver could not start CUDA at all: this machine's CUDA cannot run it.
+    "cuda_init": ErrorClass.CUDA_BLOCK,
 }
 
 
@@ -2464,6 +2470,215 @@ def check_nvidia_smi_full(reading: dict | None) -> CheckResult:
                        reading)
 
 
+# --------------------------------------------------------------------------
+# Can the driver bring CUDA up at all? Asked without torch.
+# --------------------------------------------------------------------------
+# Measured 2026-10-08 (E7, a vast RTX 3090 host): nvidia-smi ran clean (the row
+# above passed), gpu_alloc could not ask (renest's own interpreter has no torch),
+# so the machine check said only "warn" -- and the rebuild downloaded every file
+# and installed every package before the app died on `torch._C._cuda_init()` with
+# "CUDA unknown error". torch's first CUDA call is the driver's `cuInit`; asking
+# that ourselves needs nothing but the driver library, which every NVIDIA host has.
+
+#: Wall-clock ceiling. cuInit on a healthy card takes well under a second; a
+#: wedged driver can sit there for good, and a check that hangs is worse than one
+#: that says it could not find out.
+CUDA_INIT_PROBE_TIMEOUT_S = 30.0
+
+#: cuInit / cuDeviceGetCount answers that mean "no CUDA here, and not for a reason
+#: that clears by itself". 999 is CUDA_ERROR_UNKNOWN -- what E7's host gave torch;
+#: 100 is CUDA_ERROR_NO_DEVICE. Every other non-zero answer only warns: some are a
+#: setup question (34: a stub library, 804: forward compatibility), some can clear
+#: (46: devices busy), and none of them has been seen on a real machine here.
+CUDA_INIT_FATAL_CODES = frozenset({100, 999})
+
+#: Runs in a throwaway interpreter (renest's own is fine: only ctypes is needed),
+#: so a driver that hangs or takes its process down cannot take renest with it.
+#: Same rule as the gpu_alloc probe: one JSON line on every path it controls.
+_CUDA_INIT_PROBE_SRC = r"""
+import ctypes, json
+out = {}
+try:
+    lib = ctypes.CDLL("libcuda.so.1")
+except OSError as exc:
+    out["outcome"] = "cannot_probe"
+    out["why"] = "no_libcuda"
+    out["error"] = str(exc)[:200]
+    print(json.dumps(out))
+    raise SystemExit(0)
+
+def name(rc):
+    try:
+        s = ctypes.c_char_p()
+        if lib.cuGetErrorName(ctypes.c_int(rc), ctypes.byref(s)) == 0 and s.value:
+            return s.value.decode("ascii", "replace")
+    except Exception:
+        pass
+    return None
+
+rc = int(lib.cuInit(ctypes.c_uint(0)))
+out["cuinit"] = rc
+if rc != 0:
+    out["cuinit_name"] = name(rc)
+else:
+    n = ctypes.c_int(-1)
+    crc = int(lib.cuDeviceGetCount(ctypes.byref(n)))
+    out["device_count_rc"] = crc
+    if crc != 0:
+        out["device_count_name"] = name(crc)
+    else:
+        out["device_count"] = int(n.value)
+out["outcome"] = "answered"
+print(json.dumps(out))
+"""
+
+
+def collect_cuda_init(timeout: float = CUDA_INIT_PROBE_TIMEOUT_S) -> dict:
+    """Call the driver's ``cuInit(0)`` and ``cuDeviceGetCount`` in a subprocess.
+
+    Returns a reading, never raises. ``outcome`` is ``answered`` / ``timeout`` /
+    ``crashed`` / ``cannot_probe``. Not Linux, or no ``libcuda.so.1`` to load, is
+    ``cannot_probe``: that is us being unable to ask, not the card failing.
+    """
+    if platform.system() != "Linux":
+        return {"outcome": "cannot_probe", "why": "not_linux",
+                "platform": platform.system()}
+    try:
+        proc = subprocess.run(  # noqa: S603 - fixed program, our own interpreter
+            [sys.executable, "-c", _CUDA_INIT_PROBE_SRC],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return {"outcome": "timeout", "timeout_s": timeout}
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"outcome": "cannot_probe", "why": "probe_did_not_run",
+                "error": f"{type(exc).__name__}: {exc}"[:200]}
+    for line in reversed((proc.stdout or "").strip().splitlines()):
+        try:
+            parsed = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict) and parsed.get("outcome"):
+            # A set CUDA_VISIBLE_DEVICES hides GPUs from cuInit on a healthy machine
+            # (Spark, 2026-10-09: CUDA_VISIBLE_DEVICES= gave 100, CUDA_ERROR_NO_DEVICE).
+            # Record it so the verdict can point at the variable, not at the machine.
+            cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+            if cvd is not None:
+                parsed["cuda_visible_devices"] = cvd
+            return parsed
+        break
+    # No JSON line: the interpreter died inside the driver call.
+    return {"outcome": "crashed", "returncode": proc.returncode,
+            "error": (proc.stderr or "").strip()[-300:]}
+
+
+def check_cuda_init(reading: dict | None, *, needs_gpu: bool = False) -> CheckResult:
+    """Could the driver bring CUDA up on this machine?
+
+    *cuInit fine and at least one device → pass.*
+
+    *cuInit answered 999 (unknown) or 100 (no device), or it found no device at all
+    → **reject when the nest needs a GPU**, warn otherwise.* Unlike a failed memory
+    request (check_gpu_alloc), this is not "busy this minute": cuInit allocates
+    nothing and does not care what other tenants hold, and these answers are the
+    ones that come back the same until the machine itself is fixed. Refusing costs
+    a re-rent now; admitting costs the download, the install and the same re-rent
+    later (E7: 13 files and four minutes of installing, then exactly this). Like
+    every other refusal here, ``--force`` goes ahead anyway. Which nests need a GPU
+    is read off the nest (its ``gpu`` block); a nest that says nothing about a GPU
+    only gets the warning.
+
+    *Any other error code, a timeout, or the probe dying → warn.* Seen nowhere yet,
+    some can clear on their own, so not a reason to stop.
+
+    *Could not ask (not Linux, no driver library, probe would not start) →
+    unknown, never pass.*
+    """
+    if not reading or not reading.get("outcome"):
+        return CheckResult("cuda_init", LEVEL_UNKNOWN,
+                           "Nothing asked the driver to start CUDA here, so whether it "
+                           "can is unknown. Not a pass.", {"outcome": "not_run"})
+    reading = dict(reading)
+    outcome = reading["outcome"]
+    fatal = LEVEL_REJECT if needs_gpu else LEVEL_WARN
+    retry = (" Renting a different machine and running the same command there usually "
+             "gets past this.")
+    if "cuda_visible_devices" in reading and (
+            reading.get("cuinit") == 100 or reading.get("device_count") == 0):
+        # Not a broken machine: the variable hides every GPU from this process.
+        return CheckResult(
+            "cuda_init", fatal,
+            f"The GPU driver sees no GPU this process may use, and CUDA_VISIBLE_DEVICES "
+            f"is set to {reading['cuda_visible_devices']!r} here, which can hide them. "
+            f"Unset it (or point it at a GPU) and run the same command again.",
+            reading)
+    if outcome == "answered":
+        rc = reading.get("cuinit")
+        if isinstance(rc, int) and rc != 0:
+            label = f"{rc}" + (f", {reading['cuinit_name']}" if reading.get("cuinit_name") else "")
+            if rc in CUDA_INIT_FATAL_CODES:
+                return CheckResult(
+                    "cuda_init", fatal,
+                    f"The GPU driver could not start CUDA on this machine (cuInit answered "
+                    f"{label}). An app that uses the GPU usually fails the same way, "
+                    f"even when nvidia-smi looks normal."
+                    + (retry if needs_gpu else ""),
+                    reading)
+            return CheckResult(
+                "cuda_init", LEVEL_WARN,
+                f"The GPU driver answered {label} when asked to start CUDA. Not a reason "
+                f"on its own to stop, but if the app later fails to start CUDA, this line "
+                f"is the lead.",
+                reading)
+        crc = reading.get("device_count_rc")
+        if isinstance(crc, int) and crc != 0:
+            label = f"{crc}" + (f", {reading['device_count_name']}"
+                                if reading.get("device_count_name") else "")
+            return CheckResult(
+                "cuda_init", LEVEL_WARN,
+                f"CUDA started, but asking how many GPUs it sees failed ({label}). If the "
+                f"app later fails to start CUDA, this line is the lead.",
+                reading)
+        count = reading.get("device_count")
+        if count == 0:
+            return CheckResult(
+                "cuda_init", fatal,
+                "The GPU driver started CUDA but it sees no GPU on this machine (or none "
+                "this process is allowed to use)."
+                + (retry if needs_gpu else ""),
+                reading)
+        if isinstance(count, int) and count > 0:
+            return CheckResult(
+                "cuda_init", LEVEL_PASS,
+                f"The GPU driver started CUDA and sees {count} GPU(s).", reading)
+        return CheckResult("cuda_init", LEVEL_UNKNOWN,
+                           "The driver's answer about CUDA could not be read, so this "
+                           "went unanswered. Not a pass.", reading)
+    if outcome == "timeout":
+        return CheckResult(
+            "cuda_init", LEVEL_WARN,
+            f"Asking the GPU driver to start CUDA got no answer within "
+            f"{reading.get('timeout_s', CUDA_INIT_PROBE_TIMEOUT_S):.0f}s — often a driver "
+            f"that has stopped responding. If the app hangs or fails at start-up, this "
+            f"line is the lead.",
+            reading)
+    if outcome == "crashed":
+        return CheckResult(
+            "cuda_init", LEVEL_WARN,
+            "Asking the GPU driver to start CUDA ended the asking process before it could "
+            "answer. If the app later fails to start CUDA, this line is the lead.",
+            reading)
+    why = reading.get("why") or "unknown"
+    excuse = {
+        "not_linux": "this is not a Linux machine",
+        "no_libcuda": "there is no NVIDIA driver library (libcuda.so.1) to ask",
+        "probe_did_not_run": "the probe interpreter would not start",
+    }.get(str(why), f"the probe could not run ({why})")
+    return CheckResult("cuda_init", LEVEL_UNKNOWN,
+                       f"Whether the GPU driver can start CUDA here is unknown: {excuse}. "
+                       f"Not a pass.", reading)
+
+
 def _binary_runs_here(sm_list: list[int], cap: int) -> bool:
     """Can card generation ``cap`` run a binary built for these targets?
 
@@ -2844,6 +3059,11 @@ def run_precheck(
     # The full nvidia-smi (B10): single-fact queries above still answer on a
     # wedged node; the full run does not. Warn-only, same argument.
     report.checks.append(check_nvidia_smi_full(collect_nvidia_smi_full()))
+    # The driver's own cuInit, no torch needed (E7, 2026-10-08: nvidia-smi was clean
+    # and the app died on "CUDA unknown error"). Refuses only when the nest records a
+    # GPU block -- the same switch the architecture gate below uses, so `renest
+    # doctor` (which never passes it) stays a note.
+    report.checks.append(check_cuda_init(collect_cuda_init(), needs_gpu=bool(nest_gpu)))
     # GPU architecture gate, also blocking. A nest with no gpu block (legal for
     # older nests) skips the whole check rather than inventing a warning.
     if nest_gpu:

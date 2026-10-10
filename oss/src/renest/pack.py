@@ -37,10 +37,17 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import unquote, urlparse
 
 import httpx
 
-from .capture import _parse_extra_model_paths, capture, is_tool_default_licence, unknown_licence_gap
+from .capture import (
+    UNKNOWN_LICENCE_DEFAULT,
+    _parse_extra_model_paths,
+    capture,
+    is_tool_default_licence,
+    unknown_licence_gap,
+)
 from .envlock import (
     COMPILE_REQUIRED_VERDICT,
     LOCK_FROM_ENV_HEADER,
@@ -74,6 +81,7 @@ from .envlock import (
 )
 from .errors import NestFailure, ErrorClass, ExitCode
 from .events import EventEmitter
+from . import systools
 from .doctor import LEVEL_PASS, check_lock_cuda_family
 from .fingerprint import CRITICAL_PACKAGES, collect, collect_gpu, collect_wheel_env
 from .syslibs import (
@@ -94,6 +102,7 @@ from .integrity import (
     probe_model_bytes,
     serialization_of,
     upstream_match,
+    WEIGHT_SUFFIXES,
 )
 from .licensing import (
     licence_text_path,
@@ -875,6 +884,34 @@ def _declared_assets_inside(spec: dict, install_path: str, already=()) -> list[s
         if any(inner == c or inner.startswith(c + "/") for c in covered):
             continue
         out.add(inner)
+    return sorted(out)
+
+
+def _weights_inside_code_dir(src_dir: Path, exclude=()) -> list[str]:
+    """Model weight files a code folder would otherwise carry in its archive.
+
+    Returned relative to the folder, like any other exclude. A code archive travels
+    under the code's own licence, and the server never holds one back from a
+    hand-off. A plugin that downloads its own models on first run (batch 23,
+    2026-10-08: comfyui_controlnet_aux put 1.3 GB of detector weights, one of them
+    non-commercial, under its ``ckpts/`` folder) would then hand those weights to
+    anyone, labelled with the plugin's Apache-2.0. Each of these files is taken out
+    of the archive and travels as an ordinary ``files[]`` entry instead, with its
+    own licence check by sha256 -- and restricted when nothing vouches for it.
+
+    "Weight file" is the suffix table the integrity probe already uses
+    (``integrity.WEIGHT_SUFFIXES``), not a new list. A Git LFS placeholder is left
+    alone: it is a few hundred bytes of text, and ``_settle_lfs`` decides what
+    happens to it.
+    """
+    out: list[str] = []
+    for rel, p in _packed_files(src_dir, exclude):
+        if Path(rel).suffix.lower() not in WEIGHT_SUFFIXES:
+            continue
+        with contextlib.suppress(OSError):
+            if looks_like_lfs_pointer(p):
+                continue
+        out.append(rel)
     return sorted(out)
 
 
@@ -2247,6 +2284,9 @@ def _build_manifest(
 
     inventory: list[dict] = []
     node_arch_entries: list[dict] = []  # kept-vendored .so target archs -> manifest.gpu
+    # Weight files found inside code folders, moved out of their archives (see
+    # _weights_inside_code_dir). Packed below together with the spec's own files[].
+    carved_files: list[dict] = []
 
     # -- code deps: tar -> blob --
     for dep in spec.get("code_deps", []):
@@ -2291,16 +2331,63 @@ def _build_manifest(
             dep_ex += _settle_lfs(src_dir, dep["install_path"], dep_ex, dry_run=dry_run,
                                   warnings=warnings, lfs=lfs)
 
+        # Model weights inside a code folder (a plugin that downloads its own models
+        # on first run) never travel under the code's licence: each one comes out of
+        # the archive and joins files[], where it gets its own licence verdict.
+        if src_dir.is_dir():
+            _weights = _weights_inside_code_dir(src_dir, dep_ex)
+            if _weights:
+                dep_ex += _weights
+                _ip = str(dep["install_path"]).strip("/")
+                for inner in _weights:
+                    if any(c["path"] == f"{_ip}/{inner}" for c in carved_files):
+                        continue  # two code entries landing in one folder (program + data)
+                    fs: dict = {"path": f"{_ip}/{inner}",
+                                "license": dict(UNKNOWN_LICENCE_DEFAULT), "kind": "other"}
+                    if dep.get("source_path"):
+                        fs["source_path"] = str(src_dir / inner)
+                    carved_files.append(fs)
+                shown = ", ".join(_weights[:3]) + (f" and {len(_weights) - 3} more"
+                                                    if len(_weights) > 3 else "")
+                warnings.append(
+                    f"{dep['name']}: {len(_weights)} model file(s) sit inside this code "
+                    f"folder ({shown}). They are left out of its archive and stored as "
+                    f"files of their own, each with its own licence check: the code's "
+                    f"licence does not cover models it downloaded. Any we cannot confirm "
+                    f"are restricted -- your own restores get them, a hand-off does not."
+                )
+
         # -- "strip by default, tell the user to recompile": node .so routing --
         raw_excludes: list[str] = []
         if src_dir.is_dir():
-            # Dirty git working tree: the manifest only records repo_url+commit,
-            # so a rebuild git-clones the clean version and any hand edits in the
-            # tree silently evaporate. Report it truthfully at pack time; do not
-            # block.
+            # Dirty git working tree: the archive below is the tree as it stands, so
+            # the hand edits travel and come back on restore (a restore unpacks, it
+            # never clones). What changes is that the code no longer matches the
+            # repo_url+commit recorded beside it -- say so; do not block.
             dg = dirty_gap(dep["name"], src_dir)
             if dg:
                 warnings.append(dg)
+            # Programs this code starts by name (ffmpeg for video nodes). A nest cannot
+            # carry them -- they belong to the machine -- so say it while packing, and
+            # say what the restore does about it.
+            if role != "host":
+                home_use = _keeps_files_in_home(src_dir)
+                if home_use:
+                    warnings.append(
+                        f"{dep['name']} keeps files under the home folder ({home_use}) — "
+                        f"typically something it downloads on first use and reads afterwards. "
+                        f"A nest carries files inside the environment (and the Hugging Face "
+                        f"cache), not the rest of the home folder, so on the new machine the "
+                        f"node starts without them and fetches them again; if that source is "
+                        f"gone or needs a login there, the node fails."
+                    )
+                for prog, files in systools.programs_called_in(src_dir).items():
+                    warnings.append(
+                        f"{dep['name']} runs the program {prog} ({files[0]}). Programs "
+                        f"belong to the machine, not the nest: a restore installs {prog} "
+                        f"where it can (it asks first; --yes answers) and otherwise prints "
+                        f"the command to install it."
+                    )
             # Symlinks reaching out of the tree. We warn instead of following them:
             # a link into a shared model cache would drag that whole cache into the
             # code archive, and the manifest's files[] paths say nothing about links.
@@ -2316,20 +2403,37 @@ def _build_manifest(
                 )
             so_files = _find_so_files(src_dir, dep_ex)
             if so_files:
-                if _has_build_path(src_dir):
+                # Left out only when something will build them again: the restore runs
+                # this node's post_install and nothing else -- it never compiles a node by
+                # itself. Stripping them on the strength of "it has a setup.py" alone
+                # shipped a node that could not import (probe I, 2026-10-08: built in
+                # place with setup.py build_ext, packed with --workflow -- which has no way
+                # to set post_install -- and restored to ImportError). Without a rebuild
+                # command they ship as they are, like any other prebuilt binary.
+                if _has_build_path(src_dir) and dep.get("post_install"):
                     raw_excludes = ["*.so", "build"]
-                    post_hint = (
-                        "post_install is already set"
-                        if dep.get("post_install")
-                        else "no post_install set yet — add a rebuild command yourself, "
-                             "e.g. pip install -e ."
-                    )
                     warnings.append(
                         f"{dep['name']}: {len(so_files)} compiled .so file(s) left out of the "
-                        f"code archive (this node can rebuild them — it has setup.py / "
-                        f"pyproject build-system / requirements.txt). On a different GPU they "
-                        f"get rebuilt during restore, so {post_hint}"
+                        f"code archive — its setup command (post_install) builds them again "
+                        f"during restore, for the machine it lands on"
                     )
+                elif _has_build_path(src_dir):
+                    warnings.append(
+                        f"{dep['name']}: {len(so_files)} compiled .so file(s) ship as they are "
+                        f"(nothing in this nest would build them again). They load on a machine "
+                        f"like this one; on another CPU or GPU architecture they may not, and "
+                        f"this node has a build file, so rebuilding it there is the fix"
+                    )
+                    for so in so_files:
+                        archs = _probe_so_arch(so)
+                        if archs:
+                            node_arch_entries.append(
+                                {
+                                    "code_dep": dep["name"],
+                                    "path": so.relative_to(root).as_posix(),
+                                    "sm_list": archs,
+                                }
+                            )
                 else:
                     warnings.append(
                         f"⚠ {dep['name']}: {len(so_files)} compiled .so file(s) with no way to "
@@ -2428,6 +2532,23 @@ def _build_manifest(
             f"with it. If whoever restores this should get {'it' if one else 'them'} too, "
             f"move {'it' if one else 'them'} into the application folder and pack again."
         )
+
+    # Data files a node names in its code that sit outside everything this nest carries
+    # (probe G2, 2026-10-08: a node read <env>/probe-data/g2.json, pack said nothing, the
+    # restore came back without it). Named with the exact --add command rather than packed
+    # on our own: a data file can hold anything, files[] is not credential-scanned, and
+    # a guess from a file name is not proof the node needs it.
+    _packed_files = {str(f.get("path") or "") for f in spec.get("files") or [] if isinstance(f, dict)}
+    for dep in spec.get("code_deps", []):
+        if dep.get("role") == "host":
+            continue
+        for rel, lit, src_file in _data_files_named_outside(
+                root, _spec_source(root, dep, dep["install_path"]), packed_dirs, _packed_files):
+            warnings.append(
+                f"{dep['name']} names the file {lit!r} in its code ({src_file}), and a file by "
+                f"that name sits at {rel} — outside everything this nest carries, so it will "
+                f"not come back with it. If the node reads it, pack again with --add {rel}"
+            )
 
     # -- python_lock: four tiers, in order (the format spec carries the full table) --
     #   1. a lock file in the environment → pack it as-is;
@@ -2926,6 +3047,16 @@ def _build_manifest(
         # another machine, while that directory itself travels with the nest, so
         # they become a marker the restore side swaps for its own rebuild root.
         # **Only the segment pointing at this environment's root is touched.**
+        # Editable installs from outside the environment that `_carry_outside_editables`
+        # packed as code: point their lines at where that code lands, through the same
+        # marker, so the restore installs the carried copy.
+        _carried = spec.get("_carried_local_packages") or {}
+        if _carried:
+            _re, _n_re = _repoint_carried_lines(lock_text_for_audit, _carried)
+            if _n_re:
+                lock_text_for_audit = _re
+                lock_src = work / "requirements.lock"
+                lock_src.write_text(_re)
         tokenised, n_tok = tokenise_env_root(lock_text_for_audit, root)
         if n_tok:
             lock_src = work / "requirements.lock"
@@ -3090,7 +3221,7 @@ def _build_manifest(
         # already holds — not worth a manual verification.
 
     # -- assets: parallel stream-hash + blob --
-    files = spec.get("files", [])
+    files = list(spec.get("files", [])) + carved_files
 
     def do_file(fspec: dict) -> dict | None:
         # A file may live in one of two model-cache roots outside the environment
@@ -3433,7 +3564,9 @@ def _apply_add(root: Path, spec: dict, adds: list[str], warnings: list[str]) -> 
             if rel in have:
                 continue
             owner = None
-            for d in deps:
+            # A model file never rides inside a code archive (_weights_inside_code_dir),
+            # so one asked for by name is added like any other file.
+            for d in ([] if Path(rel).suffix.lower() in WEIGHT_SUFFIXES else deps):
                 ip = str(d["install_path"]).strip("/")
                 if rel.startswith(ip + "/"):
                     inner = rel[len(ip) + 1:]
@@ -3463,6 +3596,174 @@ def _apply_add(root: Path, spec: dict, adds: list[str], warnings: list[str]) -> 
         shown = ", ".join(added[:5]) + ("…" if len(added) > 5 else "")
         warnings.append(f"Packed because you asked with --add: {len(added)} file(s) ({shown})")
     return None
+
+
+#: Where a package installed editable from a folder outside the environment lands in
+#: the nest (and on the machine that restores it), under the environment root.
+LOCAL_PACKAGES_DIR = "local-packages"
+#: Above this a folder installed editable from outside the environment is left where it
+#: is (and named, as before) rather than packed on the user's behalf.
+CARRY_LOCAL_PACKAGE_MAX_BYTES = 100 << 20
+
+
+def _carry_outside_editables(root: Path, spec: dict, env_python: str | None,
+                             warnings: list[str]) -> dict[str, str]:
+    """Carry editable installs of folders **outside the environment** inside the nest.
+
+    ``uv pip install -e /somewhere/mylib`` leaves ``-e file:///somewhere/mylib`` in the
+    lock. That folder is not under the environment root, so it never travelled and a
+    restore stopped on it (measured 2026-10-08, probe F: pack warned, restore refused
+    the ``file://`` line as an unrecognised source). The folder is the user's own code
+    and it is right here, so instead of telling them to rearrange their setup we pack
+    it as a ``code_deps`` entry (``role: user_code``) landing at
+    ``local-packages/<name>`` under the environment root, and point the lock line at
+    that spot through the environment-root marker both restore legs already resolve.
+    No format change: ``code_deps`` with ``source_path`` and the marker are existing
+    mechanisms (the kohya ``-e .`` line has travelled this way since 2.0).
+
+    Only folders that look buildable (``pyproject.toml`` / ``setup.py`` /
+    ``setup.cfg``) and only lines the lock really carries as that ``file://`` URL.
+    Returns ``{original URL: install_path}`` and records it in
+    ``spec['_carried_local_packages']`` for the lock rewrite.
+    """
+    py = ((spec.get("python_lock") or {}).get("from_environment") or {}).get("python") \
+        or _env_python_for(root, env_python)
+    sp = interpreter_site_packages(py) if py else None
+    if sp is None:
+        return {}
+    root_r = root.resolve()
+    deps = spec.setdefault("code_deps", [])
+    taken = {str(d.get("install_path") or "").strip("/") for d in deps if isinstance(d, dict)}
+    carried: dict[str, str] = {}
+    for _name, url in sorted(dists_built_from_a_directory(sp).items()):
+        # renest itself, installed for development into the environment it packs, is
+        # not the user's code to hand on (its own test fixtures look like credentials).
+        if not url.startswith("file://") or canonical_name(_name) == "renest":
+            continue
+        folder = Path(unquote(urlparse(url).path))
+        try:
+            folder.resolve().relative_to(root_r)
+            continue  # inside the environment: it already travels with it
+        except ValueError:
+            pass
+        if not folder.is_dir() or not any(
+                (folder / f).is_file() for f in ("pyproject.toml", "setup.py", "setup.cfg")):
+            continue
+        # A whole project checkout (data, weights, build trees) is not "a small local
+        # package"; past this size the old advice stands instead of a surprise upload.
+        if _dir_size_as_packed(folder, []) > CARRY_LOCAL_PACKAGE_MAX_BYTES:
+            continue
+        ip, n =f"{LOCAL_PACKAGES_DIR}/{folder.name}", 2
+        while ip in taken:
+            ip, n = f"{LOCAL_PACKAGES_DIR}/{folder.name}-{n}", n + 1
+        taken.add(ip)
+        deps.append({"name": Path(ip).name, "role": "user_code", "install_path": ip,
+                     "source_path": str(folder)})
+        carried[url] = ip
+    if carried:
+        spec["_carried_local_packages"] = carried
+        shown = ", ".join(f"{Path(u[len('file://'):]).name} -> {ip}" for u, ip in
+                          list(carried.items())[:3])
+        warnings.append(
+            f"{len(carried)} package(s) were installed editable from a folder outside this "
+            f"environment ({shown}). That folder is your own code and would not have "
+            f"travelled, so it is packed into the nest and installed from there on restore."
+        )
+    return carried
+
+
+#: A string literal that is a bare data-file name (``"g2.json"``, ``'styles.yaml'``).
+_DATA_NAME = re.compile(r"^[\w][\w.-]{0,120}\.(?:json|ya?ml|toml|ini|cfg|csv|txt)$", re.IGNORECASE)
+#: Folders under the environment root that are never somebody's data: environments,
+#: model stores, ComfyUI's own in/out folders, version control.
+_DATA_SKIP = frozenset({".git", "__pycache__", ".venv", "venv", "site-packages", "node_modules",
+                        "models", "output", "input", "temp", ".renest", ".cache"})
+
+
+def _data_files_named_outside(root: Path, code_dir: Path, packed_dirs: list[str],
+                              packed_files: set[str]) -> list[tuple[str, str, str]]:
+    """``(path under root, the literal, the source file)`` for each data file a node's
+    code names by its bare file name that exists under the environment root but outside
+    every packed code folder and every packed file. Read off the source with ``ast`` --
+    only string constants count, never comments or prose. Bounded: a few hundred
+    source files, a walk that skips environments and model stores."""
+    import ast  # noqa: PLC0415
+
+    names: dict[str, str] = {}
+    if not code_dir.is_dir():
+        return []
+    for py in sorted(code_dir.rglob("*.py"))[:400]:
+        if any(p in _DATA_SKIP for p in py.relative_to(code_dir).parts):
+            continue
+        try:
+            if py.stat().st_size > (1 << 20):
+                continue
+            tree = ast.parse(py.read_text(encoding="utf-8", errors="ignore"))
+        except (OSError, SyntaxError, ValueError):
+            continue
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Constant) and isinstance(n.value, str) and _DATA_NAME.match(n.value):
+                names.setdefault(n.value, py.relative_to(code_dir).as_posix())
+    if not names:
+        return []
+    dirs = [d for d in packed_dirs if d]
+    hits: list[tuple[str, str, str]] = []
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        seen += len(filenames)
+        if seen > 50_000:  # a dataset folder; this is a hint, not an inventory
+            break
+        rel_dir = Path(dirpath).relative_to(root).as_posix()
+        rel_dir = "" if rel_dir == "." else rel_dir
+        if rel_dir and any(rel_dir == d or rel_dir.startswith(d + "/") for d in dirs):
+            dirnames[:] = []
+            continue
+        dirnames[:] = sorted(d for d in dirnames if d not in _DATA_SKIP)
+        for fn in sorted(filenames):
+            if fn in names:
+                rel = f"{rel_dir}/{fn}" if rel_dir else fn
+                if rel not in packed_files:
+                    hits.append((rel, fn, names[fn]))
+    return hits
+
+
+_HOME_CALL = re.compile(r"\bexpanduser\(|\bPath\.home\(\)|\bos\.environ(?:\.get)?\(\s*[\"']HOME[\"']")
+_HOME_CACHE_LITERAL = re.compile(r"""["'](?:~/)?\.cache(?:/[^"']*)?["']""")
+
+
+def _keeps_files_in_home(code_dir: Path) -> str | None:
+    """``"~/.cache (in nodes.py)"`` when a node's code builds a path under the home
+    folder's ``.cache`` -- where nodes park what they download on first use (probe J,
+    2026-10-08: the cache never travelled, the download address was gone on the new
+    machine, nothing said so). Off the source: the download happens only at run time."""
+    if not code_dir.is_dir():
+        return None
+    for py in sorted(code_dir.rglob("*.py"))[:400]:
+        if any(p in _DATA_SKIP for p in py.relative_to(code_dir).parts):
+            continue
+        try:
+            if py.stat().st_size > (1 << 20):
+                continue
+            text = py.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if _HOME_CALL.search(text) and _HOME_CACHE_LITERAL.search(text):
+            return f"~/.cache, in {py.relative_to(code_dir).as_posix()}"
+    return None
+
+
+def _repoint_carried_lines(lock_text: str, carried: dict[str, str]) -> tuple[str, int]:
+    """Swap each carried folder's ``file://`` URL in the lock for its place under the
+    environment-root marker. Exact-URL replacement only, so nothing else moves."""
+    n = 0
+    for url, ip in carried.items():
+        for line_url in (url, url.rstrip("/")):
+            c = lock_text.count(line_url)
+            if c:
+                lock_text = lock_text.replace(line_url, f"file://{ENV_ROOT_TOKEN}/{ip}")
+                n += c
+                break
+    return lock_text, n
 
 
 def _add_command(argv: list[str], possibly_used: list[dict]) -> str | None:
@@ -4073,6 +4374,10 @@ def pack(
             _said = {f"pack again with --add {c['path']}" for c in _gone}
             warnings[:] = [w for w in warnings
                            if not ("is NOT packed" in w and any(w.endswith(s) for s in _said))]
+    if isinstance(spec, dict):
+        # Before the credential scan on purpose: a folder carried this way is code
+        # handed to whoever restores the nest, so it goes through the same scan.
+        _carry_outside_editables(root, spec, env_python, warnings)
     if isinstance(spec, dict) and spec.get("_workflow_ui") is not None:
         # The API form of the same graph, for the credential scan below only.
         twin = workflow
@@ -4756,6 +5061,10 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
             nest_name=args.nest_name,
             log=None if args.json else (lambda m: print(m, file=sys.stderr)),
             report=not getattr(args, "no_report", False),
+            # The reporting disclosure goes to stderr even under --json (stdout stays
+            # the report); the field-by-field list only on an explicit --verbose,
+            # same split as restore.
+            full_disclosure=bool(getattr(args, "verbose", False)),
         )
 
     # Validate a hand-written spec against the schema — a misspelled enum should

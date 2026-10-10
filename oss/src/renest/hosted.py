@@ -32,7 +32,19 @@ import httpx
 from .errors import ErrorClass, ExitCode, NestFailure
 from .pack import PackError
 from .update_rules import DEFAULT_ORIGIN
-from .uplink import UPLINK_CONTRACT_VERSION, machine_facts, scrub_events
+from .uplink import (
+    UPLINK_CONTRACT_VERSION,
+    disclosure,
+    disclosure_brief,
+    machine_facts,
+    scrub_events,
+)
+
+
+def _stderr_notice(text: str) -> None:
+    import sys
+
+    print(text, file=sys.stderr, flush=True)
 
 __all__ = ["DEFAULT_ORIGIN", "MAX_PARALLEL_PUT", "HostedResult", "HostedUploader",
            "byte_challenge_answers",
@@ -305,7 +317,14 @@ class HostedUploader:
         client: httpx.Client | None = None,
         log: Callable[[str], None] | None = None,
         report: bool = True,
+        full_disclosure: bool = False,
+        notice: Callable[[str], None] | None = None,
     ) -> None:
+        """``notice`` is where the reporting disclosure is written. It is separate from
+        ``log`` on purpose: ``--json`` silences ``log``, but a run that reports must still
+        say so (on stderr, like restore does, so stdout stays clean). ``full_disclosure``
+        swaps the five-line note for the field-by-field list (an explicit ``--verbose``).
+        """
         self._origin = origin.rstrip("/")
         self._token = token
         self._nest_id = nest_id
@@ -313,6 +332,9 @@ class HostedUploader:
         self._client = client
         self._log = log or (lambda _msg: None)
         self._report_enabled = report
+        self._full_disclosure = full_disclosure
+        self._notice = notice or _stderr_notice
+        self._disclosed = False
         # After one failed report, this process stops trying (same rule as the
         # restore side).
         self._report_dead = False
@@ -321,6 +343,24 @@ class HostedUploader:
         self.result = HostedResult()
 
     # -- Progress reporting (POST /runs/report-pack, same token as elsewhere) --
+    def _disclose_reporting(self) -> None:
+        """Say that progress is reported, and exactly what, before the first report goes.
+
+        Until 0.1.21 the pack side reported silently while restore said so (E2 measured
+        2026-10-08: pack stderr 0 bytes, server holding the machine survey). Same words
+        and same short/long split as restore, from the same source (``uplink``)."""
+        if not self._report_enabled or self._disclosed:
+            return
+        self._disclosed = True
+        try:
+            self._notice(
+                "Upload progress is being sent to your drive (--no-report turns this off; "
+                "if it fails, your upload carries on regardless)\n"
+                + (disclosure("pack") if self._full_disclosure else disclosure_brief("pack"))
+            )
+        except Exception:  # noqa: BLE001 - a broken terminal must not stop the upload
+            pass
+
     def _report(self, client: httpx.Client, events: list[dict]) -> None:
         """Reporting never blocks and never affects the upload: every exception is
         swallowed, and a failure silently turns reporting off.
@@ -613,6 +653,9 @@ class HostedUploader:
             self.result.upload_session_id = session["upload_session_id"]
             self.result.nest_id = session["nest_id"]
             plans = session["blobs"]
+            # The upload stage starts here, and so can reporting (it needs the session
+            # id): say so before the first report leaves.
+            self._disclose_reporting()
 
             # Byte spot check: the server names a few byte ranges, we answer from
             # the local copy, and a correct answer skips the upload. If anything

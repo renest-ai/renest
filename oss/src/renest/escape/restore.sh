@@ -1345,6 +1345,42 @@ while read -r dep; do
   fi
 done < <(jq -c '.code_deps[]' "$MANIFEST")
 
+# BEGIN called-programs -- the both-legs test runs exactly these lines
+# Programs the restored code starts by name (ffmpeg / ffprobe for video nodes) that
+# this machine lacks. Probe H (2026-10-08): a node calling ffmpeg came back byte for
+# byte, then died on `FileNotFoundError: 'ffmpeg'` at its first run, and nothing
+# before that said a word. The Renest agent installs it (asked first); this script
+# only tells you and carries on -- it never installs and never stops. Read off the
+# code just unpacked, by the same rules as the agent (systools.programs_called_in):
+# a .py file that can start a program at all (subprocess / os.system and friends /
+# shutil.which) and names ffmpeg or ffprobe as a whole quoted string. Both programs
+# come with the ffmpeg package, so the check is `command -v ffmpeg`, as on that side.
+# called_programs <code folder> -> "<program> <first file that calls it>", one per line
+called_programs() {
+  local _cp_f _cp_p
+  [ -d "$1" ] || return 0
+  ( cd "$1" && find . \( -name .git -o -name __pycache__ -o -name node_modules \
+        -o -name site-packages -o -name .venv -o -name venv \) -prune \
+        -o -type f -name '*.py' -print 2>/dev/null ) \
+  | LC_ALL=C sort | while IFS= read -r _cp_f; do
+      [ "$(wc -c < "$1/$_cp_f" 2>/dev/null | tr -d ' ')" -le 2097152 ] 2>/dev/null || continue
+      grep -aqE '(^|[^A-Za-z0-9_])(subprocess|os\.(system|popen|exec[A-Za-z0-9_]*|spawn[A-Za-z0-9_]*)|shutil\.which)([^A-Za-z0-9_]|$)' "$1/$_cp_f" 2>/dev/null || continue
+      for _cp_p in $(grep -aoE "[\"'](ffmpeg|ffprobe)[\"']" "$1/$_cp_f" 2>/dev/null | tr -d "\"'" | LC_ALL=C sort -u); do
+        printf '%s %s\n' "$_cp_p" "${_cp_f#./}"
+      done
+    done | awk '!seen[$1]++' || true
+}
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  while IFS=$'\t' read -r _cp_role _cp_name _cp_path; do
+    [ "$_cp_role" = extension ] && _cp_label="custom node $_cp_name" || _cp_label="$_cp_name"
+    while read -r _cp_prog _cp_file; do
+      [ -n "$_cp_prog" ] || continue
+      warn "$_cp_label runs $_cp_prog ($_cp_file), and ffmpeg is not on this machine, so that node will fail when it runs it. This script does not install system programs. To add it: sudo apt-get install -y ffmpeg (Debian/Ubuntu; leave out sudo as root; or your system's package manager). Carrying on — nothing else depends on it."
+    done < <(called_programs "$TARGET/$_cp_path")
+  done < <(jq -r '.code_deps[]? | select(.role != "host") | [(.role // "-"), .name, .install_path] | @tsv' "$MANIFEST")
+fi
+# END called-programs
+
 # BEGIN wheel-fits -- the both-legs test runs exactly these lines (format 2.13)
 # wheel_fits <wheel file name> <python tag, e.g. cp311> <x86_64|aarch64> <linux-gnu|linux-musl|macos|windows>
 #   Prints nothing when the wheel installs here; otherwise "<python tags> / <platform
@@ -1491,6 +1527,35 @@ if [ -n "$UNSAFE_URLS" ]; then
     # Strip the query string before showing a URL: model hosts put the user's own
     # API token in it, and this output ends up in tickets and forum posts.
     printf '%s\n' "$UNSAFE_URLS" | head -5 | sed -e 's/?.*//' -e 's/^/    /' >&2
+  # A `file://` line that points outside the rebuild root is not a server at all: the
+  # packing machine installed that package straight from one of its own folders (an
+  # editable or local-path install), and the nest carries the line, not the folder.
+  # Probe F (2026-10-09): this used to be called "servers nobody recognises" and
+  # ended with an empty `RENEST_TRUSTED_HOSTS= bash restore.sh` -- naming a host
+  # cannot fetch a folder that is not here. Same verdict (stopped, nothing
+  # installed), the real cause and the real fix. The agent side says the same
+  # (restore.py, _local_folder_refusal).
+  elif LOCAL_URLS=$(printf '%s\n' "$UNSAFE_URLS" | grep '^file://' | sed -e 's/?.*//') && [ -n "$LOCAL_URLS" ]; then
+    _LF_HERE=""
+    while IFS= read -r _lf; do
+      _lfp="${_lf#file://}"
+      case "$_lfp" in (/*) [ -e "$_lfp" ] && _LF_HERE="$_LF_HERE $_lfp" ;; esac
+    done <<<"$LOCAL_URLS"
+    _LF_OTHERS=$(printf '%s\n' "$UNSAFE_URLS" | grep -vc '^file://' || true)
+    die DEPS-UNTRUSTED-URL "This nest installs a package from a folder on the machine it was packed on, and that folder did not come with the nest. Stopped — nothing was installed:
+$(printf '%s\n' "$LOCAL_URLS" | while IFS= read -r _lf; do grep -F -- "$_lf" "$LOCK_FOR_UV" | head -1; done | sed -e 's/?.*//' -e 's/^[[:space:]]*/       /')
+
+       That is not a server: the packing machine installed this package from one of
+       its own folders (an editable or local-path install), and the nest carries only
+       the line that points there, not the folder.$( [ -n "$_LF_HERE" ] \
+         && printf '\n       A folder by that name exists on this machine, but nothing shows it holds the same\n       code, so it is not used.' \
+         || printf '\n       That folder is not on this machine either.' )
+
+       To fix it, on the machine it was packed on, either:
+         - pack again with the newest Renest, which carries such folders inside the nest; or
+         - install that package from a published source (PyPI or a git address) instead
+           of the folder, then pack again.$( [ "$_LF_OTHERS" -gt 0 ] 2>/dev/null \
+         && printf '\n\n       This nest also installs from %s other source(s) nobody recognises; this script\n       will ask about those once the folder above is dealt with.' "$_LF_OTHERS" )"
   else
     UNSAFE_HOSTS=$(printf '%s\n' "$UNSAFE_URLS" | while IFS= read -r u2; do
         h="${u2#*://}"; h="${h%%/*}"; h="${h##*@}"; h="${h%%:*}"
