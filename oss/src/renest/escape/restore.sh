@@ -754,6 +754,60 @@ if [ -n "$BLOB_MANIFEST" ]; then
   jq -e 'type == "object"' "$BLOBMAP" >/dev/null || die BLOBMAP-BAD "The presigned file list is malformed (it should be a {sha256: url} object)"
 fi
 
+# ---- 1f. Files that do not travel with this nest ------------------------------
+# A nest somebody handed you leaves out the files whose licence does not let the
+# sender pass them on: the manifest lists them, the presigned list has no link for
+# them. Until 0.1.23 this script said nothing until the download reached the first
+# of them, and then named only that one. Now every one is named here, before
+# anything is downloaded: size, sha256, the address the nest records for it, and the
+# exact place to put it. A file already in place whose bytes match counts as here.
+# Told, never enforced (2026-07-15 ruling): nothing in this block stops the run, and
+# this script does not fetch from those addresses itself — `renest restore` does.
+# BEGIN files-not-travelling -- the both-legs test runs exactly these lines, so they cannot drift
+_NT_N=0
+_NT_DESTS=$'\n'
+_NT_SUMMARY=""
+if [ -n "$BLOB_MANIFEST" ]; then
+  # Fields are joined with the unit separator, not a tab: an empty field between two
+  # tabs is swallowed by `read`, and "no address on record" is exactly an empty field.
+  _NT_ROWS=$(jq -r '
+    (.files // [])[]
+    | (.license // {}) as $l
+    | select(($l | type) == "object")
+    | select((($l | has("shareable")) and ($l.shareable | not)) or ($l.serving_scope == "gated"))
+    | (.blob.sha256 // "") as $h
+    | select(($h | type) == "string" and ($h | length) > 0)
+    | [$h, ((.blob.size_bytes // 0) | tostring), (.root // "env"), (.origin_url // ""), .path]
+    | map(tostring | gsub("[\u001f\r\n]"; " ")) | join("\u001f")' "$MANIFEST")
+  while IFS=$'\037' read -r _nt_h _nt_sz _nt_root _nt_origin _nt_rel; do
+    [ -n "$_nt_h" ] || continue
+    # A link in the presigned list means these bytes are your own copy: it travels.
+    [ -z "$(jq -r --arg h "$_nt_h" '.[$h] // empty' "$BLOBMAP")" ] || continue
+    _nt_dest="$(root_dir "$_nt_root")/$_nt_rel"
+    if [ -f "$_nt_dest" ] && [ "$(sha256_of "$_nt_dest")" = "$_nt_h" ]; then
+      log "Does not travel with this nest, but it is already here and byte-checked: $_nt_rel"
+      continue
+    fi
+    if [ "$_NT_N" -eq 0 ]; then
+      warn "Some files do not travel with this nest — their licence does not let the sender pass them on — and they are not on this machine. This script does not fetch them. Every one of them:"
+    fi
+    _NT_N=$((_NT_N + 1))
+    _NT_DESTS="$_NT_DESTS$_nt_dest"$'\n'
+    _nt_entry="  $_nt_rel ($(hsize "$_nt_sz"))
+      sha256:    $_nt_h
+      came from: ${_nt_origin:-no address on record — find a file with exactly this sha256}
+      put it at: $_nt_dest"
+    printf '%s\n' "$_nt_entry" >&2
+    _NT_SUMMARY="$_NT_SUMMARY
+$_nt_entry"
+  done <<<"$_NT_ROWS"
+  if [ "$_NT_N" -gt 0 ]; then
+    warn "$_NT_N file(s) in all. Carrying on with everything else. Put each one at the path shown and run this again: a file in place whose bytes match is kept as it is, and different bytes are never accepted. (\`renest restore\` fetches the ones whose address is public for you.)"
+  fi
+fi
+# END files-not-travelling
+
+# BEGIN fetch-blob -- the both-legs test runs exactly these lines, so they cannot drift
 # blob_url <sha256> — work out where to download this file from
 blob_url() {
   local h="$1"
@@ -777,12 +831,15 @@ mkdir -p "$SEEN_BLOBS" 2>/dev/null || SEEN_BLOBS=""
 fetch_blob() {
   local STAGE="S1-fetch"      # anything failing in here is a fetch failure
   local h="$1" dest="$2" prefix="${3:-}" url tmp got
-  url=$(blob_url "$h")
   tmp="$dest.part"
   mkdir -p "$(dirname "$dest")"
+  # **Looked at before asking where to download it from.** A file that does not
+  # travel with the nest has no link at all, so asking first stopped the run on a
+  # file the user had already put in place with the right bytes (until 0.1.23).
   if [ -f "$dest" ] && [ "$(sha256_of "$dest")" = "$h" ]; then
     log "  ${prefix}already here and byte-checked, skipping $(basename "$dest")"; return 0
   fi
+  url=$(blob_url "$h")
   # **One sha256, one download.** A manifest may point several paths at the same bytes
   # (one big model referenced from several places is normal); fetching each path
   # separately spends the user's bandwidth once per reference. If these bytes already
@@ -857,6 +914,7 @@ fetch_blob() {
   [ -n "${SEEN_BLOBS:-}" ] && printf '%s' "$dest" > "$SEEN_BLOBS/$h"
   return 0
 }
+# END fetch-blob
 
 # ---- 3. Which image this nest was built on (told, not enforced) -------------
 # base_image is optional from format 2.3 on: a container cannot see its own image
@@ -1924,6 +1982,13 @@ while read -r f; do
   path="$(root_dir "$froot")/$relpath"
   h=$(jq -r '.blob.sha256' <<<"$f")
   sz=$(jq -r '.blob.size_bytes' <<<"$f")
+  # A file named at the start as not travelling with this nest and not here: there is
+  # no link to try, so move on to the next one. It is reported once, with all the
+  # others, after everything that can be moved has been.
+  case "$_NT_DESTS" in *$'\n'"$path"$'\n'*)
+    log "  [$i/$N] does not travel with this nest and is not here — carrying on: $relpath"
+    continue ;;
+  esac
   (
     fetch_blob "$h" "$path" "[$i/$N] "
     printf '\033[1;32m[renest]\033[0m   [✓ %d/%d] %s (%s)\n' "$i" "$N" "$relpath" "$(hsize "$sz")"
@@ -1959,6 +2024,13 @@ if [ -f "$FAILFILE" ]; then
   log "One of the downloads failed (details in $FAILFILE) — stopping"
   exit 1
 fi
+# The same stop this script always made for a file with no link (BLOBMAP-MISS), made
+# once and for all of them: every file that could be moved has been by now.
+# BEGIN files-not-travelling-stop -- the both-legs test runs exactly these lines
+if [ "$_NT_N" -gt 0 ]; then
+  die BLOBMAP-MISS "$_NT_N file(s) this nest needs do not travel with it and are not on this machine — the presigned list has no entry for them, so there is nowhere to download them from. Not a transfer failure, and everything else has been moved. Put each one at the path shown and run this again:$_NT_SUMMARY"
+fi
+# END files-not-travelling-stop
 T_XFER_END=$(date +%s)
 
 # Count the bytes actually on disk, not what the manifest claims. Counting files

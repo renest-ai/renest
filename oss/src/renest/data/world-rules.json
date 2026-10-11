@@ -1,7 +1,7 @@
 {
   "schema": "ai.renest.rules.world",
   "schema_version": "1",
-  "updated": "2026-08-08",
+  "updated": "2026-10-11",
   "issued_at": null,
   "provenance": "Factory baseline. **This file holds what the outside world currently looks like** -- the facts that go stale when something upstream changes. They used to be hard-coded, so correcting a single character required a new release; kept here, one update fixes them. The issue date is stamped by the signing tool, never written by hand: a hand-written date lies the moment someone edits the content and forgets it, which would turn \"speak up when stale\" into speaking falsely.",
   "boundary_note": "**What does not belong in this file**: (1) anything that would relax the safety semantics of a restore (the path-traversal check, the launch-argument allowlist) -- those are format contract, not world knowledge, and letting them be changed remotely hands the gate to the network; (2) licence texts -- those are bytes that travel with a nest and should be content-addressed, not a mutable world file; (3) the escape hatch never reads anything here.",
@@ -30,7 +30,7 @@
     "note": "Which CUDA generation to assume when the dependency list carries no marker. **Assuming the oldest is the conservative choice**: it demands the lowest driver version and so never rejects a good machine, but it also means a newer environment does not get the check it deserves. This default moves as the mainstream moves, which makes it a fact about the world rather than a decision of ours."
   },
   "comfyui_vocab": {
-    "provenance": "Read off ComfyUI's own source: the loader classes and the input names they declare, which is the only place this can be known exactly. Not hand-copied -- scripts/propose-rules-update.py parses that source and prints what upstream has and we do not; a human confirms each row against the source before it is written here, because the proposer has been wrong before (it once took an outer wrapper key for an input name). Last reconciled 2026-08-14; the rows added that day are in the factory table in capture.py, each checked one by one. A refreshed table can add a row to the factory one or replace a row, but never remove one, so refreshing this cannot make the tool recognise fewer node classes than it shipped with (_merge_vocab in capture.py).",
+    "provenance": "Read off ComfyUI's own source: the loader classes and the input names they declare, which is the only place this can be known exactly. Not hand-copied -- scripts/propose-rules-update.py parses that source and prints what upstream has and we do not; a human confirms each row against the source before it is written here, because the proposer has been wrong before (it once took an outer wrapper key for an input name). Last reconciled 2026-08-14; the rows added that day are in the factory table in capture.py, each checked one by one. A refreshed table can add a row to the factory one or replace a row, but never remove one, so refreshing this cannot make the tool recognise fewer node classes than it shipped with (_merge_vocab in capture.py). Added 2026-10-11, read off upstream at commit 7f7fd918ed0815c5d5ef2ccfe44bfc8e72cfd217: ConditioningLoader (comfy_extras/nodes_cond.py; input conditioning_name, options folder_paths.get_filename_list(\"embeddings\")) and SAM3DBody_Loader (comfy_extras/nodes_sam3d_body.py; input model_file, options folder_paths.get_filename_list(\"detection\")). Their two categories, embedding and detection_model, were already in the factory table in capture.py and are repeated here so the rows resolve on their own.",
     "note": "The two tables used to recognise ComfyUI nodes. **Every time upstream renames a node, these tables lose a little accuracy** -- and they lose it silently, simply collecting one model fewer, which is the easiest kind of failure to miss. Kept here, an upstream rename can be shipped the same day.\n\n**These tables only affect what can be recognised, never what may be collected.** The boundary is still \"only what this workflow referenced\", and that boundary lives in code, not in this file -- so changing these tables remotely cannot widen what gets collected.",
     "categories": {
       "checkpoint": {
@@ -100,6 +100,18 @@
           "input"
         ],
         "kind": "input_asset"
+      },
+      "embedding": {
+        "dirs": [
+          "models/embeddings"
+        ],
+        "kind": "embedding"
+      },
+      "detection_model": {
+        "dirs": [
+          "models/detection"
+        ],
+        "kind": "detection_model"
       }
     },
     "model_ref_map": {
@@ -199,6 +211,18 @@
         {
           "input": "image",
           "category": "input_asset"
+        }
+      ],
+      "ConditioningLoader": [
+        {
+          "input": "conditioning_name",
+          "category": "embedding"
+        }
+      ],
+      "SAM3DBody_Loader": [
+        {
+          "input": "model_file",
+          "category": "detection_model"
         }
       ]
     }

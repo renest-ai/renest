@@ -39,6 +39,8 @@ __all__ = [
     "LicenseClues",
     "LicenseVerdict",
     "hf_repo_from_path",
+    "hf_cache_location",
+    "address_seen",
     "known_component",
     "parse_allow_commercial_use",
     "judge_hf",
@@ -126,6 +128,12 @@ SHARED_COMPONENT_KINDS: frozenset[str] = frozenset({"clip", "vae", "tokenizer"})
 
 #: Pull the repository name out of an ``hf_hub`` cache path: ``models--<org>--<name>/...``
 _HF_CACHE_PATH = re.compile(r"^models--([^/]+)/")
+#: The same cache when it travels under the home folder (``files[].root == "home"``).
+_HOME_HF_PREFIX = ".cache/huggingface/hub/"
+#: The revision a cache entry belongs to: a file of a snapshot, or the cache's own
+#: record that the repository has no such file at that revision.
+_HF_CACHE_REVISION = re.compile(r"^models--[^/]+/(?:snapshots|\.no_exist)/([0-9a-f]{40})/")
+_HF_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 
 
 class GatedForm:
@@ -239,6 +247,29 @@ def hf_repo_from_path(path: str) -> str:
     if not m:
         return ""
     return m.group(1).replace("--", "/", 1)
+
+
+def hf_cache_location(root: str, path: str) -> tuple[str, str] | None:
+    """``(repository, revision)`` of an entry in a Hugging Face model cache, or None.
+
+    Both places such a cache travels from are read: ``root == "hf_hub"`` (the path
+    starts at ``models--<org>--<name>/``) and ``root == "home"`` (the same thing under
+    ``.cache/huggingface/hub/``). Every kind of entry belongs to its repository: a
+    snapshot file, a ``refs/<branch>`` pointer, a ``.no_exist`` marker. The revision is
+    empty for a ``refs/`` pointer, whose path does not name one.
+    """
+    rel = path or ""
+    if root == "home":
+        if not rel.startswith(_HOME_HF_PREFIX):
+            return None
+        rel = rel[len(_HOME_HF_PREFIX):]
+    elif root != "hf_hub":
+        return None
+    repo = hf_repo_from_path(rel)
+    if not repo:
+        return None
+    m = _HF_CACHE_REVISION.match(rel)
+    return repo, (m.group(1) if m else "")
 
 
 def parse_allow_commercial_use(raw: object) -> frozenset[str]:
@@ -400,6 +431,12 @@ def known_component(sha256: str) -> LicenseVerdict | None:
     Three gates, all in code so the data channel cannot widen them: a full sha256, an
     origin on a repository we treat as an authority, and a licence already on the
     allow-list. Anything else returns ``None`` and the normal lookup carries on.
+
+    A row may also say the opposite: ``"verdict": "restricted"`` marks a file we looked
+    into and must **not** pass on, whatever the repository it sits in declares (the
+    licence tag there was not set by the author, say). Such a row wins over every
+    other row for the same sha256 and over the repository lookup, and it needs no
+    gate: a row that only ever holds a file back cannot widen anything.
     """
     sha = (sha256 or "").strip().lower()
     if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
@@ -408,11 +445,23 @@ def known_component(sha256: str) -> LicenseVerdict | None:
         table = load_rules(KNOWN_COMPONENTS)
     except (KeyError, RuntimeError, OSError):
         return None      # judging is optional; it must never be able to fail packing
-    for entry in table.get("components") or []:
-        if not isinstance(entry, dict):
-            continue
-        if str(entry.get("sha256") or "").strip().lower() != sha:
-            continue
+    rows = [e for e in table.get("components") or []
+            if isinstance(e, dict) and str(e.get("sha256") or "").strip().lower() == sha]
+    for entry in rows:
+        # Any value in ``verdict`` holds the file back: "restricted" is the only one
+        # defined, and a misspelt one must not turn into a release.
+        if str(entry.get("verdict") or "").strip():
+            name = str(entry.get("name") or "").strip() or "This file"
+            why = str(entry.get("reason") or "").strip() or (
+                "It is on our list of files whose licence does not allow that.")
+            return LicenseVerdict(
+                serving_scope="gated",
+                shareable=False,
+                tag="restricted",
+                origin_url=str(entry.get("origin_url") or "").strip(),
+                reason=f"{name} is not passed on. {why}",
+            )
+    for entry in rows:
         origin = str(entry.get("origin_url") or "").strip()
         spdx = str(entry.get("spdx") or "").strip().lower()
         if _origin_host(origin) not in _AUTHORITATIVE_ORIGINS:
@@ -634,19 +683,42 @@ def licence_text_path(spdx: str) -> Path | None:
     return p if p.is_file() else None
 
 
+#: sha256 -> a download address a lookup came across for exactly those bytes. Filled by
+#: :func:`lookup`, read by :func:`address_seen`. A fact about public bytes, so sharing it
+#: across calls in one process is harmless.
+_ADDRESSES_SEEN: dict[str, str] = {}
+
+
+def address_seen(sha256: str) -> str:
+    """The download address :func:`lookup` came across for these bytes, or empty.
+
+    Today that is the address a Civitai record gives for the file with this sha256
+    (see :func:`renest.origins.civitai_address`). Kept apart from the verdict: the
+    address is known even when the record cannot speak for the file's licence.
+    """
+    return _ADDRESSES_SEEN.get((sha256 or "").strip().lower(), "")
+
+
 def lookup(fspec: dict, *, client: "httpx.Client | None" = None) -> LicenseVerdict | None:
     """Turn the clues in one ``files[]`` entry into a verdict. ``None`` if nothing found.
 
     **This is the wire that connects this module to the packing side.**
 
-    Two independent routes, as established by probing the real APIs -- not one chain:
+    Three routes, in this order:
 
-    - the placement root is the model cache and the path looks like
-      ``models--<org>--<name>/...`` -> **take the repository name straight from the path**
-      and look it up; name and revision are both already there;
+    - our own known-files table, by sha256, without a request. A row there was checked
+      by hand, and a row marked restricted must hold whatever the routes below say;
+    - the file sits in a Hugging Face model cache (``root`` ``hf_hub``, or ``home``
+      under ``.cache/huggingface/hub/``) -> **the repository it belongs to answers**,
+      read at the revision the cache pinned. This covers every entry of the cache:
+      snapshot files, ``refs/`` pointers and ``.no_exist`` markers. A pointer's path
+      names no revision, so the caller passes the commit it holds as ``hf_revision``;
     - everything else (mostly weights the user downloaded by hand) -> look up by content
       hash on the community site, which **takes two requests** (the first returns only an
       id; the permission fields need a second one).
+
+    A download address the community record gives for exactly these bytes is kept
+    for :func:`address_seen`.
 
     **Nothing found, lookup failed, or timed out: always return None** -- the layer above
     then keeps what the user wrote and labels it as their own statement.
@@ -658,28 +730,39 @@ def lookup(fspec: dict, *, client: "httpx.Client | None" = None) -> LicenseVerdi
     own = client is None
     c = client or _httpx.Client(timeout=15.0, follow_redirects=True)
     try:
-        if fspec.get("root") == "hf_hub":
-            repo = hf_repo_from_path(fspec.get("path", ""))
-            if not repo:
-                return None
-            r = c.get(f"https://huggingface.co/api/models/{repo}")
+        sha = ((fspec.get("blob") or {}).get("sha256")) or fspec.get("sha256") or ""
+        # Our own table answers first, and without a request. See `known_component`
+        # for why a hash lookup on a community site cannot answer for a file that sits
+        # inside dozens of unrelated bundles, and for the rows that hold a file back.
+        mine = known_component(sha) if len(sha) == 64 else None
+        if mine is not None:
+            return mine
+
+        where = hf_cache_location(str(fspec.get("root") or "env"), str(fspec.get("path") or ""))
+        if fspec.get("root") == "hf_hub" and where is None:
+            return None
+        if where is not None:
+            repo, rev = where
+            rev = rev or str(fspec.get("hf_revision") or "").strip().lower()
+            ask = f"https://huggingface.co/api/models/{repo}"
+            if _HF_COMMIT.match(rev):
+                ask += f"/revision/{rev}"
+            r = c.get(ask)
             if r.status_code != 200:
                 return None
             return judge_hf(repo, r.json())
 
-        sha = ((fspec.get("blob") or {}).get("sha256")) or fspec.get("sha256") or ""
         if len(sha) != 64:
             return None
-        # Our own table of shared parts answers first, and without a request. See
-        # `known_component` for why a hash lookup on a community site cannot answer for
-        # a file that sits inside dozens of unrelated bundles.
-        mine = known_component(sha)
-        if mine is not None:
-            return mine
         r = c.get(f"https://civitai.com/api/v1/model-versions/by-hash/{sha}")
         if r.status_code != 200:
             return None
         version = r.json()
+        from .origins import civitai_address
+
+        address = civitai_address(version, sha)
+        if address:
+            _ADDRESSES_SEEN[sha.strip().lower()] = address
         model_id = version.get("modelId")
         if not model_id:
             return None

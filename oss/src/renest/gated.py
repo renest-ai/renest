@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +33,11 @@ __all__ = [
     "TOKEN_HELP",
     "check_reach",
     "summarise",
+    "not_travelling",
+    "already_in_place",
+    "needs_you",
+    "missing_report",
+    "human_size",
 ]
 
 #: Where to get a token and where to put it. Anyone receiving someone else's
@@ -56,6 +62,14 @@ class Reach:
     NO_TOKEN = "no_token"        # credentials required, none on this machine
     NO_SOURCE = "no_source"      # we do not even know where to get it
     ERROR = "error"              # the probe failed (network etc.); not "unreachable"
+    #: The host wants a sign-in and it is not Hugging Face: we hold no credential
+    #: for it and never send the Hugging Face one there.
+    SIGN_IN_ELSEWHERE = "sign_in_elsewhere"
+    #: Handed-over nest, address on a host we do not recognise, sender not named:
+    #: not contacted at all until the receiver names the sender.
+    UNVETTED = "unrecognised_source"
+    #: Already at its landing path with the right sha256. Nothing left to do.
+    PRESENT = "present"
 
 
 @dataclass
@@ -71,6 +85,10 @@ class GatedAsset:
     gated_form: str = ""
     reach: str = ""
     detail: str = ""
+    #: The landing root recorded in the manifest (``files[].root``).
+    root: str = "env"
+    #: The exact place this file has to be on this machine (filled by the restore).
+    dest: str = ""
 
 
 def gated_assets(manifest: dict) -> list[GatedAsset]:
@@ -93,9 +111,56 @@ def gated_assets(manifest: dict) -> list[GatedAsset]:
                 size_bytes=int(blob.get("size_bytes") or 0),
                 origin_url=f.get("origin_url") or "",
                 gated_form=lic.get("gated_form") or "",
+                root=f.get("root") or "env",
             )
         )
     return out
+
+
+def not_travelling(
+    manifest: dict,
+    *,
+    linked: Collection[str],
+    dest_of: Callable[[str, str], Path],
+) -> list[GatedAsset]:
+    """The restricted files **this restore has no link for**, each with the exact
+    place it has to land.
+
+    ``linked`` holds the sha256 of every file the restore can download as usual
+    (a restore code that carries a link for it, or a storage address given by
+    hand). A restricted file with a link is the owner's own copy and travels like
+    anything else; one without is what the receiver gets from its original source.
+    ``dest_of(root, path)`` is the landing rule, passed in so this module never
+    holds a second copy of it.
+    """
+    out = []
+    for a in gated_assets(manifest):
+        if not a.sha256 or a.sha256 in linked:
+            continue
+        a.dest = str(dest_of(a.root, a.path))
+        out.append(a)
+    return out
+
+
+def already_in_place(asset: GatedAsset) -> bool:
+    """Whether the file is at its landing path with the right bytes.
+
+    Size first (free), then the sha256 — a file somebody put there by hand counts
+    exactly when its bytes are the ones the nest was built with.
+    """
+    p = Path(asset.dest)
+    try:
+        if not p.is_file():
+            return False
+        if asset.size_bytes and p.stat().st_size != asset.size_bytes:
+            return False
+        h = hashlib.sha256()
+        with p.open("rb") as r:
+            for chunk in iter(lambda: r.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return False
+    return h.hexdigest() == asset.sha256
 
 
 def find_token(env: dict[str, str] | None = None, home: Path | None = None) -> str:
@@ -198,8 +263,11 @@ def check_reach(asset: GatedAsset, *, token: str, client: httpx.Client) -> Gated
         asset.reach = Reach.FREE
         return asset
     if code in (401, 403):
-        if token and not token_may_go_to(asset.origin_url):
-            asset.reach = Reach.ERROR
+        if not token_may_go_to(asset.origin_url):
+            # Not Hugging Face: there is no credential of yours we would send here,
+            # token on this machine or not — and asking for a Hugging Face token
+            # would point the reader at the wrong account.
+            asset.reach = Reach.SIGN_IN_ELSEWHERE
             asset.detail = (
                 "this host asks for a sign-in; your Hugging Face token is only ever "
                 "sent to huggingface.co, so get this file from that site yourself"
@@ -223,53 +291,137 @@ def check_reach(asset: GatedAsset, *, token: str, client: httpx.Client) -> Gated
     return asset
 
 
-#: Display order: **what we handle automatically goes first, what needs the
-#: user goes last** — the first thing they should see is "these are taken care
-#: of", not a screen full of red.
-_ORDER = [Reach.FREE, Reach.NEEDS_CLICK, Reach.NO_TOKEN, Reach.NEEDS_APPROVAL,
-          Reach.NO_SOURCE, Reach.ERROR]
-_MARK = {Reach.FREE: "OK ", Reach.NEEDS_CLICK: "!! ", Reach.NO_TOKEN: "!! ",
-         Reach.NEEDS_APPROVAL: "XX ", Reach.NO_SOURCE: "XX ", Reach.ERROR: "?? "}
-_HEAD = {
-    Reach.FREE: "will be fetched for you — nothing to do",
-    Reach.NEEDS_CLICK: "need you to accept the terms once, then run this again",
-    Reach.NO_TOKEN: "need a token on this machine",
-    Reach.NEEDS_APPROVAL: "need the author to approve you, which can take days",
-    Reach.NO_SOURCE: "cannot be fetched — we do not know where to get them",
+def human_size(n: int) -> str:
+    for unit, k in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+        if n >= k:
+            return f"{n / k:.1f} {unit}"
+    return f"{n} bytes"
+
+
+#: The reaches where nothing we can do on our own gets the file: the receiver has
+#: to act (provide it, accept terms, add a token, name the sender).
+_NEEDS_YOU = frozenset({
+    Reach.NEEDS_CLICK, Reach.NO_TOKEN, Reach.NEEDS_APPROVAL, Reach.NO_SOURCE,
+    Reach.SIGN_IN_ELSEWHERE, Reach.UNVETTED,
+})
+
+#: Said when the reach itself is the whole story and no detail was recorded.
+_WHY = {
+    Reach.NEEDS_CLICK: "open the page once and accept the terms",
+    Reach.NO_TOKEN: "needs your own account, and this machine has no token",
+    Reach.NEEDS_APPROVAL: "the author has to approve you — that can take days",
+    Reach.NO_SOURCE: "we do not know where this one came from",
+    Reach.SIGN_IN_ELSEWHERE: "this host asks for a sign-in — get it there yourself",
+    Reach.UNVETTED: "the address is on a host we do not recognise",
     Reach.ERROR: "could not be checked right now",
 }
 
 
+def needs_you(asset: GatedAsset) -> bool:
+    """Whether this file can only arrive if the receiver does something."""
+    return asset.reach in _NEEDS_YOU
+
+
+def _entry(a: GatedAsset, *, why: bool) -> list[str]:
+    size = f"  ({human_size(a.size_bytes)})" if a.size_bytes else ""
+    lines = [f"      {a.path}{size}"]
+    lines.append(f"          from <{a.origin_url}>" if a.origin_url
+                 else "          no address on record")
+    if why:
+        lines.append(f"          {a.detail or _WHY.get(a.reach, a.reach)}")
+    return lines
+
+
 def summarise(assets: list[GatedAsset], *, have_token: bool) -> str:
-    """Explain all four cases **in one go**.
+    """Every file that does not travel with the nest, **all of them, in one go**,
+    in two groups: the ones we fetch, and the ones the receiver has to provide.
 
     **Why all at once**: the worst experience is not "you have to fetch it
     yourself", it is hitting them one at a time — fix one, run again, hit the
-    next. Said once, they can deal with the whole set once.
+    next. Said once, with size and address, they can deal with the whole set once.
+    Never shortened to "and N more": a file left out of this list is a file the
+    reader finds out about after paying for the machine.
     """
     if not assets:
         return ""
     lines = [
-        f"{len(assets)} file(s) do not travel with this nest — they are fetched from "
-        f"where they came from, with your own account:"
+        f"{len(assets)} file(s) do not travel with this nest — their licence does not "
+        f"let the sender pass them on. All of them, before anything is downloaded:"
     ]
-    by: dict[str, list[GatedAsset]] = {}
-    for a in assets:
-        by.setdefault(a.reach or Reach.ERROR, []).append(a)
-    for reach in _ORDER:
-        group = by.get(reach)
-        if not group:
-            continue
-        lines.append(f"\n  {_MARK[reach]}{len(group)} {_HEAD[reach]}")
-        for a in group[:5]:
-            where = f"  <{a.origin_url}>" if a.origin_url else ""
-            lines.append(f"      {a.path}{where}")
-        if len(group) > 5:
-            lines.append(f"      …and {len(group) - 5} more")
+    ours = [a for a in assets if a.reach in (Reach.FREE, Reach.ERROR, "")]
+    yours = [a for a in assets if needs_you(a)]
+    here = [a for a in assets if a.reach == Reach.PRESENT]
+    if ours:
+        lines.append(
+            f"\n  We will fetch these for you from their original source "
+            f"({len(ours)}), and check each one against this nest:"
+        )
+        for a in ours:
+            lines += _entry(a, why=a.reach != Reach.FREE)
+    if yours:
+        lines.append(f"\n  You need to provide these ({len(yours)}):")
+        for a in yours:
+            lines += _entry(a, why=True)
+    if here:
+        lines.append(f"\n  Already on this machine and checked ({len(here)}):")
+        for a in here:
+            lines += _entry(a, why=False)
     if not have_token and any(
         a.reach in (Reach.NO_TOKEN, Reach.NEEDS_CLICK, Reach.NEEDS_APPROVAL) for a in assets
     ):
         lines.append("\n" + TOKEN_HELP)
+    return "\n".join(lines)
+
+
+def missing_report(
+    assets: list[GatedAsset], *, have_token: bool, sender: str = "", tried: bool = False
+) -> str:
+    """The one message printed when the restore stops because files that do not
+    travel are not here: **every** such file, with its size, sha256, address, the
+    exact place to put it, and how to carry on.
+
+    ``tried`` = we did go to the original source and it did not work out (as
+    opposed to knowing beforehand that only the receiver can supply the file).
+    """
+    lines = [
+        (
+            f"{len(assets)} file(s) that do not travel with this nest could not be "
+            f"fetched from their original source. They are licence-restricted, so "
+            f"your drive holds no copy to download. None of this nest's files or code "
+            f"has been downloaded yet."
+            if tried else
+            f"{len(assets)} file(s) this nest needs are licence-restricted, so they "
+            f"never travel with a hand-off, and they are not on this machine. Not a "
+            f"transfer failure — nothing has been downloaded yet, and running this "
+            f"again as it is will stop here again."
+        )
+        + " Each one, and the exact place to put it:"
+    ]
+    for i, a in enumerate(assets, 1):
+        size = f" ({human_size(a.size_bytes)})" if a.size_bytes else ""
+        lines.append(f"\n  {i}. {a.path}{size}")
+        lines.append(f"       sha256: {a.sha256}")
+        lines.append(
+            f"       came from: <{a.origin_url}>" if a.origin_url else
+            "       came from: no address on record — find a file with exactly this sha256"
+        )
+        lines.append(f"       why we could not get it: {a.detail or _WHY.get(a.reach, a.reach)}")
+        lines.append(f"       put it at: {a.dest}")
+    lines.append(
+        "\nThen run the same command again. A file that is in place and matches its "
+        "sha256 is kept as it is; a file with different bytes is never accepted."
+    )
+    if sender and any(a.reach == Reach.UNVETTED for a in assets):
+        lines.append(
+            f"To let this restore fetch from the addresses {sender} recorded on hosts "
+            f'we do not recognise, add: --trust-sender "{sender}"'
+        )
+    if any(a.reach in (Reach.NO_TOKEN, Reach.NEEDS_CLICK, Reach.NEEDS_APPROVAL) for a in assets):
+        lines.append(
+            "Files that need your own Hugging Face account are fetched for you once "
+            + ("the terms are accepted on their page." if have_token
+               else "your token is on this machine:\n" + TOKEN_HELP)
+        )
     return "\n".join(lines)
 
 
@@ -303,6 +455,15 @@ def fetch_from_origin(
                            follow_redirects=True, timeout=300.0) as r:
             if r.status_code >= 400:
                 return f"the source answered {r.status_code}"
+            ctype = (r.headers.get("content-type") or "").split(";")[0].strip().lower()
+            if ctype in ("text/html", "application/xhtml+xml"):
+                # A page about the file (or a sign-in page), not the file. Said as
+                # what it is: reading it to the end only to report "different bytes"
+                # would blame the source for changing a file it never served.
+                return (
+                    "the address on record answers with a web page, not the file "
+                    "itself — open it and download the file there"
+                )
             with tmp.open("wb") as w:
                 for chunk in r.iter_bytes(1 << 20):
                     w.write(chunk)

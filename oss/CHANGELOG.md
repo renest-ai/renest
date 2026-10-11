@@ -2,6 +2,140 @@
 
 What changed for the person using `renest`. Dates are the release date.
 
+## 0.1.23 — 2026-10-11
+
+### Restoring a nest someone handed you: every file that does not travel is named first
+A nest handed to you leaves out the files whose licence does not let the sender pass them
+on. `renest restore` used to say only how many there were, download everything else, and
+then stop on the first missing one, naming that one alone. Fix it, run again, and it
+stopped on the next.
+Now the restore opens with all of them: path, size, and the address the nest records for
+each. They come in two groups: "We will fetch these for you from their original source"
+and "You need to provide these", with the reason next to each one. Nothing is shortened
+to "and N more". `--check-only` and `--plan` print the same list and move no bytes.
+(`--check-only` used to download the public ones.)
+
+### Restore fetches publicly downloadable files from their original source for you
+When the nest records where a withheld file came from and that address is public,
+`renest restore` downloads it at the start of the download stage, before any of the
+nest's own files, and checks it against the sha256 in the nest. Different bytes are a
+failure for that file and are never kept. An address that turns out to be a web page is
+reported as that, not as changed bytes.
+Your Hugging Face token is used only when the file is on Hugging Face and needs your
+account, and is sent only to huggingface.co. A file on any other host that asks for a
+sign-in is listed under "You need to provide these"; no token is sent there.
+On a nest someone handed you, an address on a host renest does not recognise is not
+contacted at all until you name the sender (`--trust-sender "<name>"`), the same rule as
+for unrecognised dependency sources. Add your own hosts with `RENEST_TRUSTED_HOSTS`.
+
+### Restore stops before downloading when a withheld file cannot be had, and names them all
+If any file that does not travel is neither fetchable nor already in place, the restore
+stops before the nest's files and code are downloaded. One message names every such file
+with its size, full sha256, recorded address, why it could not be fetched, and the exact
+path to put it at. Put the files there and run the same command again: a file in place
+whose bytes match is kept and the rest carries on. The exit code (16) and error class
+(`OBJECT_MISSING`) are unchanged. `restore-report.json` lists each file under `gated`
+with `size_bytes`, `sha256` and `put_it_at`.
+A restricted file your own storage can serve (`--blob-base`, or a link in your own
+restore code) is no longer listed as "does not travel".
+
+### `restore.sh` names the files that do not travel, and keeps one you put in place
+`restore.sh` now lists every such file before it downloads anything, with size, sha256,
+recorded address and where to put it. It only tells: it does not fetch them and does not
+stop there. It moves everything else, then stops once with the whole list (same
+`BLOBMAP-MISS` code as before) instead of on the first one.
+A file you had already put in place with the right bytes used to stop the script, because
+it asked for a download link before looking at the disk. It now looks first and keeps it.
+
+### `renest restore --plan` and the real run agree on what is already on this disk
+`--plan` counted any file whose bytes matched as "already on this disk"; the run itself
+only skipped files its own record listed, so a plan could say "0 to fetch" and the run
+then downloaded everything again. Both now use one test: a file of the right size is read
+and checked, and matching bytes are kept. `--no-resume` still downloads everything again,
+and the plan now says so.
+
+### The restore report says "written into home" for what it wrote into your home folder
+`restore-report.json` had `home_files`, which read as "the home-cache files this restore
+brought back" and looked like a miss when it was empty. It only ever listed files written
+into your real home folder. It is now `written_into_home`, next to a new
+`home_cache_files_in_restore_folder` count. `home_files` is still written, with the same
+content, for anything that reads it.
+
+### A missing system library named only by packages gets its install command up front
+When a nest was packed while its app was not running, its system libraries are read off
+the installed packages. If this machine lacks some of them, `renest restore` now prints
+the one `apt-get` command that brings them, before the models are downloaded. It used to
+appear only when the app failed to start, after the whole download. Nothing is installed
+for you from that list and the run does not stop: some of those libraries are never used.
+
+### `renest pack` records where each file came from
+When you hand a nest to someone, files whose licence does not let you pass them on do not
+travel; the recipient gets their checksum and, if the nest has one, the address to fetch
+them from. Most nests had none, so the recipient was left to find the files alone.
+`renest pack` now writes that address (`origin_url`, an existing field) for every file it
+can derive one for, restricted or not:
+
+- a file in a Hugging Face model cache, including the cache kept under the home folder:
+  the repository, the exact revision and the file;
+- a file in our known-files table: its pinned address;
+- a file Civitai knows by its sha256: the download address Civitai gives for that exact
+  file (the model version's page when it lists no such file).
+
+An address you give yourself (`--download-url`, or `origin_url` in a pack-spec) still comes
+first. **An address that carries a login, a key or a signature is never recorded**, whoever
+supplied it: a presigned storage link or a Civitai link ending in `?token=…` is left out
+and named in a warning, because a nest is handed to other people.
+
+### Files in a Hugging Face cache are judged by the repository they belong to
+A file from the Hugging Face cache under the home folder was looked up by its checksum
+only, so most of them (configs, tokenizer files, the `refs/main` pointer) matched nothing
+and were restricted. They now get the licence of their repository, read at the revision
+the cache holds. This covers every kind of entry, including `refs/…` pointers and the
+`.no_exist` markers. The known-files table is still asked first.
+
+### A file can be marked "not passed on", whatever its repository says
+The known-files table can now hold a row that keeps a file back, with the reason. The
+first one is the CLIPSeg weights (`CIDAS/clipseg-rd64-refined`, `model.safetensors`): the
+Hugging Face repository is tagged apache-2.0, but that tag was set by the person who
+converted the model, and the author states that no licence is specified for the weights.
+`renest pack` says so on that file, and records where the recipient can fetch it.
+
+### Data files a custom node publishes in its own repository stay with its code
+Since 0.1.21, anything in a custom node's folder that looked like a model or data file was
+taken out of the node's code archive and looked up on its own, and restricted when nothing
+vouched for it. That also caught files the node's author publishes as part of the node
+(a popular preprocessor pack carries several), which then did not travel with a
+hand-off. A file now stays in the code archive, under the node's licence, when the node's
+own git repository tracks it and it is unchanged from the published commit the nest
+names. Everything else is handled as before: a weight the node downloaded while running,
+a tracked file you edited, a file committed only on your machine, and every such file in
+a node installed without git.
+
+### Two more ComfyUI loader nodes are recognised
+`ConditioningLoader` (`models/embeddings`) and `SAM3DBody_Loader` (`models/detection`):
+the file a workflow loads through them is now packed.
+
+### `pack --dest hosted`: "uploaded, not confirmed yet" no longer reads as a failed pack
+After the upload, `renest pack` waits for the server to check the nest. When that took
+longer than the wait, the run printed "This is not a failure" and then closed on
+"✗ Pack failed", exit code 20. Three changes:
+
+- It waits longer for small nests: at least 10 minutes (was 2), still 30 seconds per GB
+  above that and 30 minutes at most. While it waits it says so every 30 seconds, and that
+  every byte is already stored, so stopping there loses nothing.
+- If the server still has not answered, the last line is now
+  `◷ Uploaded, not confirmed yet: nest … is on your Renest drive and the server is still
+  checking it. Do not pack or upload it again. See the result:  renest list <nest id>`.
+- `--json` says it at the top level: `"outcome": "uploaded_verification_pending"`,
+  `"uploaded": true`, `"verified": null`, and `hosted.check_command`. The same word is in
+  `failure.context.outcome`.
+
+What did not change: `ok` is `false` and the exit code is 20 in that case, because the
+server has not confirmed the nest and renest does not call anything stored and verified
+before it has. A script should test `outcome` and run `hosted.check_command`, not pack
+again.
+
+
 ## 0.1.22 — 2026-10-11
 
 **Restoring with `restore.sh`:** a nest packed with 0.1.22 needs the `restore.sh` from 0.1.22 or later.

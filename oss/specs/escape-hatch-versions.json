@@ -2,7 +2,7 @@
   "_what_this_is": "Every version of restore.sh, the escape hatch, that has existed in this project, listed by the sha256 of the script itself. From nest format 2.3 on, a copy of the script travels inside every nest at .renest/escape/restore.sh, and that copy is frozen: fixes made later never reach it. This table is how you tell which copy you are holding.",
   "_how_to_use": "sha256sum .renest/escape/restore.sh inside your nest, then find that hash below. known_issues lists what was wrong with that copy and fixed later.",
   "_an_empty_issue_list_means": "No issue has been recorded against that version -- not that it is known to have none. Only issues we found and fixed appear here.",
-  "current": "ced3d8b19e947de69e853476dfd348a4510cf29b230eafcd7a0d18b05f3869b3",
+  "current": "3405990f7ff18014d0918cf3969d7e180b80b18a272ed5eb36a84e3a9b69716e",
   "known_issues": [
     {
       "id": "no-transfer-speed-floor",
@@ -2320,6 +2320,31 @@
     {
       "sha256": "ced3d8b19e947de69e853476dfd348a4510cf29b230eafcd7a0d18b05f3869b3",
       "bytes": 140416,
+      "first_seen": "2026-10-11",
+      "written_for_format": "2.14",
+      "reads_formats": [
+        "2.0",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "2.5",
+        "2.6",
+        "2.7",
+        "2.8",
+        "2.9",
+        "2.10",
+        "2.11",
+        "2.12",
+        "2.13",
+        "2.14"
+      ],
+      "travels_in_nests": true,
+      "known_issues": []
+    },
+    {
+      "sha256": "3405990f7ff18014d0918cf3969d7e180b80b18a272ed5eb36a84e3a9b69716e",
+      "bytes": 144778,
       "first_seen": "2026-10-11",
       "written_for_format": "2.14",
       "reads_formats": [

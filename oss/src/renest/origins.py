@@ -18,25 +18,35 @@ file's own fingerprint. None is guessed from a file name.**
    this sha256 (the ``X-Linked-ETag`` it returns for large files), and it is recorded
    pinned to the revision Hugging Face answered with.
 
-Only Hugging Face addresses are produced. The restore side sends the recipient's own
-Hugging Face token along when it fetches an address, so an address on any other host is
-never written by us -- only by the person packing, who typed it.
+4. A Civitai record found by this file's own sha256 while its licence was looked up:
+   the download address that record gives for the file with exactly this sha256.
+
+Since 0.1.23 an address is recorded for every file one can be derived for, restricted or
+not: it is where the bytes came from, and what a restore shows and fetches from when the
+bytes do not travel. The restore side sends the recipient's Hugging Face token to Hugging
+Face addresses only (``gated.token_may_go_to``), so an address on another host never
+receives it.
+
+**No address that carries a credential is ever recorded** -- not ours, and not one the
+person packing typed (:func:`unsafe_address`): a manifest is handed to other people.
 """
 
 from __future__ import annotations
 
 import re
 from collections.abc import Iterable
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
 import httpx
 
 __all__ = [
     "HF_HOSTS",
+    "civitai_address",
     "editor_model_urls",
     "hf_address_from_cache_path",
     "hf_resolve_parts",
     "known_component_address",
+    "unsafe_address",
     "verify_hf_address",
 ]
 
@@ -45,19 +55,89 @@ HF_HOSTS = frozenset({"huggingface.co"})
 _HF_SNAPSHOT = re.compile(r"^models--([^/]+?)--([^/]+)/snapshots/([0-9a-f]{40})/(.+)$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_HOME_HF_PREFIX = ".cache/huggingface/hub/"
+
+#: Query parameters that carry a credential or a signature, lower case: a presigned
+#: storage link, a Civitai ``?token=`` API key, an Azure ``sig``.
+_SECRET_QUERY_KEYS = frozenset({
+    "token", "access_token", "api_key", "apikey", "api-key", "key", "sig", "signature",
+    "secret", "password", "passwd", "auth", "authorization", "credential", "expires",
+    "policy", "awsaccesskeyid", "key-pair-id",
+})
+_SECRET_QUERY_PREFIXES = ("x-amz-", "x-goog-")
+
+_CIVITAI_HOSTS = frozenset({"civitai.com"})
+_CIVITAI_DOWNLOAD_QUERY = frozenset({"type", "format", "size", "fp"})
 
 
 def _quote_path(path: str) -> str:
     return quote(path, safe="/")
 
 
-def hf_address_from_cache_path(path: str) -> str:
+def unsafe_address(url: str) -> str:
+    """Why this address must not be written into a nest, or empty when it is fine.
+
+    A manifest is handed to other people, so an address that carries a login
+    (``https://user:pass@host/``) or a signed / keyed query string would hand that
+    credential over with it. The answer is a short phrase for a warning.
+    """
+    parts = urlsplit((url or "").strip())
+    if parts.username or parts.password:
+        return "it has a user name or password in it"
+    for key, _value in parse_qsl(parts.query, keep_blank_values=True):
+        k = key.strip().lower()
+        if k in _SECRET_QUERY_KEYS or k.startswith(_SECRET_QUERY_PREFIXES):
+            return f"its query string carries a key or signature ({key}=…)"
+    return ""
+
+
+def civitai_address(version: dict, sha256: str) -> str:
+    """The download address a Civitai model-version record gives for this exact file.
+
+    ``version`` is the answer to ``model-versions/by-hash/<sha256>``. One version can
+    hold several files, so the address is taken only from the file whose own sha256
+    is this one. When the record lists no such file, the version's page is given
+    instead (a person can still find the file there). Empty when neither can be
+    built. Never an address with a credential in it.
+    """
+    sha = (sha256 or "").strip().lower()
+    if not isinstance(version, dict) or not _SHA256.match(sha):
+        return ""
+    for f in version.get("files") or []:
+        if not isinstance(f, dict) or not isinstance(f.get("hashes"), dict):
+            continue
+        if str(f["hashes"].get("SHA256") or "").strip().lower() != sha:
+            continue
+        url = str(f.get("downloadUrl") or "").strip()
+        parts = urlsplit(url)
+        if (parts.scheme == "https" and (parts.hostname or "").lower() in _CIVITAI_HOSTS
+                and not parts.username and not parts.password and not parts.fragment
+                and parts.path.startswith("/api/download/models/")
+                and all(k in _CIVITAI_DOWNLOAD_QUERY
+                        for k, _v in parse_qsl(parts.query, keep_blank_values=True))):
+            return url
+    model_id, version_id = version.get("modelId"), version.get("id")
+    if (isinstance(model_id, int) and isinstance(version_id, int)
+            and not isinstance(model_id, bool) and not isinstance(version_id, bool)):
+        return f"https://civitai.com/models/{model_id}?modelVersionId={version_id}"
+    return ""
+
+
+def hf_address_from_cache_path(path: str, root: str = "hf_hub") -> str:
     """The address of a file in the Hugging Face model cache, from its path alone.
 
-    Only a ``snapshots/<commit>/`` path names a file; a ``refs/`` pointer or a blob does
-    not, so those get nothing.
+    Only a ``snapshots/<commit>/`` path names a file; a ``refs/`` pointer, a
+    ``.no_exist`` marker or a blob does not, so those get nothing. ``root == "home"``
+    is the same cache under ``.cache/huggingface/hub/``.
     """
-    m = _HF_SNAPSHOT.match(path or "")
+    path = path or ""
+    if root == "home":
+        if not path.startswith(_HOME_HF_PREFIX):
+            return ""
+        path = path[len(_HOME_HF_PREFIX):]
+    elif root != "hf_hub":
+        return ""
+    m = _HF_SNAPSHOT.match(path)
     if not m:
         return ""
     org, name, commit, rest = m.groups()

@@ -162,22 +162,28 @@ _CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 #: rethink), and the server paces its check by nest size. Real-machine numbers,
 #: 2026-09-06 (wan60 large packs): 18 GB verified in 4m37s, 46 GB in 10m45s —
 #: about 14-15 seconds per GB. So the window scales with the declared bytes at
-#: twice that measured rate (margin for a slower day), keeps the old 120 s floor
-#: so small nests lose nothing, and is capped at 30 minutes: past that, holding
-#: the terminal (often a billed GPU machine) costs more than handing over the
-#: check-later instructions the timed-out branch gives (version id + command).
+#: twice that measured rate (margin for a slower day), and is capped at 30
+#: minutes: past that, holding the terminal (often a billed GPU machine) costs
+#: more than handing over the check-later instructions the timed-out branch
+#: gives (version id + command).
+#: The floor was 120 s until 0.1.23. Two small nests ran past their window on
+#: real machines (batch 24 U1, 2026-10-09: gave up after 155 s; the showcase
+#: pack, 2026-10-11) and were fine minutes later: for a few GB the wait is the
+#: server's queue, not the bytes. Ten minutes of a small machine costs cents;
+#: an exit that reads as a failed pack costs a re-pack or a support thread.
 _VERDICT_MEASURED_SECONDS_PER_GB = 15.0  # measured 2026-09-06 (wan60): 14-15 s/GB
 _VERDICT_WAIT_SECONDS_PER_GB = 2 * _VERDICT_MEASURED_SECONDS_PER_GB
-_VERDICT_WAIT_FLOOR_SECONDS = 120.0
+_VERDICT_WAIT_FLOOR_SECONDS = 600.0
 _VERDICT_WAIT_CEILING_SECONDS = 30 * 60.0
 _VERDICT_POLL_FIRST = 1.0   # first gap; grows 1.6x per round
 _VERDICT_POLL_MAX = 5.0     # never sit longer than this between asks
+_VERDICT_PROGRESS_EVERY = 30.0  # say "still waiting" this often, so the wait is not silent
 
 
 def _verdict_wait_seconds(total_bytes: int) -> float:
     """The verdict window for a nest declaring ``total_bytes`` bytes.
 
-    ``min(max(120 s, 30 s/GB), 30 min)`` — see the constants above for where
+    ``min(max(10 min, 30 s/GB), 30 min)`` — see the constants above for where
     every number comes from. Sized from the *declared* manifest bytes, not the
     bytes uploaded this run: the server verifies the whole version, so a pack
     that skipped most blobs as already-owned still waits for the full check.
@@ -187,6 +193,11 @@ def _verdict_wait_seconds(total_bytes: int) -> float:
         max(_VERDICT_WAIT_FLOOR_SECONDS, gb * _VERDICT_WAIT_SECONDS_PER_GB),
         _VERDICT_WAIT_CEILING_SECONDS,
     )
+
+
+#: What ``--json`` calls the one ending that is neither a success nor a failure: every
+#: byte is on the server and its check has not answered yet. Scripts key on this word.
+UPLOADED_VERIFICATION_PENDING = "uploaded_verification_pending"
 
 
 def _verdict_complaint(
@@ -234,6 +245,7 @@ def _verdict_complaint(
     gb = max(total_bytes, 0) / 1e9
     est_remaining = max(int(round(gb * _VERDICT_MEASURED_SECONDS_PER_GB)), 60)
     message = (
+        "Uploaded, not confirmed yet. "
         "Your files are already on the server — **do not pack or upload this again**. "
         "This is not a failure: the server is still verifying what you sent "
         f"(nest version {version_id}), and we stopped waiting after "
@@ -241,7 +253,9 @@ def _verdict_complaint(
         f"{int(_VERDICT_MEASURED_SECONDS_PER_GB)} seconds per GB ({gb:.1f} GB here), "
         f"so give it about {max(est_remaining // 60, 1)} more minute(s), then run "
         f"`{check_again}`: when that version reads 'stored & verified' it is done "
-        "and there is nothing more for you to do."
+        "and there is nothing more for you to do. This command ends with exit code "
+        f"{int(ExitCode.S2_UNKNOWN)} only because the server has not confirmed the nest "
+        "yet; a script should run that command rather than pack again."
     )
     # Exit code stays 20 (S2_UNKNOWN): the exit-code table is the frozen
     # "Master plan 1.2" contract (specs/restore-protocol.md is its human
@@ -255,6 +269,7 @@ def _verdict_complaint(
         message,
         context={
             "status": "verifying",
+            "outcome": UPLOADED_VERIFICATION_PENDING,
             "not_a_failure": True,
             "nest_id": nest_id,
             "nest_version_id": version_id,
@@ -451,9 +466,11 @@ class HostedUploader:
         It never guesses: an unreachable server during the wait is also
         reported as still-unknown rather than quietly turned into a pass.
         """
-        deadline = clock() + wait_seconds
+        started = clock()
+        deadline = started + wait_seconds
         gap = _VERDICT_POLL_FIRST
         status = "verifying"
+        said_at = started
         while clock() < deadline:
             try:
                 got = self._api(client, "GET", f"/nest-versions/{version_id}").json()
@@ -464,6 +481,14 @@ class HostedUploader:
                 pass
             if status != "verifying":
                 return status
+            now = clock()
+            if now - said_at >= _VERDICT_PROGRESS_EVERY:
+                said_at = now
+                self._log(
+                    f"Still being checked by the server — {int(now - started)} of up to "
+                    f"{int(wait_seconds)} seconds. Your files are already stored; nothing "
+                    f"is being sent again."
+                )
             sleep(min(gap, max(deadline - clock(), 0.0)))
             gap = min(gap * 1.6, _VERDICT_POLL_MAX)
         return status
@@ -791,7 +816,9 @@ class HostedUploader:
             self._log(
                 f"Hosted storage has it: {human_version} nest {self.result.nest_id} "
                 f"— the server is verifying {total_declared / 1e9:.1f} GB, "
-                f"waiting up to {max(int(round(wait_seconds / 60)), 1)} minute(s)…"
+                f"waiting up to {max(int(round(wait_seconds / 60)), 1)} minute(s)… "
+                f"Every byte is already stored: if you stop here, "
+                f"`renest list {self.result.nest_id}` shows the result later."
             )
 
             # **Wait for the real verdict before calling this a success.**

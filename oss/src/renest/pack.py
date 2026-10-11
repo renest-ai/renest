@@ -915,6 +915,54 @@ def _declared_assets_inside(spec: dict, install_path: str, already=()) -> list[s
     return sorted(out)
 
 
+def _git_lines(repo_dir: Path, *args: str) -> list[str] | None:
+    """NUL-separated output of a git query as a list, or None when git could not answer.
+
+    Unlike ``integrity.run_git`` this keeps "nothing to list" (an empty list) apart
+    from "could not tell" (None): the caller treats the second as "assume nothing".
+    Subprocess only, reading metadata -- no git code is imported or carried.
+    """
+    try:
+        r = subprocess.run(["git", "-C", str(repo_dir), *args],
+                           capture_output=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    return [os.fsdecode(x) for x in r.stdout.split(b"\0") if x]
+
+
+def _published_with_the_code(src_dir: Path) -> frozenset[str]:
+    """Files this code folder's own git repository carries, unchanged from its commit.
+
+    Relative paths, as the archive names them. A file counts only when all of this
+    holds, and anything git cannot confirm counts as not published:
+
+    - the folder is the root of its own repository (not a folder inside the host's);
+    - the commit checked out is one a remote branch or a tag has, so it is something
+      the author published and not a commit made on this machine;
+    - git tracks the file, and its content is the same as in that commit (neither
+      edited nor staged).
+
+    A folder installed from a zip has no repository, so nothing in it counts.
+    """
+    top = _git_lines(src_dir, "rev-parse", "--show-toplevel")
+    try:
+        if not top or Path(top[0].strip()).resolve() != src_dir.resolve():
+            return frozenset()
+    except OSError:
+        return frozenset()
+    upstream = _git_lines(src_dir, "for-each-ref", "--count=1", "--contains", "HEAD",
+                          "--format=%(refname)%00", "refs/remotes", "refs/tags")
+    if not upstream:
+        return frozenset()
+    tracked = _git_lines(src_dir, "ls-files", "-z")
+    changed = _git_lines(src_dir, "diff", "--name-only", "-z", "HEAD", "--")
+    if not tracked or changed is None:
+        return frozenset()
+    return frozenset(tracked) - frozenset(changed)
+
+
 def _weights_inside_code_dir(src_dir: Path, exclude=()) -> list[str]:
     """Model weights and other data payloads a code folder would otherwise carry.
 
@@ -932,10 +980,17 @@ def _weights_inside_code_dir(src_dir: Path, exclude=()) -> list[str]:
     weight is caught as surely as a ``.safetensors``. A Git LFS placeholder is left
     alone: it is a few hundred bytes of text, and ``_settle_lfs`` decides what
     happens to it.
+
+    One kind of file stays in the archive whatever its content: a file the code's
+    own git repository carries, unchanged from the commit the nest names (see
+    :func:`_published_with_the_code`). The author published it as part of the code,
+    so it travels under the code's licence like the source beside it. What a plugin
+    downloaded while running is not in its repository, and is still taken out.
     """
+    published = _published_with_the_code(src_dir)
     out: list[str] = []
     for rel, p in _packed_files(src_dir, exclude):
-        if payload_kind(p) is None:
+        if rel in published or payload_kind(p) is None:
             continue
         with contextlib.suppress(OSError):
             if looks_like_lfs_pointer(p):
@@ -1963,6 +2018,23 @@ def _saved_editor_workflows(root: Path) -> list[dict]:
     return out
 
 
+_HF_REF_PATH = re.compile(r"^(?:\.cache/huggingface/hub/)?models--[^/]+/refs/[^/]+$")
+
+
+def _hf_ref_commit(froot: str, path: str, src: Path, size: int) -> str:
+    """The commit a Hugging Face cache ``refs/<branch>`` pointer holds, or empty.
+
+    Such a file is 40 hex characters and nothing else. Anything that is not exactly
+    that gives nothing (never raises)."""
+    if froot not in ("hf_hub", "home") or size != 40 or not _HF_REF_PATH.match(path):
+        return ""
+    try:
+        text = src.read_bytes()[:64].decode("ascii").strip().lower()
+    except (OSError, UnicodeDecodeError):
+        return ""
+    return text if re.fullmatch(r"[0-9a-f]{40}", text) else ""
+
+
 def _is_restricted(entry: dict) -> bool:
     lic = entry.get("license") or {}
     return lic.get("serving_scope") == "gated" or lic.get("shareable") is False
@@ -1985,17 +2057,24 @@ def _fill_download_addresses(
     manifest: dict, spec: dict, root: Path, warnings: list[str], *, online: bool,
     client: httpx.Client | None, declared: dict[str, str] | None,
 ) -> None:
-    """Write ``origin_url`` for files that will not travel with a hand-off.
+    """Write ``origin_url`` for every file an address can be derived for.
 
-    Sources, in order: what the person packing typed (``--download-url``); the model
-    cache path; our known-files table; addresses the environment's ComfyUI workflows
-    give for the file, kept only when Hugging Face confirms the sha256. See
-    renest.origins for why nothing else counts. Never fails a pack.
+    Restricted files most of all -- the address is all a recipient gets of them --
+    but the others too: it is where the bytes came from. Sources, in order: what the
+    person packing typed (``--download-url``, or ``origin_url`` in a pack-spec); the
+    model cache path; our known-files table; the address the licence lookup came
+    across for these exact bytes (``licensing.address_seen``); and, for
+    restricted files only, addresses the environment's ComfyUI workflows give for the
+    file, kept only when Hugging Face confirms the sha256. See renest.origins for why
+    nothing else counts. An address with a credential in it is never recorded, whoever
+    supplied it. Never fails a pack.
     """
+    from .licensing import address_seen
     from .origins import (
         editor_model_urls,
         hf_address_from_cache_path,
         known_component_address,
+        unsafe_address,
         verify_hf_address,
     )
 
@@ -2020,6 +2099,12 @@ def _fill_download_addresses(
                     f"--download-url names {path}, but no file in this nest has that path "
                     f"(paths are as the pack output lists them), so it was not recorded.")
                 continue
+            why = unsafe_address(url)
+            if why:
+                warnings.append(
+                    f"--download-url for {path} was not recorded: {why}, and a nest is "
+                    f"handed to other people. Give the plain address of the file instead.")
+                continue
             sha = (entry.get("blob") or {}).get("sha256", "")
             verdict = verify_hf_address(url, sha, client=http())[0] if online else "unknown"
             if verdict == "mismatch":
@@ -2031,16 +2116,25 @@ def _fill_download_addresses(
 
         candidates: dict[str, list[str]] | None = None
         for entry in files:
-            if entry.get("origin_url") or not _is_restricted(entry):
-                continue
             path = str(entry.get("path") or "")
+            froot = str(entry.get("root") or "env")
+            if entry.get("origin_url"):
+                # Typed into a pack-spec, or written by capture from a cache path.
+                why = unsafe_address(str(entry["origin_url"]))
+                if not why:
+                    continue
+                del entry["origin_url"]
+                warnings.append(
+                    f"The download address given for {path} was not recorded: {why}, and "
+                    f"a nest is handed to other people. Give the plain address of the "
+                    f"file instead.")
             sha = str((entry.get("blob") or {}).get("sha256") or "")
-            url = ""
-            if entry.get("root") == "hf_hub":
-                url = hf_address_from_cache_path(path)
+            url = hf_address_from_cache_path(path, froot)
             if not url:
                 url = known_component_address(sha)
-            if not url and online:
+            if not url:
+                url = address_seen(sha)
+            if not url and online and _is_restricted(entry):
                 if candidates is None:
                     graphs = [spec.get("_workflow_ui")] + _saved_editor_workflows(root)
                     candidates = editor_model_urls(g for g in graphs if g)
@@ -2049,7 +2143,7 @@ def _fill_download_addresses(
                     if verdict == "match":
                         url = pinned
                         break
-            if url:
+            if url and not unsafe_address(url):
                 entry["origin_url"] = url
     finally:
         if own_client is not None:
@@ -3653,6 +3747,13 @@ def _build_manifest(
         # that lookup names the base in what it tells the user, and the header is
         # often the only place the name exists.
         base = declared_base_model(src)
+        # A `refs/<branch>` pointer in a Hugging Face cache names no revision in its
+        # path; the commit it points at is its whole content. Passed along so the
+        # repository's licence is read at that commit, like the files beside it.
+        clues = fspec | {"blob": blob, "declared_base_model": base}
+        ref_commit = _hf_ref_commit(str(froot), str(fspec["path"]), src, blob["size_bytes"])
+        if ref_commit:
+            clues["hf_revision"] = ref_commit
         entry = {
             "path": fspec["path"],
             "blob": blob,
@@ -3660,9 +3761,7 @@ def _build_manifest(
             # returns None and _license_of keeps what the user wrote, marked as
             # their claim — packing must never fail because a lookup failed.
             "license": _license_of(
-                _declare_mine(
-                    fspec | {"blob": blob, "declared_base_model": base}, mine, warnings
-                ), warnings,
+                _declare_mine(clues, mine, warnings), warnings,
                 license_lookup=None if no_licence_lookup else (
                     lambda fs: _licence_lookup(fs, client=client)
                 ),
@@ -3705,8 +3804,8 @@ def _build_manifest(
         with ThreadPoolExecutor(max_workers=jobs) as ex:
             manifest["files"] = [e for e in ex.map(do_file, files) if e is not None]
         _attach_licence_texts(manifest, place, dry_run, root)
-    # Addresses for what will not travel with a hand-off -- after the licence verdicts,
-    # since only those say which files are restricted.
+    # Where each file came from -- after the licence verdicts, since those say which
+    # files are restricted (the ones a recipient gets only the address of).
     _fill_download_addresses(
         manifest, spec, root, warnings, online=not no_licence_lookup, client=client,
         declared=download_urls)
@@ -5349,6 +5448,25 @@ def _reconcile(
 HOSTED_MEMORY_REL = ".renest/state/drive-nest.json"
 
 
+def _upload_awaits_confirmation(report: PackReport, hosted_uploader) -> dict | None:
+    """The facts of an upload that landed but was not confirmed in time, or None.
+
+    Read from the failure object the uploader raised (``hosted._verdict_complaint``),
+    never inferred from an exit code: 20 is also the code for failures nobody could
+    classify, and those must keep reading as failures.
+    """
+    if report.ok or hosted_uploader is None or not isinstance(report.failure, dict):
+        return None
+    ctx = report.failure.get("context")
+    if not isinstance(ctx, dict) or ctx.get("outcome") != "uploaded_verification_pending":
+        return None
+    return {
+        "outcome": "uploaded_verification_pending",
+        "nest_id": str(ctx.get("nest_id") or ""),
+        "check_command": str(ctx.get("check_command") or ""),
+    }
+
+
 def hosted_memory_read(target: str | os.PathLike[str]) -> dict | None:
     """Read "the nest this folder last went into". Wrong shape or unreadable →
     None (a missing memory is never an error)."""
@@ -5811,6 +5929,12 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
             args.dir, nest_id=hr.nest_id, nest_name=name_to_keep, origin=origin
         )
 
+    # The one ending that is neither: every byte is on the server, and its check had
+    # not answered when we stopped waiting. Still not ``ok`` (nothing is called a
+    # success before the server confirms it) and still a non-zero exit, but it must
+    # not be dressed as a failed pack either -- for a person or for a script.
+    pending = _upload_awaits_confirmation(report, hosted_uploader)
+
     if args.json:
         out = report.to_dict()
         if report.dry_run:
@@ -5819,6 +5943,11 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
             out["hosted"] = hosted_uploader.result.to_dict()
         if byos_uploader is not None:
             out["own_bucket"] = byos_uploader.result.to_dict()
+        if pending:
+            out["outcome"] = pending["outcome"]
+            out["uploaded"] = True
+            out["verified"] = None
+            out["hosted"]["check_command"] = pending["check_command"]
         print(json.dumps(out, ensure_ascii=False, indent=2))
     else:
         for w in report.findings:
@@ -5848,6 +5977,14 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
             print(
                 f"✓ Dry run: nest {report.nest_id} would seal "
                 f"{report.blob_count} items / {report.total_bytes} bytes",
+                file=sys.stderr,
+            )
+        elif pending:
+            print(
+                f"◷ Uploaded, not confirmed yet: nest {pending['nest_id']} "
+                f"({report.blob_count} items / {report.total_bytes} bytes) is on your "
+                f"Renest drive and the server is still checking it. Do not pack or "
+                f"upload it again. See the result:  {pending['check_command']}",
                 file=sys.stderr,
             )
         else:

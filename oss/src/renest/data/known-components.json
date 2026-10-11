@@ -1,7 +1,7 @@
 {
   "schema": "ai.renest.rules.known-components",
   "schema_version": "1.0",
-  "updated": "2026-10-07",
+  "updated": "2026-10-11",
   "provenance": "One text encoder or VAE sits inside dozens of unrelated bundles, so a content-hash lookup on a community site returns whichever bundle somebody uploaded first, and that stranger's permission flags then decide the licence of a file they did not publish. Each entry here is a file whose sha256 was traced back to the repository that actually publishes it, together with the licence tag that repository declares. Entries are added one misjudged case at a time; a mirror, a re-upload or a guess is not a source.",
   "components": [
     {
@@ -102,7 +102,174 @@
       "revision": "e7181fe1896b7f2ce34120d1a3663413548240d7",
       "spdx": "apache-2.0",
       "provenance": "Checked 2026-10-07 against the HF API, anonymous, not gated. Comfy-Org repack for Wan Animate 2; paths-info at commit e7181fe1 gives lfs.oid equal to this sha256 (size 253806278, file last commit 92456346). Repo tags license:apache-2.0 and its README names Wan-AI/Wan2.2-Animate-2-14B as the original, which tags license:apache-2.0 (commit 6e8f1973). Upstream ships the VAE as videomodel/Wan-AI/vae.pth, not byte-identical. No Civitai by-hash record."
+    },
+    {
+      "sha256": "6ce0161689b3853acaa03779ec93eafe75a02f4ced659bee03f50797806fa2fa",
+      "name": "Stable Diffusion v1.5 pruned EMA-only checkpoint",
+      "origin_url": "https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5",
+      "path": "v1-5-pruned-emaonly.safetensors",
+      "revision": "451f4fe16113bff5a5d2269ed5ad43b0592e9a14",
+      "spdx": "creativeml-openrail-m",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 451f4fe1 gives lfs.oid equal to this sha256 (size 4265146304, file last commit f03de327). Repo cardData.license and tag license:creativeml-openrail-m, and the card body names the CreativeML OpenRAIL M licence. This repository calls itself a mirror of the deprecated runwayml/stable-diffusion-v1-5 and says it is not affiliated with RunwayML; the original address now 307-redirects here on huggingface.co itself, so there is no other upstream left to point at. WHY THIS ROW OVERRIDES THE COMMUNITY RECORD: Civitai by-hash returns model 62437 'v1-5-pruned-emaonly' (version 66991, base SD 1.5, uploader faye_1225322) with an empty allowCommercialUse, which our judge reads as 'the author did not allow it to be passed on'. That uploader is a third party re-uploading the checkpoint, not its author, and cannot narrow the licence the model was released under. The licence itself, CreativeML Open RAIL-M Section III paragraph 4, permits hosting, reproducing and distributing copies provided the use restrictions are passed on and a copy of the licence is given to the recipient; we ship that text (data/licenses/creativeml-openrail-m.txt, fetched from CompVis/stable-diffusion) and it travels with the nest. First row in this table that is not apache-2.0, and the first that outvotes a Civitai 'not allowed' record for a base checkpoint: approved by the founder on 2026-10-11."
+    },
+    {
+      "sha256": "a1c250be40455cc61a43da1201ec3f1edaea71214865fb47f57927e06cbe4996",
+      "name": "IP-Adapter Plus SD1.5",
+      "origin_url": "https://huggingface.co/h94/IP-Adapter",
+      "path": "models/ip-adapter-plus_sd15.safetensors",
+      "revision": "018e402774aeeddd60609b4ecdb7e298259dc729",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 018e4027 gives lfs.oid equal to this sha256 (size 98183288, file last commit 9bf28b38). Repo cardData.license and tag license:apache-2.0. The authors' code repository github.com/tencent-ailab/IP-Adapter is Apache-2.0 and its README sends readers to this HF repository for the models. No Civitai by-hash record (404), so before this row the file fell back to deny-by-default. Approved by the founder on 2026-10-11."
+    },
+    {
+      "sha256": "68aaebf5e7d5eeb62eaea9476c68d279ba98d0876b385cc925e12c43cee19edd",
+      "name": "T2I-Adapter depth SD1.5 v2",
+      "origin_url": "https://huggingface.co/TencentARC/t2iadapter_depth_sd15v2",
+      "path": "diffusion_pytorch_model.bin",
+      "revision": "9f96518933daa6c9386692914f72af81a0f6978f",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. TencentARC is a verified organisation on HF (ARC Lab, Tencent), the model's own authors; paths-info at commit 9f965189 gives lfs.oid equal to this sha256 (size 309492083, file last commit d36602ae). Repo cardData.license and tag license:apache-2.0, and the card body says 'License: Apache 2.0'. (The code repository github.com/TencentARC/T2I-Adapter carries no licence file; this row rests on the model card.) The showcase pack stores the file renamed as models/controlnet/t2iadapter_depth_sd15v2.bin; same bytes. Used in place of the ControlNet 1.1 depth model, whose sources say openrail or nothing and cannot be released by this table (founder accepted the swap 2026-10-11). No Civitai by-hash record (404)."
+    },
+    {
+      "sha256": "715fade13be8f229f8a70cc02066f656f2423a59effd0579197bbf57860e1378",
+      "name": "Depth Anything V2 Small",
+      "origin_url": "https://huggingface.co/depth-anything/Depth-Anything-V2-Small",
+      "path": "depth_anything_v2_vits.pth",
+      "revision": "03876f8651c73a60fe4c2c48294e09fcb6838fcf",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 03876f86 gives lfs.oid equal to this sha256 (size 99218434, file last commit 05bbaec5). Repo cardData.license and tag license:apache-2.0; the authors' github.com/DepthAnything/Depth-Anything-V2 README says the Small model is under Apache-2.0. ONLY THE SMALL MODEL: the same README puts Base/Large/Giant under CC-BY-NC-4.0 (HF tags agree), so none of those may be added on the strength of this row. The file is one a custom node (comfyui_controlnet_aux) downloads into its own ckpts/ directory on first run. No Civitai by-hash record (404). Approved by the founder on 2026-10-11."
+    },
+    {
+      "sha256": "c023375966d31b3b1392764f7bd91df47098ce19f62f11b0263d8eedcf708bcd",
+      "name": "CLIPSeg rd64-refined config.json",
+      "origin_url": "https://huggingface.co/CIDAS/clipseg-rd64-refined",
+      "path": "config.json",
+      "revision": "999e0328d9e10b484360c477313983f9afdd7050",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. Not an LFS file, so HF publishes no sha256 for it: the file was downloaded from resolve/999e0328 and hashed (sha256 equal, size 4732), and the git blob id recomputed from those bytes equals the oid paths-info gives (9c1a3a86). Repo cardData.license and tag license:apache-2.0. This is a configuration file written by the Hugging Face contributor who converted the model (nielsr, the only member of the CIDAS organisation on HF), not the model weights. THE WEIGHTS OF THIS REPOSITORY (model.safetensors, sha256 d00ca85d...) ARE DELIBERATELY NOT IN THIS TABLE: the CLIPSeg author says in github.com/timojl/clipseg (README, and issue 35, 2023-06-07) that no licence is specified for the weights and they were released for research purposes, which contradicts the apache-2.0 tag on the HF card - do not add them on the strength of this row. Sits in the packer's home model cache (root=home), which is judged by sha256 and not by repository name. No Civitai by-hash record (404). Approved by the founder on 2026-10-11."
+    },
+    {
+      "sha256": "4fb09ebcfd7651205ca8299b993c30088e5535ef350a72d46c5c4580eeac0440",
+      "name": "CLIPSeg rd64-refined preprocessor_config.json",
+      "origin_url": "https://huggingface.co/CIDAS/clipseg-rd64-refined",
+      "path": "preprocessor_config.json",
+      "revision": "999e0328d9e10b484360c477313983f9afdd7050",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. Not an LFS file, so HF publishes no sha256 for it: the file was downloaded from resolve/999e0328 and hashed (sha256 equal, size 380), and the git blob id recomputed from those bytes equals the oid paths-info gives (30fe86be). Repo cardData.license and tag license:apache-2.0. This is a configuration file written by the Hugging Face contributor who converted the model (nielsr, the only member of the CIDAS organisation on HF), not the model weights. THE WEIGHTS OF THIS REPOSITORY (model.safetensors, sha256 d00ca85d...) ARE DELIBERATELY NOT IN THIS TABLE: the CLIPSeg author says in github.com/timojl/clipseg (README, and issue 35, 2023-06-07) that no licence is specified for the weights and they were released for research purposes, which contradicts the apache-2.0 tag on the HF card - do not add them on the strength of this row. Sits in the packer's home model cache (root=home), which is judged by sha256 and not by repository name. No Civitai by-hash record (404). Approved by the founder on 2026-10-11."
+    },
+    {
+      "sha256": "4c75d57fd9bd0be8478ad2d6f8b9cebdd4a45338eb108547329c2b6333476ca6",
+      "name": "CLIPSeg rd64-refined tokenizer_config.json",
+      "origin_url": "https://huggingface.co/CIDAS/clipseg-rd64-refined",
+      "path": "tokenizer_config.json",
+      "revision": "999e0328d9e10b484360c477313983f9afdd7050",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. Not an LFS file, so HF publishes no sha256 for it: the file was downloaded from resolve/999e0328 and hashed (sha256 equal, size 974), and the git blob id recomputed from those bytes equals the oid paths-info gives (446c3901). Repo cardData.license and tag license:apache-2.0. This is a configuration file written by the Hugging Face contributor who converted the model (nielsr, the only member of the CIDAS organisation on HF), not the model weights. THE WEIGHTS OF THIS REPOSITORY (model.safetensors, sha256 d00ca85d...) ARE DELIBERATELY NOT IN THIS TABLE: the CLIPSeg author says in github.com/timojl/clipseg (README, and issue 35, 2023-06-07) that no licence is specified for the weights and they were released for research purposes, which contradicts the apache-2.0 tag on the HF card - do not add them on the strength of this row. Sits in the packer's home model cache (root=home), which is judged by sha256 and not by repository name. No Civitai by-hash record (404). Approved by the founder on 2026-10-11. GENERIC BYTES: releasing this by sha256 releases it for every nest that carries the same bytes, whichever repository they were fetched from - accepted by the founder 2026-10-11. Measured the same day: byte-identical in CIDAS/clipseg-rd64 and CIDAS/clipseg-rd16; not byte-identical to the file of the same name in openai/clip-vit-base-patch32, -base-patch16 or -large-patch14."
+    },
+    {
+      "sha256": "e089ad92ba36837a0d31433e555c8f45fe601ab5c221d4f607ded32d9f7a4349",
+      "name": "CLIP tokenizer vocab.json (as shipped with CLIPSeg)",
+      "origin_url": "https://huggingface.co/CIDAS/clipseg-rd64-refined",
+      "path": "vocab.json",
+      "revision": "999e0328d9e10b484360c477313983f9afdd7050",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. Not an LFS file, so HF publishes no sha256 for it: the file was downloaded from resolve/999e0328 and hashed (sha256 equal, size 1059962), and the git blob id recomputed from those bytes equals the oid paths-info gives (469be27c). Repo cardData.license and tag license:apache-2.0. This is a configuration file written by the Hugging Face contributor who converted the model (nielsr, the only member of the CIDAS organisation on HF), not the model weights. THE WEIGHTS OF THIS REPOSITORY (model.safetensors, sha256 d00ca85d...) ARE DELIBERATELY NOT IN THIS TABLE: the CLIPSeg author says in github.com/timojl/clipseg (README, and issue 35, 2023-06-07) that no licence is specified for the weights and they were released for research purposes, which contradicts the apache-2.0 tag on the HF card - do not add them on the strength of this row. Sits in the packer's home model cache (root=home), which is judged by sha256 and not by repository name. No Civitai by-hash record (404). Approved by the founder on 2026-10-11. GENERIC BYTES: releasing this by sha256 releases it for every nest that carries the same bytes, whichever repository they were fetched from - accepted by the founder 2026-10-11. Measured the same day: byte-identical in CIDAS/clipseg-rd64 and CIDAS/clipseg-rd16; not byte-identical to the file of the same name in openai/clip-vit-base-patch32, -base-patch16 or -large-patch14."
+    },
+    {
+      "sha256": "9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a",
+      "name": "CLIP tokenizer merges.txt",
+      "origin_url": "https://huggingface.co/CIDAS/clipseg-rd64-refined",
+      "path": "merges.txt",
+      "revision": "999e0328d9e10b484360c477313983f9afdd7050",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. Not an LFS file, so HF publishes no sha256 for it: the file was downloaded from resolve/999e0328 and hashed (sha256 equal, size 524619), and the git blob id recomputed from those bytes equals the oid paths-info gives (76e821f1). Repo cardData.license and tag license:apache-2.0. This is a configuration file written by the Hugging Face contributor who converted the model (nielsr, the only member of the CIDAS organisation on HF), not the model weights. THE WEIGHTS OF THIS REPOSITORY (model.safetensors, sha256 d00ca85d...) ARE DELIBERATELY NOT IN THIS TABLE: the CLIPSeg author says in github.com/timojl/clipseg (README, and issue 35, 2023-06-07) that no licence is specified for the weights and they were released for research purposes, which contradicts the apache-2.0 tag on the HF card - do not add them on the strength of this row. Sits in the packer's home model cache (root=home), which is judged by sha256 and not by repository name. No Civitai by-hash record (404). Approved by the founder on 2026-10-11. GENERIC BYTES: releasing this by sha256 releases it for every nest that carries the same bytes, whichever repository they were fetched from - accepted by the founder 2026-10-11. Measured the same day: byte-identical in CIDAS/clipseg-rd64, CIDAS/clipseg-rd16, openai/clip-vit-base-patch16 and openai/clip-vit-large-patch14 (the openai repositories on HF state no licence; github.com/openai/CLIP is MIT)."
+    },
+    {
+      "sha256": "c4864a9376a8401918425bed71fc14fc0e81f9b59ec45c1cf96cccb2df508eac",
+      "name": "CLIP tokenizer special_tokens_map.json (as shipped with CLIPSeg)",
+      "origin_url": "https://huggingface.co/CIDAS/clipseg-rd64-refined",
+      "path": "special_tokens_map.json",
+      "revision": "999e0328d9e10b484360c477313983f9afdd7050",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. Not an LFS file, so HF publishes no sha256 for it: the file was downloaded from resolve/999e0328 and hashed (sha256 equal, size 472), and the git blob id recomputed from those bytes equals the oid paths-info gives (2c2130b5). Repo cardData.license and tag license:apache-2.0. This is a configuration file written by the Hugging Face contributor who converted the model (nielsr, the only member of the CIDAS organisation on HF), not the model weights. THE WEIGHTS OF THIS REPOSITORY (model.safetensors, sha256 d00ca85d...) ARE DELIBERATELY NOT IN THIS TABLE: the CLIPSeg author says in github.com/timojl/clipseg (README, and issue 35, 2023-06-07) that no licence is specified for the weights and they were released for research purposes, which contradicts the apache-2.0 tag on the HF card - do not add them on the strength of this row. Sits in the packer's home model cache (root=home), which is judged by sha256 and not by repository name. No Civitai by-hash record (404). Approved by the founder on 2026-10-11. GENERIC BYTES: releasing this by sha256 releases it for every nest that carries the same bytes, whichever repository they were fetched from - accepted by the founder 2026-10-11. Measured the same day: byte-identical in CIDAS/clipseg-rd64 and CIDAS/clipseg-rd16; not byte-identical to the file of the same name in openai/clip-vit-base-patch32, -base-patch16 or -large-patch14."
+    },
+    {
+      "sha256": "d00ca85d6b859f9d07b7cfb8ef26fe9771cb275b34c9368f2ecf603139307f55",
+      "name": "CLIPSeg rd64-refined weights (model.safetensors)",
+      "origin_url": "https://huggingface.co/CIDAS/clipseg-rd64-refined",
+      "path": "model.safetensors",
+      "revision": "999e0328d9e10b484360c477313983f9afdd7050",
+      "spdx": "none",
+      "verdict": "restricted",
+      "reason": "The CLIPSeg author states that no licence is specified for these weights and that they were released for research purposes (github.com/timojl/clipseg, README and issue 35). The apache-2.0 tag on the Hugging Face repository was set by the person who converted the model, not by the author.",
+      "provenance": "Checked 2026-10-11. sha256 equals the lfs.oid Hugging Face gives for model.safetensors at revision 999e0328 (size 603049496). The Hugging Face card says apache-2.0, but GET /api/organizations/CIDAS/members lists one member, nielsr, who converted the model into transformers; the organisation has no verification badge and every commit in the repository is his or the conversion bot's, so the tag was not set by the author. The author's own repository github.com/timojl/clipseg says in its README (master) 'The MIT license does not apply to these weights.' and 'The source code files in this repository (excluding model weights) are released under MIT license.'; in issue 35 'License of model weights' the author timojl answered on 2023-06-07 'There is no license specified for the weights. We released them for research purposes.' This row exists because files in a Hugging Face cache are now judged by the repository they belong to: without it the apache-2.0 tag would release these weights. spdx is 'none' on purpose - it is not on the allow-list, so a client that predates the verdict field reads this row as releasing nothing. The pinned address is kept so a recipient is told where to fetch the file."
+    },
+    {
+      "sha256": "8abff87a15a049f3e0186c2e82c1c8e77783baf2cfb63f34c412656052eb57b0",
+      "name": "IP-Adapter-FaceID Plus v2 LoRA for SD 1.5",
+      "origin_url": "https://huggingface.co/h94/IP-Adapter-FaceID",
+      "path": "ip-adapter-faceid-plusv2_sd15_lora.safetensors",
+      "revision": "43907e6f44d079bf1a9102d9a6e56aef7a219bae",
+      "spdx": "none",
+      "verdict": "restricted",
+      "reason": "The author's model card states that IP-Adapter-FaceID models are released exclusively for research purposes and are not intended for commercial use (huggingface.co/h94/IP-Adapter-FaceID, section 'Non-commercial use').",
+      "provenance": "Checked 2026-10-11. sha256 equals the lfs.oid Hugging Face gives for this path at the pinned revision (size 51059544). The model card of h94/IP-Adapter-FaceID (main, read 2026-10-11) has a section 'Non-commercial use': 'AS InsightFace pretrained models are available for non-commercial research purposes, IP-Adapter-FaceID models are released exclusively for research purposes and is not intended for commercial use.' The repository declares no licence tag. Without this row a content-hash lookup on Civitai finds a re-upload whose permission flags allow passing it on, and the file is released on a stranger's say-so. spdx is not on the allow-list on purpose, so a client that predates the verdict field reads this row as releasing nothing. The pinned address is kept so a recipient is told where to fetch the file."
+    },
+    {
+      "sha256": "f24b4bb2dad6638a09c00f151cde84991baf374409385bcbab53c1871a30cb7b",
+      "name": "IP-Adapter-FaceID Plus v2 LoRA for SDXL",
+      "origin_url": "https://huggingface.co/h94/IP-Adapter-FaceID",
+      "path": "ip-adapter-faceid-plusv2_sdxl_lora.safetensors",
+      "revision": "43907e6f44d079bf1a9102d9a6e56aef7a219bae",
+      "spdx": "none",
+      "verdict": "restricted",
+      "reason": "The author's model card states that IP-Adapter-FaceID models are released exclusively for research purposes and are not intended for commercial use (huggingface.co/h94/IP-Adapter-FaceID, section 'Non-commercial use').",
+      "provenance": "Checked 2026-10-11. sha256 equals the lfs.oid Hugging Face gives for this path at the pinned revision (size 371842896). The model card of h94/IP-Adapter-FaceID (main, read 2026-10-11) has a section 'Non-commercial use': 'AS InsightFace pretrained models are available for non-commercial research purposes, IP-Adapter-FaceID models are released exclusively for research purposes and is not intended for commercial use.' The repository declares no licence tag. Without this row a content-hash lookup on Civitai finds a re-upload whose permission flags allow passing it on, and the file is released on a stranger's say-so. spdx is not on the allow-list on purpose, so a client that predates the verdict field reads this row as releasing nothing. The pinned address is kept so a recipient is told where to fetch the file."
+    },
+    {
+      "sha256": "5a4b928cb1e93748217900cb66d4135bf70d932d2924232f925910fad9e43a92",
+      "name": "OpenPose ControlNet for SDXL (OpenPoseXL2)",
+      "origin_url": "https://huggingface.co/thibaud/controlnet-openpose-sdxl-1.0",
+      "path": "OpenPoseXL2.safetensors",
+      "revision": "1db673ed3dad75181fcf2e24f827597fe34e97b7",
+      "spdx": "other",
+      "verdict": "restricted",
+      "reason": "The author's model card says the licence 'refers to the OpenPose's one', and the OpenPose licence allows non-commercial research use only (huggingface.co/thibaud/controlnet-openpose-sdxl-1.0; github.com/CMU-Perceptual-Computing-Lab/openpose, LICENSE).",
+      "provenance": "Checked 2026-10-11. sha256 equals the lfs.oid Hugging Face gives for this path at the pinned revision (size 5004167829). The model card of thibaud/controlnet-openpose-sdxl-1.0 (licence tag 'other', read 2026-10-11) says 'License: refers to the OpenPose's one.' The LICENSE file of github.com/CMU-Perceptual-Computing-Lab/openpose (master) is headed 'ACADEMIC OR NON-PROFIT ORGANIZATION NONCOMMERCIAL RESEARCH USE ONLY' and grants 'a personal, non-exclusive, non-transferable license to use the Software for noncommercial research purposes, without the right to sublicense'. Without this row a content-hash lookup on Civitai finds a re-upload whose permission flags allow passing it on, and the file is released on a stranger's say-so. spdx is not on the allow-list on purpose, so a client that predates the verdict field reads this row as releasing nothing. The pinned address is kept so a recipient is told where to fetch the file."
+    },
+    {
+      "sha256": "8afa079285bf9384eaf8f6322884cb4f24bbe405da490f91f5540d3bff585e75",
+      "name": "OpenPose Control-LoRA for SDXL (rank 256)",
+      "origin_url": "https://huggingface.co/thibaud/controlnet-openpose-sdxl-1.0",
+      "path": "control-lora-openposeXL2-rank256.safetensors",
+      "revision": "1db673ed3dad75181fcf2e24f827597fe34e97b7",
+      "spdx": "other",
+      "verdict": "restricted",
+      "reason": "The author's model card says the licence 'refers to the OpenPose's one', and the OpenPose licence allows non-commercial research use only (huggingface.co/thibaud/controlnet-openpose-sdxl-1.0; github.com/CMU-Perceptual-Computing-Lab/openpose, LICENSE).",
+      "provenance": "Checked 2026-10-11. sha256 equals the lfs.oid Hugging Face gives for this path at the pinned revision (size 774423024). The model card of thibaud/controlnet-openpose-sdxl-1.0 (licence tag 'other', read 2026-10-11) says 'License: refers to the OpenPose's one.' The LICENSE file of github.com/CMU-Perceptual-Computing-Lab/openpose (master) is headed 'ACADEMIC OR NON-PROFIT ORGANIZATION NONCOMMERCIAL RESEARCH USE ONLY' and grants 'a personal, non-exclusive, non-transferable license to use the Software for noncommercial research purposes, without the right to sublicense'. Without this row a content-hash lookup on Civitai finds a re-upload whose permission flags allow passing it on, and the file is released on a stranger's say-so. spdx is not on the allow-list on purpose, so a client that predates the verdict field reads this row as releasing nothing. The pinned address is kept so a recipient is told where to fetch the file."
+    },
+    {
+      "sha256": "b46c3de62e5696af72c4056e3cdcbea12fbc19581c0aad7b6f2b027851148f5f",
+      "name": "AnimateLCM motion module for SD 1.5",
+      "origin_url": "https://huggingface.co/wangfuyun/AnimateLCM",
+      "path": "AnimateLCM_sd15_t2v.ckpt",
+      "revision": "3d4d00fc113225e1040f4d3bec504b6ec750c10c",
+      "spdx": "none",
+      "verdict": "restricted",
+      "reason": "No licence is stated for these weights: the author's Hugging Face repository declares none, and the MIT licence of the code repository github.com/G-U-N/AnimateLCM does not mention the weights.",
+      "provenance": "Checked 2026-10-11. sha256 equals the lfs.oid Hugging Face gives for this path at the pinned revision (size 1813041929). The Hugging Face API for wangfuyun/AnimateLCM returns no licence in cardData and no licence tag, and the model card (main, read 2026-10-11) contains no licence statement. The code repository github.com/G-U-N/AnimateLCM carries an MIT licence; its README does not say that licence covers the released weights. With nothing stated for the weights the default answer applies. Without this row a content-hash lookup on Civitai finds a re-upload whose permission flags allow passing it on, and the file is released on a stranger's say-so. spdx is not on the allow-list on purpose, so a client that predates the verdict field reads this row as releasing nothing. The pinned address is kept so a recipient is told where to fetch the file."
+    },
+    {
+      "sha256": "8f90d840e075ff588a58e22c6586e2ae9a6f7922996ee6649a7f01072333afe4",
+      "name": "AnimateLCM LoRA for SD 1.5",
+      "origin_url": "https://huggingface.co/wangfuyun/AnimateLCM",
+      "path": "AnimateLCM_sd15_t2v_lora.safetensors",
+      "revision": "3d4d00fc113225e1040f4d3bec504b6ec750c10c",
+      "spdx": "none",
+      "verdict": "restricted",
+      "reason": "No licence is stated for these weights: the author's Hugging Face repository declares none, and the MIT licence of the code repository github.com/G-U-N/AnimateLCM does not mention the weights.",
+      "provenance": "Checked 2026-10-11. sha256 equals the lfs.oid Hugging Face gives for this path at the pinned revision (size 134621556). The Hugging Face API for wangfuyun/AnimateLCM returns no licence in cardData and no licence tag, and the model card (main, read 2026-10-11) contains no licence statement. The code repository github.com/G-U-N/AnimateLCM carries an MIT licence; its README does not say that licence covers the released weights. With nothing stated for the weights the default answer applies. Without this row a content-hash lookup on Civitai finds a re-upload whose permission flags allow passing it on, and the file is released on a stranger's say-so. spdx is not on the allow-list on purpose, so a client that predates the verdict field reads this row as releasing nothing. The pinned address is kept so a recipient is told where to fetch the file."
     }
   ],
-  "components_note": "This table only ever releases, so an empty table releases nothing and every file keeps the deny-by-default answer. Entries arrive through the signed rules channel, which is the whole point of putting them here rather than in code - a shared part judged wrongly is fixed for everyone without a release. Each entry needs sha256, origin_url and spdx; the reader in licensing.py refuses any entry whose origin is not an authority it recognises or whose licence is not one we already pass on, so adding a row cannot widen either of those."
+  "components_note": "A row releases a file only when it has sha256, origin_url and spdx, its origin is an authority the reader in licensing.py recognises and its licence is one we already pass on, so adding a releasing row cannot widen either of those; an empty table releases nothing and every file keeps the deny-by-default answer. A row with \"verdict\": \"restricted\" does the opposite: it marks a file we looked into and must not pass on, it wins over every releasing row for the same sha256 and over the licence tag of the repository the file sits in, and its \"reason\" is the sentence shown to the person packing. Such a row still carries origin_url (where a recipient fetches the file) and an spdx that is not on the allow-list. Entries arrive through the signed rules channel, which is the whole point of putting them here rather than in code - a shared part judged wrongly is fixed for everyone without a release."
 }

@@ -74,7 +74,19 @@ from .download import (
 from .envlock import DISTRO_ONLY_PACKAGES
 from .errors import RETRYABLE_ERROR_CLASSES, NestFailure, ErrorClass, ExitCode
 from .events import EventEmitter, sanitise_terminal
-from .gated import GatedAsset, check_reach, fetch_from_origin, find_token, gated_assets, summarise
+from .gated import (
+    GatedAsset,
+    Reach,
+    already_in_place,
+    check_reach,
+    fetch_from_origin,
+    find_token,
+    human_size,
+    missing_report,
+    needs_you,
+    not_travelling,
+    summarise,
+)
 from .integrity import looks_like_lfs_pointer, probe_model_bytes
 from .report import maybe_report_sink
 from .training import reanchor_recorded_paths
@@ -2354,7 +2366,21 @@ class RestoreReport:
     #: ``{"path", "status"}`` with status ``written`` / ``already_there`` /
     #: ``kept_yours`` (a different file was there; never overwritten) /
     #: ``missing_in_restore``.
-    home_files: list[dict] = field(default_factory=list)
+    #: **Only what was written into the real home folder.** Home-cache files that
+    #: land inside the restore folder (Hugging Face, rembg, …) are not here — they
+    #: are counted in ``home_cache_files_in_restore_folder``. Named ``home_files``
+    #: until 0.1.23, which read as "the home-cache files this restore brought back"
+    #: and made an empty list look like a miss; the old name is still written to
+    #: the json report, same list, for anything that already reads it.
+    written_into_home: list[dict] = field(default_factory=list)
+    #: How many of this nest's files are home-folder model caches that landed inside
+    #: the restore folder (``<target>/.renest/home``), where the app is pointed at them.
+    home_cache_files_in_restore_folder: int = 0
+
+    @property
+    def home_files(self) -> list[dict]:
+        """The pre-0.1.23 name of :attr:`written_into_home` (same list)."""
+        return self.written_into_home
     #: End-of-run words ("Done", where things landed, what's next). Collected
     #: here and printed by the CLI **after** the json document: printed inside
     #: restore() they landed above it and scrolled away under it (2026-09-13,
@@ -2394,7 +2420,10 @@ class RestoreReport:
             "programs_missing": self.programs_missing,
             "fetched_while_running": self.fetched_while_running,
             "capture_gaps": self.capture_gaps,
-            "home_files": self.home_files,
+            "written_into_home": self.written_into_home,
+            "home_cache_files_in_restore_folder": self.home_cache_files_in_restore_folder,
+            # Deprecated alias of written_into_home (the name until 0.1.23).
+            "home_files": self.written_into_home,
             "closing_lines": self.closing_lines,
         }
 
@@ -3279,6 +3308,21 @@ def _libs_the_working_run_used_but_this_machine_lacks(precheck: dict | None) -> 
     return []
 
 
+def _libs_read_off_packages_that_this_machine_lacks(precheck: dict | None) -> list[str]:
+    """The other list: library files named by the installed packages (the app was not
+    running when the nest was packed) that this machine does not have.
+
+    Never acted on — see the function above for why — but worth one line at S0 with
+    the command that brings them, because a nest packed that way learns of a missing
+    one only when the app fails to start, after everything has been downloaded.
+    """
+    for check in ((precheck or {}).get("checks") or []):
+        nl = (check.get("reading") or {}).get("native_libs") or {}
+        if nl.get("method") and nl.get("method") != "loaded":
+            return [n for n in (nl.get("missing") or []) if isinstance(n, str)]
+    return []
+
+
 def every_missing_library(hit: list[str], precheck: dict | None) -> list[str]:
     """The one that tripped this run, **plus every other one this machine lacks**.
 
@@ -3912,8 +3956,14 @@ def restore(
     # what lets us say the right thing (go and fetch it yourself, rather than
     # "transfer failed").
     gated_origin: dict[str, GatedAsset] = {}
+    #: The same assets as a list, one per landing path, in manifest order.
+    gated_list: list[GatedAsset] = []
     handle_box: dict = {}
     state: dict = {
+        #: Landing paths whose bytes were read and matched during this run, so no
+        #: multi-gigabyte file is read twice to answer the same question.
+        "checked_in_place": set(),
+        "fetched_from_origin": 0,
         "blobs_downloaded": 0,
         "blobs_cached": 0,
         "transfer_seconds": 0.0,
@@ -3930,6 +3980,88 @@ def restore(
     }
     t_run = time.monotonic()
     failure: NestFailure | None = None
+
+    def gated_report() -> list[dict]:
+        return [
+            {"path": a.path, "reach": a.reach, "origin_url": a.origin_url,
+             "detail": a.detail, "size_bytes": a.size_bytes, "sha256": a.sha256,
+             "put_it_at": a.dest}
+            for a in gated_list
+        ]
+
+    def withheld_stop(missing: list[GatedAsset], *, tried: bool) -> NestFailure:
+        """The one failure for "files that do not travel are not here": every such
+        file named at once. Same stage, class and exit code (S1 / OBJECT_MISSING /
+        16) this outcome has always had — only now it is raised before anything is
+        downloaded, and for all of them rather than the first."""
+        return NestFailure(
+            "S1",
+            ErrorClass.OBJECT_MISSING,
+            missing_report(missing, have_token=bool(find_token()),
+                           sender=handed_off_from or "", tried=tried),
+            context={
+                "missing": [
+                    {"path": a.path, "sha256": a.sha256, "size_bytes": a.size_bytes,
+                     "origin_url": a.origin_url, "put_it_at": a.dest, "reach": a.reach}
+                    for a in missing
+                ],
+                # Kept for readers of the single-file shape this context used to have.
+                "sha256": missing[0].sha256,
+                "origin_url": missing[0].origin_url,
+            },
+        )
+
+    def fetch_withheld() -> None:
+        """Fetch the files that do not travel from their original source, **before
+        any of the nest's own bytes move**, and check each against the sha256 the
+        nest records. Different bytes are never kept. If any cannot be had, stop
+        here with all of them named — the nest itself has not been downloaded.
+
+        No confirmation dialog: a batch of machines must not stall on a question,
+        and the addresses that would deserve one (a hand-off pointing at a host
+        nobody recognises) were already held back before this point.
+        """
+        assert journal is not None
+        todo = [a for a in gated_list if a.reach in (Reach.FREE, Reach.ERROR)]
+        if not todo:
+            return
+        tok = find_token()
+        failed: list[GatedAsset] = []
+        landed: dict[str, Path] = {
+            a.sha256: Path(a.dest) for a in gated_list if a.reach == Reach.PRESENT
+        }
+        for a in todo:
+            dst = Path(a.dest)
+            twin = landed.get(a.sha256)
+            if twin is not None and twin != dst and twin.is_file():
+                # Same bytes wanted at a second path: copy, then check the copy.
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(twin, dst)
+                why = None if already_in_place(a) else "the copy did not match"
+            else:
+                narrate(
+                    f"Fetching from its original source: {a.path}"
+                    + (f" ({human_size(a.size_bytes)})" if a.size_bytes else "")
+                    + f" <{a.origin_url}>",
+                    stage="S1",
+                )
+                why = fetch_from_origin(a, dst, token=tok, client=client)
+            if why:
+                a.reach = Reach.ERROR
+                a.detail = why
+                failed.append(a)
+                narrate(f"Could not fetch {a.path}: {why}", stage="S1", level="warning")
+                continue
+            a.reach = Reach.FREE
+            a.detail = "fetched from its original source and checked"
+            landed.setdefault(a.sha256, dst)
+            state["checked_in_place"].add(str(dst))
+            state["fetched_from_origin"] += 1
+            journal.mark_blob(a.sha256, BLOB_VERIFIED, dst)
+            narrate(f"Fetched from its original source and checked: {a.path}", stage="S1")
+        report.gated = gated_report()
+        if failed:
+            raise withheld_stop(failed, tried=True)
 
     # -- stage skeleton: timing + contract events + attribution --
     def run_stage(
@@ -3969,32 +4101,54 @@ def restore(
     # ``stage`` labels the narration only (the S0 lock probe fetches the lock early);
     # failure attribution below stays S1 — that is the transfer contract, and the
     # probe catches and downgrades it rather than letting a fetch hiccup block S0.
+    def in_place(it: PlanItem) -> tuple[bool, str]:
+        """Whether this file is on the disk already — **the one test** both S1 (to skip
+        a download) and ``--plan`` (to count "already on this disk") use. Second value:
+        what to tell the user when an earlier run's record turned out wrong.
+
+        Until 0.1.23 these were two tests: ``--plan`` accepted any file whose sha256
+        matched, S1 only the ones its own record listed — so a plan could say
+        "9 already on this disk, 0 to fetch" and the run then downloaded all 9.
+        Now S1 accepts matching bytes too: the size is compared first (free), and
+        only a file of the right size is read and checked.
+        """
+        if not it.dest.is_file():
+            return False, ""
+        if str(it.dest) in state["checked_in_place"]:
+            return True, ""
+        recorded = (
+            journal is not None and journal.blob(it.sha256).get("status") == BLOB_VERIFIED
+        )
+        why = ""
+        if opts.resume and recorded:
+            if not opts.reverify:
+                if it.dest.stat().st_size == it.size_bytes:
+                    return True, ""
+                why = "An earlier run marked this done, but the size is wrong — downloading again"
+            else:
+                why = "--reverify found a mismatch, downloading again"
+        # `--no-resume` means "start over": matching bytes are downloaded again all the
+        # same. A file that does not travel with the nest has nowhere to be downloaded
+        # from, so for it the bytes on the disk always count.
+        if not (opts.resume or it.sha256 in gated_origin):
+            return False, ""
+        if it.dest.stat().st_size == it.size_bytes and _sha256_file(it.dest) == it.sha256:
+            state["checked_in_place"].add(str(it.dest))
+            return True, ""
+        return False, why
+
     def fetch_one(it: PlanItem, stage: str = "S1") -> tuple[str, ResolveReport | None]:
         assert journal is not None
-        if (
-            opts.resume
-            and journal.blob(it.sha256).get("status") == BLOB_VERIFIED
-            and it.dest.is_file()
-        ):
-            if opts.reverify:
-                if _sha256_file(it.dest) == it.sha256:
-                    return "cached", None
-                narrate(f"--reverify found a mismatch, downloading again: {it.label}", stage=stage, level="warning")
-            elif it.dest.stat().st_size == it.size_bytes:
-                return "cached", None
-            else:
-                narrate(
-                    f"An earlier run marked this done, but the size is wrong — downloading again: {it.label}",
-                    stage=stage, level="warning",
-                )
-        if it.sha256 in gated_origin and it.dest.is_file() and _sha256_file(it.dest) == it.sha256:
-            # A restricted asset (one that does not travel with the nest) was
-            # already fetched from source before the run, or the user put it
-            # there themselves — a matching byte fingerprint means it has landed,
-            # and we no longer demand a download link for it (it never would have
-            # one).
-            journal.mark_blob(it.sha256, BLOB_VERIFIED, it.dest)
+        _kept, _why = in_place(it)
+        if _kept:
+            # Recorded, so the next run compares sizes instead of reading it again.
+            # Also the path a file that does not travel takes once it is here —
+            # fetched from its original source, or put there by hand.
+            if journal.blob(it.sha256).get("status") != BLOB_VERIFIED:
+                journal.mark_blob(it.sha256, BLOB_VERIFIED, it.dest)
             return "cached", None
+        if _why:
+            narrate(f"{_why}: {it.label}", stage=stage, level="warning")
         if not it.sources:
             gated = gated_origin.get(it.sha256)
             if gated is not None:
@@ -4205,57 +4359,77 @@ def restore(
         # fetched: on the packing machine it was a warning that scrolled away; here is
         # where it matters (format 2.14, renest.gaps).
         report.capture_gaps = valid_gaps(mani.get("capture_gaps"))
+        report.home_cache_files_in_restore_folder = sum(
+            1 for _f in mani.get("files") or [] if _f.get("root") == "home")
         if report.capture_gaps:
             narrate(capture_gaps_heading(report.capture_gaps), stage="S1", level="warning")
             for _g in report.capture_gaps:
                 narrate(f"  · [{_g['kind']}] {gap_line(_g)}", stage="S1", level="warning")
-        # The assets that do not travel with the nest: say it all **before the
-        # run starts**, instead of discovering missing files at the very end.
-        # Restricted assets never serve bytes across users, so without this the
-        # files would simply be quietly absent. The probe downloads no bytes and
-        # needs no GPU.
-        _gated = gated_assets(mani)
-        # Anything the restore code **does** carry a link for is not a
-        # "fetch it yourself" case: a link means the server attests these bytes
-        # are genuinely yours (for instance you packed the nest), so they are
-        # served straight from your drive as usual.
-        # Only assets the manifest marks restricted **and** the drive will not
-        # serve go down the "fetch from source with your own credentials" path.
-        # Bytes sitting in a folder on this disk that the restore was pointed at are
-        # the same case: you packed them, nobody has to fetch them from the source.
+        # The files that do not travel with the nest: **every one of them, said before
+        # anything is downloaded** — path, size, where it came from — in two groups:
+        # the ones we fetch from their original source, and the ones the receiver has
+        # to provide. Restricted bytes are never served across users, so without this
+        # they would simply be absent, and (until 0.1.23) the run downloaded
+        # everything else first and then stopped on the first of them.
+        # The probe asks for no body and needs no GPU; nothing is fetched here.
+        #
+        # "Does not travel" = the manifest marks it restricted **and this restore has
+        # nowhere to download it from**. A link in the restore code means the server
+        # attests the bytes are yours (you packed the nest), so they come from your
+        # drive as usual. A storage address given by hand counts the same way — it is
+        # your own storage — except a folder on this disk, where we can see whether
+        # the file is really in it (an exported hand-off leaves these out).
         _local_base = local_path_of(_blob_base) if _blob_base else None
-        _gated = [a for a in _gated if not (a.sha256 and (
-            a.sha256 in blobmap
-            or (_local_base is not None
-                and (_local_base / a.sha256[:2] / a.sha256).is_file())))]
-        gated_origin.update({a.sha256: a for a in _gated if a.sha256})
+        _linked = set(blobmap)
+        for _f in mani.get("files") or []:
+            _h = (_f.get("blob") or {}).get("sha256") or ""
+            if not _h:
+                continue
+            if _f.get("sources") or (_blob_base and (
+                    _local_base is None or (_local_base / _h[:2] / _h).is_file())):
+                _linked.add(_h)
+        _gated = not_travelling(
+            mani, linked=_linked,
+            dest_of=lambda _root, _path: resolve_file_root(_root, target) / _path,
+        )
+        gated_origin.update({a.sha256: a for a in _gated})
+        gated_list.extend(_gated)
         if _gated:
+            from .wheels import trusted_lock_hosts
+
             _tok = find_token()
+            _known_hosts = trusted_lock_hosts()
+            _named = sender_named(handed_off_from, opts.trust_sender)
             for _a in _gated:
-                check_reach(_a, token=_tok, client=client)
-            narrate(summarise(_gated, have_token=bool(_tok)), stage="S1", level="warning")
-            # Whatever can be fetched automatically is fetched, **with no
-            # confirmation dialog** — same reason a batch of machines must not
-            # be stalled by pop-ups: ask every day and the user just clicks
-            # through with their eyes shut.
-            for _a in _gated:
-                if _a.reach != "free":
+                if already_in_place(_a):
+                    # Fetched by an earlier run, or put there by hand: matching bytes
+                    # mean it has landed, whoever carried it.
+                    _a.reach = Reach.PRESENT
+                    _a.detail = "already on this machine, checked"
+                    state["checked_in_place"].add(_a.dest)
                     continue
-                _dst = resolve_file_root(
-                    next((f.get("root", "env") for f in (mani.get("files") or [])
-                          if f.get("path") == _a.path), "env"), target) / _a.path
-                _why = fetch_from_origin(_a, _dst, token=_tok, client=client)
-                if _why:
-                    _a.reach = "error"
-                    _a.detail = _why
-                    narrate(f"Could not fetch {_a.path}: {_why}", stage="S1", level="warning")
+                _u = urlparse(_a.origin_url) if _a.origin_url else None
+                if _u is not None and _u.scheme not in ("http", "https"):
+                    _a.reach = Reach.NO_SOURCE
+                    _a.detail = "the address on record is not one a download can use"
+                elif (_u is not None and handed_off_from and not _named
+                      and (_u.hostname or "").lower() not in _known_hosts):
+                    # [SECURITY-REVIEW] The address was written by whoever packed the
+                    # nest. On a hand-off an unrecognised host is the same case as an
+                    # unrecognised dependency source (S3): not contacted — not even
+                    # probed — until the receiver names the sender. One verdict
+                    # (sender_named), one allow-list (trusted_lock_hosts).
+                    _a.reach = Reach.UNVETTED
+                    _a.detail = (
+                        f"{handed_off_from} recorded an address on a host we do not "
+                        f"recognise ({_u.hostname}), so it was not contacted"
+                    )
                 else:
-                    _a.detail = "fetched from the source"
-                    narrate(f"Fetched from the source: {_a.path}", stage="S1")
-            report.gated = [
-                {"path": a.path, "reach": a.reach, "origin_url": a.origin_url,
-                 "detail": a.detail} for a in _gated
-            ]
+                    check_reach(_a, token=_tok, client=client)
+                    if _a.reach == Reach.FREE and not _a.detail:
+                        _a.detail = "we will fetch it from its original source"
+            narrate(summarise(_gated, have_token=bool(_tok)), stage="S1", level="warning")
+            report.gated = gated_report()
 
         report.nest_id = mani.get("id", "")
         plan = RestorePlan.from_manifest(mani, target, _blob_base, blobmap)
@@ -4431,6 +4605,7 @@ def restore(
         # git-lfs) and the libraries the working run loaded. Installed here when this
         # account may, **before any model bytes move**.
         s0_system_tools()
+        s0_libraries_named_by_packages_only()
         # Only after the machine itself passed (or was forced past): can the
         # dependency lock resolve at all? Asked **before any model bytes move** —
         # the failure this catches used to surface at S3, after a 64 GB download
@@ -4531,6 +4706,39 @@ def restore(
             # S0 has no class for this, and a new one is a format change: it rides the
             # stage's unclassified slot (exit 60), and the words carry the attribution.
             raise NestFailure("S0", ErrorClass.UNKNOWN, outcome.message)
+
+    def s0_libraries_named_by_packages_only() -> None:
+        """A nest packed while its app was not running names its system libraries from
+        the installed packages. Those are not installed for the user and never stop
+        the run (some are never loaded) — but until 0.1.23 the only words about them
+        at S0 were "come back to this if something fails to load", and the command that
+        fixes it was first printed at S4, after the whole download (real machine,
+        2026-09-09: 2.1 GB, then stopped on libGL.so.1). Now the command is said here.
+        Told only: nothing is run, and the exit code does not move."""
+        assert plan is not None
+        missing = _libs_read_off_packages_that_this_machine_lacks(report.precheck)
+        measured = dict((plan.native_libs or {}).get("packages") or {})
+        pkgs: dict[str, str] = {}
+        for lib in missing:
+            pkg = measured.get(lib) or _SO_PACKAGE.get(lib.lower())
+            if pkg and not _DRIVER_OWNED.match(lib):
+                pkgs[lib] = pkg
+        if not pkgs:
+            return
+        sp = systools.plan_system_install(
+            [], lib_packages=pkgs, machine=opts.machine or systools.Machine())
+        if sp is None or not sp.command():
+            return  # not an apt-get machine: the package names would be wrong here
+        _names = ", ".join(list(pkgs)[:6]) + (
+            f" and {len(pkgs) - 6} more" if len(pkgs) > 6 else "")
+        narrate(
+            f"This machine lacks {len(pkgs)} system library file(s) this nest's packages "
+            f"name ({_names}). Not installed for you: that list was read off the "
+            f"installed packages, not off the working run, so some may never be used. "
+            f"If the app later stops because one will not load, this one command brings "
+            f"them all: {sp.command()}",
+            stage="S0", level="warning",
+        )
 
     def _look_at_the_system_layer_again() -> None:
         """Re-run the one S0 check an install can change, and put the fresh answer
@@ -4728,15 +4936,10 @@ def restore(
     def _already_here(it: PlanItem) -> bool:
         """Whether this file is on the disk already, judged the way S1 judges it.
 
-        Same test S1 uses to skip a download (journal says verified + the size on
-        disk matches), so the plan's "already here" count is the count S1 will
-        actually skip — not an optimistic guess made by different rules.
+        Not "the same kind of test" — the same function (``in_place``), so the plan's
+        "already here" count is the count S1 will actually skip.
         """
-        if not it.dest.is_file():
-            return False
-        if journal is not None and journal.blob(it.sha256).get("status") == BLOB_VERIFIED:
-            return it.dest.stat().st_size == it.size_bytes
-        return _sha256_file(it.dest) == it.sha256
+        return in_place(it)[0]
 
     def _build_plan() -> dict:
         assert plan is not None
@@ -4846,6 +5049,9 @@ def restore(
     # -- S1 download --
     def s1_download() -> str:
         assert plan is not None
+        # First, and before a byte of the nest itself moves: the files that do not
+        # travel with it. If one of them cannot be had, this is where the run stops.
+        fetch_withheld()
         meta = [i for i in plan.items if i.role != "asset"]
         assets = plan.asset_items
         for it in meta:
@@ -4959,8 +5165,14 @@ def restore(
             blob_done(it, "copied", None, time.monotonic() - t0)
         state["transfer_seconds"] = round(time.monotonic() - t_assets, 3)
         copied = f", {len(to_copy)} copied from bytes already here" if to_copy else ""
+        # Counted with "already here" above (they were on the disk by the time the
+        # nest's own files moved); said separately so the line adds up to what happened.
+        _from_origin = state["fetched_from_origin"]
+        fetched = (f", {_from_origin} fetched from their original source"
+                   if _from_origin else "")
         return (f"{state['blobs_downloaded']} downloaded, "
-                f"{state['blobs_cached'] - len(to_copy)} already here{copied}")
+                f"{max(state['blobs_cached'] - len(to_copy) - _from_origin, 0)} "
+                f"already here{copied}{fetched}")
 
     # -- S2: model caches some nodes keep under the home folder (format 2.14) --
     def s2_home_caches() -> None:
@@ -5022,13 +5234,13 @@ def restore(
         for src, dst in writes:
             rel = str(dst)
             if not src.is_file():
-                report.home_files.append({"path": rel, "status": "missing_in_restore"})
+                report.written_into_home.append({"path": rel, "status": "missing_in_restore"})
                 continue
             if dst.exists() or dst.is_symlink():
                 if dst.is_file() and not dst.is_symlink() and _sha256_file(dst) == _sha256_file(src):
-                    report.home_files.append({"path": rel, "status": "already_there"})
+                    report.written_into_home.append({"path": rel, "status": "already_there"})
                     continue
-                report.home_files.append({"path": rel, "status": "kept_yours"})
+                report.written_into_home.append({"path": rel, "status": "kept_yours"})
                 narrate(
                     f"Kept your own {dst}: it is different from the one in this nest, and an "
                     f"existing file is never overwritten. The nest's copy is at {src}.",
@@ -5039,7 +5251,7 @@ def restore(
             tmp = dst.with_name(dst.name + ".renest-part")
             shutil.copyfile(src, tmp)
             os.replace(tmp, dst)
-            report.home_files.append({"path": rel, "status": "written"})
+            report.written_into_home.append({"path": rel, "status": "written"})
 
     # -- S2 layout: full re-verify + self-heal re-pull + unpack --
     def s2_place() -> str:
@@ -6025,7 +6237,8 @@ def restore(
             # at all — the reader got a wall of zeros and exit 0, and the single
             # question they ran the command to answer went unstated.
             gated = report.gated
-            blocked = [g for g in gated if g.get("reach") != "free"]
+            blocked = [g for g in gated
+                       if g.get("reach") not in (Reach.FREE, Reach.PRESENT)]
             report.ok = not blocked
             report.exit_code = (
                 int(ExitCode.OK) if report.ok else int(ExitCode.S0_WARNING_UNCONFIRMED)
@@ -6063,6 +6276,20 @@ def restore(
             }
             narrate(summary, stage="S1", level="info" if report.ok else "warning")
             return report
+        # Files that do not travel and that only the receiver can supply: stop
+        # **here**, before S0 and before anything is downloaded, with every one of
+        # them named. (`--plan` carries on: it moves nothing, and lists them.)
+        _need_you = [a for a in gated_list if needs_you(a)]
+        if _need_you and not opts.plan_only:
+            _stop = withheld_stop(_need_you, tried=False)
+            # No stage has started, so the stage skeleton will not announce this.
+            em.error(_stop)
+            narrate(
+                f"✗ Stopped before downloading anything: {len(_need_you)} file(s) that "
+                f"do not travel with this nest are not on this machine.",
+                level="error",
+            )
+            raise _stop
         # Say the landing spot out loud before a single byte is written. Someone
         # who packed ~/Documents/ComfyUI naturally expects a rebuild to put it
         # back there; it does not, and a nest carries no absolute path from the
@@ -6256,7 +6483,7 @@ def restore(
         closing(cache_landing_line(mani, target))
         # Format 2.14: the one thing a restore may put outside the target. Said again here,
         # so "everything is under <target>" is never the whole story.
-        _home_written = [h for h in report.home_files if h.get("status") == "written"]
+        _home_written = [h for h in report.written_into_home if h.get("status") == "written"]
         if _home_written:
             closing(f"{len(_home_written)} file(s) were also copied into your home folder, "
                     f"under {Path.home() / '.insightface'} (insightface only looks there).")
