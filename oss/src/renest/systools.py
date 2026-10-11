@@ -419,6 +419,29 @@ def _what_is_missing(plan: SystemPlan) -> list[str]:
     return lines
 
 
+#: What each package manager prints when a package name is not in this machine's package
+#: sources at all. Copied from real output: apt's line is from the batch-24 restore
+#: (2026-10-09, `E: Unable to locate package libcublas-12-8`, exit 100).
+_NOT_IN_SOURCES = (
+    re.compile(r"Unable to locate package (\S+)"),
+    re.compile(r"Package '?([^'\s]+)'? has no installation candidate"),
+    re.compile(r"No match for argument: (\S+)"),
+    re.compile(r"No package (\S+) available"),
+    re.compile(r"^\s*(\S+) \(no such package\)", re.M),
+)
+
+
+def packages_not_in_sources(output: str | None) -> list[str]:
+    """Package names the install output says this machine's package sources lack."""
+    found: list[str] = []
+    for pat in _NOT_IN_SOURCES:
+        for m in pat.finditer(output or ""):
+            name = m.group(1).rstrip(":")
+            if name not in found:
+                found.append(name)
+    return found
+
+
 def ensure_system_tools(
     plan: SystemPlan,
     *,
@@ -428,13 +451,16 @@ def ensure_system_tools(
     machine: Machine | None = None,
     recheck_libs: Callable[[list[str]], list[str]] | None = None,
     before: str = "The nest's files have not been downloaded yet. ",
+    if_not_in_sources: str | None = None,
 ) -> Outcome:
     """Install what ``plan`` names when this machine lets us; otherwise say how.
 
     Never hangs: with nobody at the keyboard and no ``--yes`` it prints the command
     and returns. Never raises: the caller decides what a failed install means.
     ``before`` opens the failure message with what has not happened yet (a restore:
-    nothing downloaded; a pack: nothing packed)."""
+    nothing downloaded; a pack: nothing packed). ``if_not_in_sources`` is the caller's
+    way on when the failure is that a package does not exist in this machine's package
+    sources -- repeating the same install as the fix would only fail again."""
     m = machine or Machine()
     what = [LABEL[n.tool] for n in plan.missing] + list(plan.lib_packages)
     head = ["This machine is missing what this nest needs:", *_what_is_missing(plan)]
@@ -477,6 +503,23 @@ def ensure_system_tools(
         if sudo:
             argv = ["sudo", "-n", *argv[1:]]
         code, tail = m.stream(argv, env)
+        absent = [p for p in packages_not_in_sources(tail) if p in plan.packages]
+        if code != 0 and absent:
+            libs = [lib for lib, pkg in plan.lib_packages.items() if pkg in absent]
+            is_are = "is" if len(absent) == 1 else "are"
+            msg = (f"Installing {', '.join(what)} failed: `{shlex.join(argv)}` exited {code}. "
+                   f"{before}{', '.join(absent)} {is_are} not in this machine's package "
+                   f"sources, so running that install again would fail the same way.")
+            if libs:
+                msg += (f" The packing machine had {', '.join(libs)} from its own system; "
+                        f"the nest's Python packages may also provide "
+                        f"{'it' if len(libs) == 1 else 'them'} (CUDA libraries often come "
+                        f"with them).")
+            msg += " " + (if_not_in_sources or (
+                "Install it from another package source you trust, or use the image the "
+                "nest was packed on, then run the same command again: " + rerun))
+            say(msg)
+            return Outcome("failed", what, msg)
         if code != 0:
             msg = (f"Installing {', '.join(what)} failed: `{shlex.join(argv)}` exited {code}. "
                    f"{before}Install them yourself "

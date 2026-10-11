@@ -2690,7 +2690,8 @@ def _binary_runs_here(sm_list: list[int], cap: int) -> bool:
     return any(t <= cap and t // 10 == cap // 10 for t in sm_list)
 
 
-def check_extension_archs(nest_gpu: dict | None, current_compute_cap: str) -> CheckResult:
+def check_extension_archs(nest_gpu: dict | None, current_compute_cap: str,
+                          unread: Iterable[str] | None = None) -> CheckResult:
     """Which GPU generations the nest's **compiled extensions** were built for.
 
     Separate from :func:`check_gpu_arch`, which asks the same of PyTorch itself, and
@@ -2708,10 +2709,20 @@ def check_extension_archs(nest_gpu: dict | None, current_compute_cap: str) -> Ch
     # shape reads as "nothing recorded" rather than raising: this runs before a
     # machine is rented, and a traceback tells the user less than silence does.
     g = nest_gpu if isinstance(nest_gpu, dict) else {}
+    # Packages packing never read (format 2.14): nothing is known about them, so they
+    # can never be counted as covered -- "unknown — not read at pack time".
+    unread_pkgs = sorted({str(u) for u in unread or () if str(u)})
+    unknown_note = (f" Unknown — not read at pack time: {', '.join(unread_pkgs[:6])}"
+                    + (f" and {len(unread_pkgs) - 6} more" if len(unread_pkgs) > 6 else "")
+                    + "." if unread_pkgs else "")
     lists = [g.get(key) for key in ("node_native_archs", "package_native_archs")]
     entries = [(e.get("code_dep") or e.get("package") or "?", e)
                for lst in lists if isinstance(lst, list)
                for e in lst if isinstance(e, dict)]
+    if not entries and unread_pkgs:
+        return CheckResult("extension_archs", LEVEL_UNKNOWN,
+                           "This nest records no readable build targets for its compiled "
+                           "extensions." + unknown_note, {"not_read_at_pack_time": unread_pkgs})
     if not entries:
         return CheckResult("extension_archs", "skip",
                            "This nest does not record what its compiled extensions were "
@@ -2746,6 +2757,12 @@ def check_extension_archs(nest_gpu: dict | None, current_compute_cap: str) -> Ch
     reading = {"this_gpu": cap, "checked": len(builds), "binaries": len(entries),
                "not_built_for_this_card": missing,
                "some_builds_skip_this_card": partial}
+    if unread_pkgs:
+        reading["not_read_at_pack_time"] = unread_pkgs
+    if not missing and unread_pkgs:
+        return CheckResult("extension_archs", LEVEL_UNKNOWN,
+                           f"{len(builds)} compiled extension(s) that were read carry a build "
+                           f"this card's generation ({cap}) can run." + unknown_note, reading)
     if not missing:
         note = ""
         if partial:
@@ -2760,7 +2777,7 @@ def check_extension_archs(nest_gpu: dict | None, current_compute_cap: str) -> Ch
         f"{len(missing)} of {len(builds)} compiled extension(s) carry no build this card's "
         f"generation ({cap}) can run: {'; '.join(missing[:4])}. What those provide will be "
         f"unavailable once the app starts; everything else still works. Never a refusal — "
-        f"the app runs without them, and you may not need them.", reading)
+        f"the app runs without them, and you may not need them.{unknown_note}", reading)
 
 
 def check_system_layer(nest_runtime: dict | None, this_env: dict | None = None) -> CheckResult:
@@ -2991,6 +3008,10 @@ def run_precheck(
     #: which is after the download. Empty = only the root is probed.
     landing_dirs: Iterable[str | os.PathLike[str]] | None = None,
     nest_gpu: dict | None = None,
+    #: Packages whose GPU build targets packing did not read in time (manifest
+    #: ``capture_gaps`` of kind ``native_arch_unread``). The extension check reports
+    #: them as unknown, never as covered.
+    nest_arch_unread: Iterable[str] | None = None,
     skip_net: bool = False,
     #: Whether the big files for this rebuild come over the internet. ``False``
     #: means they do not (they are on this machine or on the local network), in
@@ -3079,7 +3100,7 @@ def run_precheck(
         # Two readings the nest already carried and nobody read until 2026-08-13: what the
         # compiled extensions were built for, and how much video memory the run was seen
         # using. Both advisory — see each function for why neither may refuse.
-        report.checks.append(check_extension_archs(nest_gpu, _cap))
+        report.checks.append(check_extension_archs(nest_gpu, _cap, nest_arch_unread))
         report.checks.append(check_observed_vram(nest_gpu))
     elif nest_captured_on:
         report.checks.append(check_gpu_generation(collect_gpu_compute_cap(), nest_captured_on))

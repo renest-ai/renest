@@ -1117,6 +1117,91 @@ def _group_by_folder(items: list[dict]) -> list[tuple[str, list[dict]]]:
     return list(out.items())
 
 
+def not_packed_gap_lines(possibly_used: list[dict], unreferenced_large: list[dict],
+                         unreferenced_models: list[dict]) -> list[str]:
+    """The "… is NOT packed … pack again with --add" lines, written from the three lists
+    in the capture report and nothing else.
+
+    One writer on purpose: packing can still carry some of these files afterwards
+    (``--add``, the run's own downloads), and then calls
+    :func:`drop_carried_from_report` -- which writes these lines again from the trimmed
+    lists. Filtering the sentences instead missed the copy in ``--json`` (0.1.22 U1,
+    2026-10-11: nine lines for files the manifest carried)."""
+    out: list[str] = []
+    for _folder, _group in _group_by_folder(possibly_used):
+        if len(_group) > 3 and _folder:
+            total = sum(c["size_bytes"] for c in _group)
+            out.append(f"{_folder}/ holds {len(_group)} files ({_human_size(total)}) this run may "
+                       f"use that are NOT packed: {_group[0]['why']}. If this run needs them, "
+                       f"pack again with --add {_folder}")
+            continue
+        for c in _group:
+            out.append(f"{c['path']} ({_human_size(c['size_bytes'])}) may be used by this run "
+                       f"but is NOT packed: {c['why']}. If this run needs it, pack again with "
+                       f"--add {c['path']}")
+    for u in unreferenced_large:
+        # The old wording here said "we pack the whole folder either way". It was
+        # simply untrue -- this scan only looks under models/, and models/ is on the
+        # exclude list, so none of these travel. Someone deleting a 11 GB model on the
+        # strength of that sentence would have been told the opposite of the truth.
+        out.append(f"{u['path']} ({u['size_bytes']} bytes) is a big model this recipe "
+                   f"never loads, so it is NOT packed — only the models the recipe "
+                   f"names travel with the nest. If you want it in there too, pack again "
+                   f"with --add {u['path']}")
+    _big = {u["path"] for u in unreferenced_large}
+    _small = [u for u in unreferenced_models if u["path"] not in _big]
+    if _small:
+        shown = ", ".join(u["path"] for u in _small[:5]) + ("…" if len(_small) > 5 else "")
+        out.append(f"{len(_small)} smaller model file(s) this recipe never names are NOT packed "
+                   f"({shown}). If this run loads any of them, pack again with --add <path> "
+                   f"for each; `--json` lists them all under unreferenced_model_files")
+    return out
+
+
+_NOT_PACKED_LISTS = ("possibly_used_files", "unreferenced_large_files", "unreferenced_model_files")
+
+
+def drop_carried_from_report(report: dict, carried: set[str]) -> tuple[list[str], list[str]]:
+    """Packing carried some files the capture report listed as left behind: take them off
+    all three lists and write their gap lines again. Returns ``(old lines, new lines)`` so
+    a caller holding a copy of the lines (the human warnings) can swap them the same way.
+
+    The lines are replaced where they stood in ``report["gaps"]``, so the order the
+    packing person reads does not move."""
+    lists = {k: list(report.get(k) or []) for k in _NOT_PACKED_LISTS}
+    old = not_packed_gap_lines(*lists.values())
+    trimmed = {k: [c for c in v if c.get("path") not in carried] for k, v in lists.items()}
+    if trimmed == lists:
+        return [], []
+    for k in _NOT_PACKED_LISTS:
+        if k in report:
+            report[k] = trimmed[k]
+    new = not_packed_gap_lines(*trimmed.values())
+    report["gaps"] = replace_lines(list(report.get("gaps") or []), old, new)
+    return old, new
+
+
+def replace_lines(lines: list[str], old: list[str], new: list[str]) -> list[str]:
+    """``lines`` with every line of ``old`` taken out and ``new`` put where the first of
+    them stood. Unchanged when none of them is there: a list that never carried these
+    lines is not the place to start."""
+    gone = set(old)
+    at = next((i for i, x in enumerate(lines) if x in gone), None)
+    if at is None:
+        return list(lines)
+    kept = [x for x in lines if x not in gone]
+    at = sum(1 for x in lines[:at] if x not in gone)
+    return kept[:at] + new + kept[at:]
+
+
+def _kind_of_folder(folder: str) -> str:
+    """A ``files[].kind`` from a models/ folder no category names. The schema allows only
+    lower-case letters, digits and ``_``; a node's own folder (``LLM``,
+    ``facerestore-models``) copied verbatim made a manifest our own lint rejects."""
+    k = re.sub(r"[^a-z0-9_]", "_", folder.lower()).strip("_")[:64]
+    return k or "other"
+
+
 def _human_size(n: int) -> str:
     for unit, k in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
         if n >= k:
@@ -1394,7 +1479,7 @@ def capture(workflow: dict, comfyui_dir: Path,
         sha, size = _sha256_file(found, hash_cache)
         folder = rel_to_root.split("/")[2] if rel_to_root.count("/") >= 3 else ""
         entry = {**base, "path": rel_to_root, "size_bytes": size, "sha256": sha,
-                 "kind": dir_kind_by_folder.get(folder) or folder or "other",
+                 "kind": dir_kind_by_folder.get(folder) or _kind_of_folder(folder),
                  "found_by": found_by}
         if source is not None:
             entry["source_abs"] = str(source)
@@ -1804,17 +1889,6 @@ def capture(workflow: dict, comfyui_dir: Path,
                            f"it is in models/{f.folder}, a folder ComfyUI itself never reads; "
                            f"a node pack this workflow uses may load it from there")
     possibly_used = sorted(possibly.values(), key=lambda c: c["path"])
-    for _folder, _group in _group_by_folder(possibly_used):
-        if len(_group) > 3 and _folder:
-            total = sum(c["size_bytes"] for c in _group)
-            gaps.append(f"{_folder}/ holds {len(_group)} files ({_human_size(total)}) this run may "
-                        f"use that are NOT packed: {_group[0]['why']}. If this run needs them, "
-                        f"pack again with --add {_folder}")
-            continue
-        for c in _group:
-            gaps.append(f"{c['path']} ({_human_size(c['size_bytes'])}) may be used by this run "
-                        f"but is NOT packed: {c['why']}. If this run needs it, pack again with "
-                        f"--add {c['path']}")
 
     unreferenced_models: list[dict] = []
     for f in index.files:
@@ -1824,22 +1898,7 @@ def capture(workflow: dict, comfyui_dir: Path,
             unreferenced_models.append({"path": f.path, "size_bytes": f.abs.stat().st_size})
     unreferenced_large = [u for u in _scan_unreferenced_large_files(
         comfyui_dir, prefix, seen_paths, large_file_bytes) if u["path"] not in possibly]
-    for u in unreferenced_large:
-        # The old wording here said "we pack the whole folder either way". It was
-        # simply untrue -- this scan only looks under models/, and models/ is on the
-        # exclude list, so none of these travel. Someone deleting a 11 GB model on the
-        # strength of that sentence would have been told the opposite of the truth.
-        gaps.append(f"{u['path']} ({u['size_bytes']} bytes) is a big model this recipe "
-                    f"never loads, so it is NOT packed — only the models the recipe "
-                    f"names travel with the nest. If you want it in there too, pack again "
-                    f"with --add {u['path']}")
-    _big = {u["path"] for u in unreferenced_large}
-    _small = [u for u in unreferenced_models if u["path"] not in _big]
-    if _small:
-        shown = ", ".join(u["path"] for u in _small[:5]) + ("…" if len(_small) > 5 else "")
-        gaps.append(f"{len(_small)} smaller model file(s) this recipe never names are NOT packed "
-                    f"({shown}). If this run loads any of them, pack again with --add <path> "
-                    f"for each; `--json` lists them all under unreferenced_model_files")
+    gaps.extend(not_packed_gap_lines(possibly_used, unreferenced_large, unreferenced_models))
 
     # A container cannot answer these about itself (it cannot even see its own image
     # name), so they have to come from outside. **The digest is not on this list** --

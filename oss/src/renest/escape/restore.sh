@@ -2,10 +2,10 @@
 # =============================================================================
 # Renest restore.sh — the escape hatch
 #
-# Nest formats this copy reads: 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13  (and, with a warning,
+# Nest formats this copy reads: 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 2.14  (and, with a warning,
 #   any later 2.x — a higher minor version only ever adds optional fields, and
 #   refusing one would turn a nest whose bytes restore perfectly into a brick).
-#   Written for format 2.13, 2026-10-07. Keep this line: from format 2.3 on a
+#   Written for format 2.14, 2026-10-11. Keep this line: from format 2.3 on a
 #   copy of this script travels inside every nest at .renest/escape/restore.sh,
 #   and this comment is how you tell which copy you are holding — there is no
 #   version field anywhere else.
@@ -361,10 +361,20 @@ FV=$(jq -r '.format_version' "$MANIFEST")
 # Section 5a below installs the stored wheel when it fits this machine and falls
 # back to the lock line when it does not, saying why. Every 2.0–2.12 nest
 # restores unchanged: both fields are absent there.
+# 2.14 (2026-10-11) adds two things. capture_gaps, the list of what the packing
+# machine knew this nest does not carry: section 3c prints one notice line per entry,
+# and the closing words say "not complete" only for one marked as needed. And a fourth
+# landing root, `home`: model caches some nodes keep under the home folder
+# (~/.cache/huggingface/hub, ~/.rembg, ~/.transparent-background, ~/.insightface).
+# They land inside $TARGET/.renest/home, the closing lines print the export lines that
+# point each library there, and only the insightface files -- that library has no such
+# setting -- are copied into your home folder, on an explicit yes. A `home` path outside
+# those four caches is named loudly and goes ahead only on an explicit yes. Every
+# 2.0-2.13 nest restores unchanged: neither is present there.
 case "$FV" in
-  2.0|2.1|2.2|2.3|2.4|2.5|2.6|2.7|2.8|2.9|2.10|2.11|2.12|2.13) ;;
+  2.0|2.1|2.2|2.3|2.4|2.5|2.6|2.7|2.8|2.9|2.10|2.11|2.12|2.13|2.14) ;;
   2.*)
-    warn "This nest says format $FV; this script knows up to 2.13. Same major version, so it only adds optional fields this script does not use — carrying on. A newer Renest will make full use of them." ;;
+    warn "This nest says format $FV; this script knows up to 2.14. Same major version, so it only adds optional fields this script does not use — carrying on. A newer Renest will make full use of them." ;;
   *)
     # Same three facts the agent side gives, in the same order: how old this nest is,
     # that there is no upgrade path and why, and that the files themselves are fine.
@@ -372,7 +382,7 @@ case "$FV" in
     # is not (the manifest still lists every one of them, with fingerprints).
     _WHEN=$(jq -r '.created_at // empty' "$MANIFEST" 2>/dev/null | cut -c1-10)
     _NFILES=$(jq -r '(.files // []) | length' "$MANIFEST" 2>/dev/null)
-    die FORMAT-VERSION "Unrecognised nest format version: $FV — this script reads format 2.x (knows 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12 and 2.13).${_WHEN:+ This nest was packed on ${_WHEN}.} Nests in the older 1.x format cannot be read here, and **there is no upgrade path**: format 2.0 made it compulsory to say which parts of a nest are the application and which are your own code, and nobody can work that out after the fact.${_NFILES:+ **Your files are not lost** — this nest still lists all ${_NFILES} of them with their fingerprints, so they can be fetched one by one even though the environment cannot be rebuilt automatically.} If you still have the environment, pack it again with a current Renest." ;;
+    die FORMAT-VERSION "Unrecognised nest format version: $FV — this script reads format 2.x (knows 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13 and 2.14).${_WHEN:+ This nest was packed on ${_WHEN}.} Nests in the older 1.x format cannot be read here, and **there is no upgrade path**: format 2.0 made it compulsory to say which parts of a nest are the application and which are your own code, and nobody can work that out after the fact.${_NFILES:+ **Your files are not lost** — this nest still lists all ${_NFILES} of them with their fingerprints, so they can be fetched one by one even though the environment cannot be rebuilt automatically.} If you still have the environment, pack it again with a current Renest." ;;
 esac
 
 # ---- Where the files may land ------------------------------------------------
@@ -399,6 +409,7 @@ root_dir() {
   case "$1" in
     hf_hub)  printf '%s' "$HF_HUB_ROOT" ;;
     hf_home) printf '%s' "$HF_HOME_ROOT" ;;
+    home)    printf '%s' "$TARGET/.renest/home" ;;
     *)       printf '%s' "$TARGET" ;;
   esac
 }
@@ -430,7 +441,7 @@ root_dir() {
 # BEGIN landing-gate -- the three-way parity test runs exactly these lines, so they cannot drift
 BADPATH=$(jq -r '
   [ (.files[]? | (.root // "env") as $r | (.path // "") as $p
-      | if ($r != "env" and $r != "hf_hub" and $r != "hf_home")
+      | if ($r != "env" and $r != "hf_hub" and $r != "hf_home" and $r != "home")
           then "unknown place to put files: \($r)"
         elif ($p == "") or ($p | test("^(/|~)")) or ($p | test("(^|/)\\.\\.(/|$)"))
           then "a path that writes outside where it belongs: \($p)"
@@ -462,6 +473,51 @@ BADPATH=$(jq -r '
   ] | .[0] // empty' "$MANIFEST")
 [ -n "$BADPATH" ] && die MANIFEST-BAD "This nest asks for something we will not do — it names $BADPATH. Refusing to restore it."
 # END landing-gate
+# ---- Home-folder model caches: what a nest may list there (format 2.14) -------
+# A `home` file is a model cache some node keeps under the home folder. It is put
+# inside $TARGET/.renest/home, never straight into your home folder, and only four
+# caches qualify: ~/.cache/huggingface/hub, ~/.rembg, ~/.transparent-background,
+# ~/.insightface. Anything else listed there -- ~/.bashrc, ~/.ssh/... -- is how a
+# hostile nest would try to plant something, so it is named loudly and goes ahead
+# only on an explicit yes (founder 2026-10-09: warn loudly, then ask; the Renest
+# agent refuses such a nest outright). A file called token or stored_tokens, and
+# program code outside the Hugging Face snapshots, count as "anything else".
+# confirm_home <question>: the same shape as confirm_archive_link. Yes typed at the
+# terminal, or RENEST_ACCEPT_HOME_WRITES=1 set in advance; otherwise it says how.
+# BEGIN home-allowlist -- the both-legs test runs exactly these lines, so they cannot drift
+confirm_home() {
+  if [ "${RENEST_ACCEPT_HOME_WRITES:-}" = "1" ]; then
+    warn "   RENEST_ACCEPT_HOME_WRITES=1 is set, so it goes ahead."
+    return 0
+  fi
+  if ( exec </dev/tty >/dev/tty ) 2>/dev/null; then
+    local _ans=""
+    printf '   %s Type yes to go ahead; anything else stops here: ' "$1" >/dev/tty
+    read -r _ans </dev/tty || _ans=""
+    if [ "$_ans" = "yes" ]; then
+      warn "   Going ahead because you typed yes."
+      return 0
+    fi
+  else
+    warn "   There is no terminal here to ask you on. To go ahead anyway, run the same command again with RENEST_ACCEPT_HOME_WRITES=1 in front of it."
+  fi
+  return 1
+}
+_HOME_ODD=$(jq -r '(.files // [])[] | select(type == "object") | select((.root // "env") == "home")
+  | (.path // "") | select(type == "string")
+  | select((test("^(\\.cache/huggingface/hub/models--[^/]+/(refs/[^/]+|snapshots/[0-9a-f]{40}/.+|\\.no_exist/[0-9a-f]{40}/.+)|\\.rembg/.+|\\.transparent-background/.+|\\.insightface/.+)$") | not)
+           or test("(^|/)(token|stored_tokens)$")
+           or ((startswith(".cache/huggingface/hub/") | not)
+               and (test("(^|/)(\\.venv|venv|site-packages|bin|Scripts)/") or test("\\.(py|pyc|pyd)$"))))' "$MANIFEST")
+while IFS= read -r _hp; do
+  [ -n "$_hp" ] || continue
+  warn "!! RISK: this nest lists a file for your home folder at ~/$_hp"
+  warn "   That is outside every model cache a nest may carry (~/.cache/huggingface/hub, ~/.rembg, ~/.transparent-background, ~/.insightface), or a credential, or program code -- and it is dangerous: it is how a hostile nest would try to plant ~/.bashrc or ~/.ssh/authorized_keys. A normal nest never needs this."
+  warn "   If you go ahead it is still only put inside $TARGET/.renest/home, never into your home folder."
+  confirm_home "Restore this nest anyway?" \
+    || die HOME-PATH "Stopped before downloading anything: this nest lists ~/$_hp, outside every model cache a nest may carry, and you did not confirm. Ask whoever packed it, or run this again and confirm (RENEST_ACCEPT_HOME_WRITES=1)."
+done <<<"$_HOME_ODD"
+# END home-allowlist
 # How many files a nest may list. Not a security limit — a sanity one: this script
 # starts a couple of processes per file, so a manifest with a million entries would
 # keep your machine busy all night without ever moving a byte worth having. A real
@@ -471,7 +527,8 @@ BADPATH=$(jq -r '
 N_FILES=$(jq '(.files // []) | length' "$MANIFEST")
 [ "$N_FILES" -gt 50000 ] && die MANIFEST-BAD "This nest lists $N_FILES files; we stop at 50000. A nest that big is nearly always a mistake — ask whoever packed it to split it up."
 # A home-cache path can only be used at all if we know where home is.
-HOME_FILES=$(jq '[.files[]? | select((.root // "env") != "env")] | length' "$MANIFEST")
+# (`home` files land inside $TARGET, so they need no HOME; see home-allowlist below.)
+HOME_FILES=$(jq '[.files[]? | select((.root // "env") != "env" and (.root // "env") != "home")] | length' "$MANIFEST")
 if [ "$HOME_FILES" -gt 0 ] && [ -z "${HOME:-}" ] && [ -z "${HF_HOME:-}" ] && [ -z "${HF_HUB_CACHE:-}" ]; then
   die TARGET-PERM "This nest keeps $HOME_FILES files in the model cache, but this machine has no HOME set. Set HF_HOME=/somewhere and run this again."
 fi
@@ -1073,6 +1130,37 @@ case "$EV_SOURCE" in
     log "This nest records evidence of the kind '$EV_SOURCE'. A newer Renest knows what that means; nothing here depends on it." ;;
 esac
 
+# ---- 3c. What the packing machine recorded as not carried (format 2.14) -------
+# Packing knows a few things this nest leaves out: files a node fetched for itself
+# that were not carried, a data file a node names that sits outside everything packed,
+# settings or a cache a node keeps under the home folder, packages whose GPU build
+# targets were not read in time. On the packing machine those were warnings that
+# scrolled away; here is where they matter, so each one gets a line. Told, never
+# enforced (2026-07-15 ruling): nothing here stops the run or changes the exit code.
+# A kind this script does not know gets the same line as any other.
+# BEGIN capture-gaps -- the both-legs test runs exactly these lines, so they cannot drift
+_GAP_LINES=$(jq -r '(.capture_gaps // []) | if type == "array" then .[] else empty end
+  | select(type == "object") | select((.subject | type) == "string" and (.subject | length) > 0)
+  | (if (.kind | type) == "string" and (.kind | length) > 0 then .kind else "unknown" end) as $k
+  | (if (.required | type) == "string" and (.required | length) > 0 then .required else "maybe" end) as $r
+  | (if (.detail | type) == "string" then .detail else "" end) as $d
+  | ("[" + $k + "] " + .subject + " ("
+     + ({"yes": "needed", "maybe": "may be needed", "cache": "cache"}[$r] // $r) + ")"
+     + (if ($d | length) > 0 then ": " + $d else "" end) | gsub("[\t\r\n]"; " "))
+    + "\t" + ($r | gsub("[\t\r\n]"; " "))' "$MANIFEST")
+_GAPS_N=0
+_GAPS_NEEDED=""
+while IFS=$'\t' read -r _gl _greq; do
+  [ -n "$_gl" ] || continue
+  _GAPS_N=$((_GAPS_N + 1))
+  warn "Not in this nest: $_gl"
+  if [ "$_greq" = "yes" ]; then
+    _GAPS_NEEDED="$_GAPS_NEEDED
+    $_gl"
+  fi
+done <<<"$_GAP_LINES"
+# END capture-gaps
+
 # ---- 3b. Can the dependency list be resolved at all? (format 2.11) ----------
 # Asked here, before a single code archive is downloaded, because the failure it
 # catches used to surface long after -- on a real machine, 2026-09-06, after 64 GB of
@@ -1303,6 +1391,74 @@ fi
 # END lock-precheck
 
 # ---- 4. Put the source code back --------------------------------------------
+# BEGIN archive-link-check -- the both-legs test runs exactly these lines
+# A code archive may hold links, and plain `tar -x` keeps a link whatever it points
+# at: /etc/passwd, ../../.ssh, anywhere. The Renest agent unpacks with Python's
+# "data" filter, which refuses a link whose target is absolute or lands outside the
+# folder being unpacked into; this is the same rule read off `tar -tv`, so the two
+# legs give the same verdict on the same archive. Lexical, after the same
+# strip-one-level the unpack does: a symlink resolves from its own folder, a hard
+# link from the top of the code folder; any `..` that climbs above it is outside.
+# Members are paired with their names by line (`tar -t` and `tar -tv` list the same
+# members in the same order), so the name is known exactly and only what follows
+# " -> " / " link to " after it is read as the target -- spaces in names are fine,
+# and GNU tar and bsdtar print both the same way.
+# archive_link_escape <archive.tar.gz> -> "<member> -> <target>" for the first link
+# that points outside, nothing when there is none.
+archive_link_escape() {
+  awk '
+    NR == FNR { name[FNR] = $0; next }
+    {
+      t = substr($0, 1, 1)
+      if (t != "l" && t != "h") next
+      m = name[FNR]
+      sep = (t == "l") ? " -> " : " link to "
+      i = index($0, " " m sep)
+      if (i == 0) next
+      target = substr($0, i + 1 + length(m) + length(sep))
+      k = split(m, p, "/"); n = 0
+      for (j = 1; j <= k; j++) if (p[j] != "" && p[j] != ".") n++
+      if (n < 2) next                      # dropped by the strip, never lands
+      if (substr(target, 1, 1) == "/") { print m " -> " target; exit }
+      k = split(target, p, "/")
+      depth = (t == "l") ? n - 2 : 0       # where the walk starts, below the code folder
+      skip = (t == "h") ? 1 : 0            # a hard link names a member: strip its top too
+      for (j = 1; j <= k; j++) {
+        if (p[j] == "" || p[j] == ".") continue
+        if (skip) { skip = 0; continue }
+        if (p[j] == "..") { depth--; if (depth < 0) { print m " -> " target; exit } }
+        else depth++
+      }
+    }
+  ' <(tar -tzf "$1" 2>/dev/null) <(tar -tvzf "$1" 2>/dev/null)
+}
+# confirm_archive_link <name> <member -> target>: the escape hatch does not refuse on
+# its own (founder 2026-10-09: warn loudly, then ask). It names the risk loudly and
+# goes ahead only on an explicit yes, typed at the terminal or set in advance with
+# RENEST_ACCEPT_ARCHIVE_LINKS=1. No terminal and no setting = no yes, so it stops and
+# says exactly how to go ahead.
+confirm_archive_link() {
+  warn "!! RISK: the code archive $1.tar.gz holds a link that points outside its own folder: $2"
+  warn "   Unpacked as it is, that link can make files from this nest land outside $TARGET, or point at files elsewhere on this machine. A normal nest never needs this. Go ahead only if you trust whoever packed it."
+  if [ "${RENEST_ACCEPT_ARCHIVE_LINKS:-}" = "1" ]; then
+    warn "   RENEST_ACCEPT_ARCHIVE_LINKS=1 is set, so it is unpacked as it is."
+    return 0
+  fi
+  if ( exec </dev/tty >/dev/tty ) 2>/dev/null; then
+    local _ans=""
+    printf '   Unpack it anyway? Type yes to go ahead; anything else stops here: ' >/dev/tty
+    read -r _ans </dev/tty || _ans=""
+    if [ "$_ans" = "yes" ]; then
+      warn "   Going ahead because you typed yes."
+      return 0
+    fi
+  else
+    warn "   There is no terminal here to ask you on. To go ahead anyway, run the same command again with RENEST_ACCEPT_ARCHIVE_LINKS=1 in front of it."
+  fi
+  return 1
+}
+# END archive-link-check
+
 STAGE="S2-place"
 log "Restoring source code…"
 _HOLLOW=""       # code folders whose archive held nothing; said again at the end
@@ -1315,6 +1471,14 @@ while read -r dep; do
   fetch_blob "$h" "$TARGET/.renest/archives/$name.tar.gz"
   mkdir -p "$path"
   # BEGIN code-dep-unpack -- the parity test runs exactly these lines, so they cannot drift
+  # A link that points outside the code folder is the one thing here that stops the
+  # run instead of telling you: unpacked, it would let the archive reach files that
+  # are not part of this nest. The Renest agent refuses the same archive.
+  _ESCAPE_LINK=$(archive_link_escape "$TARGET/.renest/archives/$name.tar.gz")
+  if [ -n "$_ESCAPE_LINK" ]; then
+    confirm_archive_link "$name" "$_ESCAPE_LINK" \
+      || die ARCHIVE-LINK "Stopped before unpacking $name.tar.gz: it holds a link that points outside its own folder ($_ESCAPE_LINK) and you did not confirm. Either the nest is packed again without that link, or you run this again and confirm (RENEST_ACCEPT_ARCHIVE_LINKS=1)."
+  fi
   tar -xzf "$TARGET/.renest/archives/$name.tar.gz" -C "$path" --strip-components=1
   # Nothing landed = that folder was a symlink when it was packed: tar stored the link
   # and not the tree, and stripping the top level leaves no member at all. The archive
@@ -1370,12 +1534,15 @@ called_programs() {
       done
     done | awk '!seen[$1]++' || true
 }
+_CP_MISSING=""
 if ! command -v ffmpeg >/dev/null 2>&1; then
   while IFS=$'\t' read -r _cp_role _cp_name _cp_path; do
     [ "$_cp_role" = extension ] && _cp_label="custom node $_cp_name" || _cp_label="$_cp_name"
     while read -r _cp_prog _cp_file; do
       [ -n "$_cp_prog" ] || continue
       warn "$_cp_label runs $_cp_prog ($_cp_file), and ffmpeg is not on this machine, so that node will fail when it runs it. This script does not install system programs. To add it: sudo apt-get install -y ffmpeg (Debian/Ubuntu; leave out sudo as root; or your system's package manager). Carrying on — nothing else depends on it."
+      _CP_MISSING="$_CP_MISSING
+    $_cp_label runs $_cp_prog ($_cp_file)"
     done < <(called_programs "$TARGET/$_cp_path")
   done < <(jq -r '.code_deps[]? | select(.role != "host") | [(.role // "-"), .name, .install_path] | @tsv' "$MANIFEST")
 fi
@@ -1915,6 +2082,70 @@ if [ -n "$_YOURS" ]; then
   warn "  Put each file back at the path listed above before the first run, or the app will stop looking for it."
 fi
 
+# ---- Home-folder model caches: where they are, and the one that needs your home ----
+# They landed inside $TARGET/.renest/home. Each library has its own setting to be
+# pointed there -- except insightface, which only ever looks in ~/.insightface, so
+# those files are copied there, on an explicit yes, never over a different file.
+# BEGIN home-caches -- the both-legs test runs exactly these lines, so they cannot drift
+_HOME_EXPORTS=""
+_hc_n() {
+  jq --arg p "$1" '[(.files // [])[] | select(type == "object") | select((.root // "env") == "home")
+    | select((.path | type) == "string" and (.path | startswith($p)))] | length' "$MANIFEST"
+}
+if [ "$(_hc_n .cache/huggingface/hub/)" -gt 0 ]; then
+  _HOME_EXPORTS="$_HOME_EXPORTS
+    export HF_HUB_CACHE=\"$TARGET/.renest/home/.cache/huggingface/hub\""
+fi
+if [ "$(_hc_n .rembg/)" -gt 0 ]; then
+  _HOME_EXPORTS="$_HOME_EXPORTS
+    export REMBG_HOME=\"$TARGET/.renest/home/.rembg\""
+fi
+if [ "$(_hc_n .transparent-background/)" -gt 0 ]; then
+  _HOME_EXPORTS="$_HOME_EXPORTS
+    export TRANSPARENT_BACKGROUND_FILE_PATH=\"$TARGET/.renest/home\""
+fi
+if [ -n "$_HOME_EXPORTS" ]; then
+  log "Model caches this nest carries are inside $TARGET/.renest/home. Start the app with these set, so it finds them there:$_HOME_EXPORTS"
+fi
+_HOME_WRITES=$(jq -r '(.files // [])[] | select(type == "object") | select((.root // "env") == "home")
+  | (.path // "") | select(type == "string") | select(startswith(".insightface/"))
+  | select(test("^(\\.cache/huggingface/hub/models--[^/]+/(refs/[^/]+|snapshots/[0-9a-f]{40}/.+|\\.no_exist/[0-9a-f]{40}/.+)|\\.rembg/.+|\\.transparent-background/.+|\\.insightface/.+)$")) | select(test("(^|/)\\.\\.(/|$)") | not)
+  | select(test("(^|/)(token|stored_tokens)$") | not)
+  | select((test("(^|/)(\\.venv|venv|site-packages|bin|Scripts)/") or test("\\.(py|pyc|pyd)$")) | not)' "$MANIFEST")
+if [ -n "$_HOME_WRITES" ] && [ -z "${HOME:-}" ]; then
+  warn "This nest carries files insightface reads from the home folder, but this machine has no HOME set, so they stay in $TARGET/.renest/home/.insightface."
+  _HOME_WRITES=""
+fi
+if [ -n "$_HOME_WRITES" ]; then
+  warn "!! This nest carries files that insightface reads from your home folder only -- it has no setting to look anywhere else. To be used they have to be copied there, outside $TARGET:"
+  while IFS= read -r _hp; do
+    [ -n "$_hp" ] && warn "     ~/$_hp"
+  done <<<"$_HOME_WRITES"
+  warn "   A file already there with different bytes is never overwritten."
+  if confirm_home "Copy them into your home folder?"; then
+    _HOME_COPIED=0
+    while IFS= read -r _hp; do
+      [ -n "$_hp" ] || continue
+      _src="$TARGET/.renest/home/$_hp"
+      _dst="${HOME:-}/$_hp"
+      [ -f "$_src" ] || continue
+      if [ -e "$_dst" ] || [ -L "$_dst" ]; then
+        if [ -f "$_dst" ] && [ ! -L "$_dst" ] && [ "$(sha256_of "$_dst")" = "$(sha256_of "$_src")" ]; then
+          continue
+        fi
+        warn "   Kept your own ~/$_hp: it is different from the one in this nest. The nest's copy is at $_src."
+        continue
+      fi
+      mkdir -p "$(dirname "$_dst")"
+      cp "$_src" "$_dst.renest-part" && mv "$_dst.renest-part" "$_dst"
+      _HOME_COPIED=$((_HOME_COPIED + 1))
+    done <<<"$_HOME_WRITES"
+    log "Copied $_HOME_COPIED file(s) into ${HOME:-}/.insightface -- the one place this restore wrote outside $TARGET."
+  else
+    die HOME-WRITE "Stopped before writing into your home folder. Everything else is restored and checked. To finish, run this again with RENEST_ACCEPT_HOME_WRITES=1 in front of it, or copy the files yourself from $TARGET/.renest/home/.insightface to ~/.insightface, keeping any file already there."
+  fi
+fi
+# END home-caches
 rm -f "$FAILFILE"
 log "✅ Done. Every file checked, byte for byte. Your setup is back."
 log "   Moving files ${XFER_SECS}s / dependencies $((T_DEPS_END - T_DEPS_START))s / checking $((T_VERIFY_END - T_VERIFY_START))s"
@@ -1968,3 +2199,21 @@ if [ -n "${_HOLLOW:-}" ]; then
   warn "Read this before you call it done: these code folder(s) arrived empty:$_HOLLOW"
   warn "   Their archives match this nest byte for byte and hold nothing to unpack. Nothing on this machine can fix that — whoever packed it has to replace the symlink with the real folder and pack again."
 fi
+# Same reason again: ffmpeg was named right after the code was unpacked, long before
+# "Your setup is back". The files are all here, but the node that runs it fails on first
+# use, so the last words on screen must say this is not the whole setup yet.
+# BEGIN called-programs-recap -- the both-legs test runs exactly these lines
+if [ -n "${_CP_MISSING:-}" ]; then
+  warn "Read this before you call it done: not complete yet -- ffmpeg is not on this machine, and restored code runs it:$_CP_MISSING"
+  warn "   Every file is back and checked, but that code will fail until ffmpeg is installed: sudo apt-get install -y ffmpeg (Debian/Ubuntu; leave out sudo as root; or your system's package manager)."
+fi
+# END called-programs-recap
+# Same reason as the recaps above: the gaps were listed before the download. Only one
+# the packing machine marked as needed makes this "not complete"; the rest is a pointer.
+# BEGIN capture-gaps-recap -- the both-legs test runs exactly these lines
+if [ -n "${_GAPS_NEEDED:-}" ]; then
+  warn "Read this before you call it done: restored, but not complete -- the machine this was packed on recorded that this nest does not carry what the run needs:$_GAPS_NEEDED"
+elif [ "${_GAPS_N:-0}" -gt 0 ]; then
+  log "   Packing recorded $_GAPS_N thing(s) this nest does not carry (listed near the start); none is marked as needed by the run."
+fi
+# END capture-gaps-recap

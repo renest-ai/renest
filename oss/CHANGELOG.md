@@ -2,6 +2,220 @@
 
 What changed for the person using `renest`. Dates are the release date.
 
+## 0.1.22 — 2026-10-11
+
+**Restoring with `restore.sh`:** a nest packed with 0.1.22 needs the `restore.sh` from 0.1.22 or later.
+Older copies stop at the new place this format keeps model caches. The copy inside each nest
+(`.renest/escape/restore.sh`) always matches the nest, so use that one.
+
+### `renest restore` no longer asks you to install a library it has just installed
+When the machine lacked a system library the working run used, `renest restore` offered to
+install it, installed it, and then closed the same run with "this machine is missing 1
+library file(s)" and the `apt-get install` command for it. The report said the same
+(`machine_libraries_missing`, `environment_warning`). Running that command only got
+"already the newest version". Restore now looks at the machine again after it installs
+anything, so the closing lines, `restore-report.json` and the `--json` result describe the
+machine as it is: what was installed is no longer named, and what is still missing (an
+install you declined, one that failed, or a library renest knows no package for) is named
+as before, with the command. `restore.sh` is unchanged: it never installs anything.
+
+### Nest format 2.14: model caches some nodes keep under the home folder now travel
+Popular nodes download real weights into caches under the home folder rather than into
+`models/`: Hugging Face's cache (CLIPSeg, grounding-dino), rembg (`~/.rembg`),
+transparent-background (`~/.transparent-background`) and insightface (`~/.insightface`).
+No nest carried them, so a new machine downloaded them again, or failed when the source
+was gone or wanted a login. `renest pack` now carries the files the working run used from
+those four caches (and only those four; a cache is never copied whole): files the running
+ComfyUI holds open, or that appeared while the run went. Each goes through the same
+checksum, credential scan and licence lookup as any model; Hugging Face's access token is
+never carried.
+
+On restore they land **inside the restore folder**, under `.renest/home/`, and the app is
+started with `HF_HUB_CACHE`, `REMBG_HOME` and `TRANSPARENT_BACKGROUND_FILE_PATH` pointing
+there (`renest start` does this by itself; the closing lines print them for a hand-built
+start command). insightface has no such setting, so its files are also copied into
+`~/.insightface`: every file is named first, a nest someone handed you stops and asks
+(`--trust-sender` or `--yes` answers), and a file already there with different bytes is
+never overwritten. `restore.sh` prints the `export` lines, and copies the insightface files
+only after you type `yes` or set `RENEST_ACCEPT_HOME_WRITES=1`. A nest that lists anything
+else under the home folder (`~/.bashrc`, `~/.ssh/...`) is refused by `renest restore`;
+`restore.sh` warns that it is dangerous and goes ahead only on an explicit yes, and even
+then puts the file inside the restore folder, never in your home folder.
+
+Hugging Face also keeps empty markers for the files a model repository does not have
+(`.no_exist/<revision>/`, for example `processor_config.json` on CLIPSeg). They now travel
+with the revision they belong to, so the restored cache does not ask huggingface.co about
+those files again. Only empty files are carried from there. An empty file holds no
+content, so it is never treated as restricted and pack does not ask for a download
+address for it; restore writes it without downloading anything.
+
+### The test render runs offline when the nest carries Hugging Face files
+Restoring a nest with Hugging Face model files rendered the same picture without
+downloading anything, but every load still asked huggingface.co for metadata. The app
+that `renest restore` starts for its test render now runs with `HF_HUB_OFFLINE=1` when the
+nest carries Hugging Face files, so a passing render shows the nest brought everything
+the run reads. If you set `HF_HUB_OFFLINE` yourself, your value is used. If the render
+stops because a file did not travel with the nest, the restore says so and tells you to
+run it again with `HF_HUB_OFFLINE=0`. `renest start` does not turn the network off: a node
+may fetch a new model later, and Hugging Face reads from the cache by itself when the
+network is down.
+
+### `pack --json` no longer lists carried files as not packed
+When pack carried files the working run fetched for itself (or files you named with
+`--add`), the printed warnings stopped naming them, but `capture_report.gaps` in `--json`
+still said "… is NOT packed … pack again with --add" for each one. The gap lines are now
+written again from what is actually left behind, in both places.
+
+### What a nest does not carry is now written into it, and said again on restore
+The list `renest pack` ends with (files the run fetched but did not need, data files a
+node names outside the nest, a node's settings under `~/.config`, caches, packages whose
+GPU build targets were not read) is now part of the nest as `capture_gaps` (format 2.14).
+`renest restore` and `restore.sh` print it near the start, one line each. The closing words
+say "Restored, but not complete" only for an entry marked as needed by the run; the exit
+code never changes. `--json` readers get it in the result. For packages whose GPU build
+targets were never read, the card check now says "unknown — not read at pack time" instead
+of counting them as covered.
+
+### Pack carries the files the working run fetched for itself
+Some nodes download their own models the first time they run: a face-swap node put 13
+files under `ComfyUI/models/`, a captioning node put 18 files (3.1 GB) there. `renest pack`
+used to only name them and give you `--add` lines to paste. Now, when ComfyUI is still
+running, pack works out when that ComfyUI started and when the picture the nest records
+was written, and carries every file that appeared in between in a folder ComfyUI loads
+models from (`models/` and `extra_model_paths.yaml` folders; temporary folders never
+count, and a model copied in by hand with its old date kept does not match). A new file in a
+folder ComfyUI loads by name (`checkpoints/`, `loras/`, `diffusion_models/`, ...) is carried
+only when ComfyUI is holding it: the recipe names what it loads from those, and anything else
+there is a download for later, so it is named instead. Each carried
+file is listed with its size, and goes through the same checksum and licence lookup as any
+other model: a file nobody vouches for is restricted, so it is never handed to someone
+else. When ComfyUI is holding one weight file open and another one appeared beside it
+(the same weights saved twice), the one it is not using is left out and named. When pack
+cannot tell, it carries them all and says so. With no picture to measure against (a
+`--workflow` that never ran here, or ComfyUI restarted since), nothing is carried on a
+guess: the files are named, with the `--add` command, as before.
+
+Pack also ends with a short list of what the nest does not carry: those files, data files
+a node names that sit outside the nest, settings a node keeps under `~/.config`, the cache
+a node fills under `~/.cache`, and packages whose GPU build targets were not read in time.
+`--json` gives the same list as `capture_gaps`.
+
+### A model in a folder a node named itself no longer makes an invalid nest
+A model packed from a folder under `models/` that ComfyUI does not know (a node's own
+`LLM/` or `facerestore-models/`) had that folder name copied into the nest as its type,
+capitals and dashes included, and `renest lint` rejected the nest. The type is now written
+in lower case with `_` for anything else.
+
+### The card check now hears about small compiled extensions, not just the big libraries
+When packing, `renest` reads which GPU generations each installed compiled package was
+built for, so the check before a restore can warn when a card is not covered. That reading
+has a time limit, and it used to spend it on PyTorch and the NVIDIA runtime libraries,
+hundreds of MB each. Packages that sort alphabetically after `nvidia` (SageAttention, for
+one) were never read. Those are the extensions most likely to be built for one card only.
+Separately built extensions are now read first, PyTorch and the NVIDIA libraries last, four
+at a time. If the limit still runs out, `renest pack` names the packages it did not get to
+instead of leaving them out silently.
+
+### restore.sh warns before unpacking a code archive whose links point outside it
+`renest restore` already refused a code archive holding a link whose target is an
+absolute path or leads out of the folder being unpacked. The standalone `restore.sh`
+unpacked the same archive and kept the link without a word. It now lists each code archive
+before unpacking it and, if it finds such a link, says plainly what the risk is and asks you
+to confirm: type `yes` at the terminal, or set `RENEST_ACCEPT_ARCHIVE_LINKS=1` beforehand.
+With your confirmation it unpacks the archive as it is; without it, it stops before
+unpacking and says how to go ahead. Links that stay inside the folder unpack as before.
+
+### A handed-off nest says its custom nodes are the sender's code
+When someone hands you a nest that carries custom nodes, the "Handed to you by …" line now
+adds: "Custom nodes in this nest are the sender's code and run on this machine when the
+app starts." Setup commands and unrecognised download sources still stop and ask, as
+before.
+
+### Restore names files the app fetched for itself while it ran
+Some nodes fetch their own model files the first time they run (a face-swap node fetched
+8 files, about 0.88 GB). On an online machine the restore's test render still worked and
+the restore said nothing, so a nest that was short of those files looked complete.
+Restore now lists, per folder, the files that appeared under the restore folder while the
+app started and ran and that the nest does not carry, with their sizes; says the app most
+likely fetched them from the network, so a machine without internet access would most
+likely fail there; and gives the `--add` flags to carry them next time. It is information
+only: the result and the exit code do not change. `--json` readers get the same in
+`fetched_while_running`. Renders, previews, settings and caches the app writes for itself
+(`output/`, `temp/`, `user/`, `__pycache__`) are not counted.
+
+### The card check sees packages built from source and stored in the nest
+A package installed from a git repository is stored in the nest as its built wheel. What
+its compiled files were built for was not recorded, so the check before a restore said
+every compiled extension could run on a card it was never built for (SageAttention built
+on an RTX 4090 for sm_89 only, restored to an sm_86 card). Pack now reads the stored
+wheel itself and records its build targets with the other packages', and the check names
+such a package on a card it does not cover. As for any other package, it is a warning,
+never a refusal.
+
+### CUDA libraries the Python packages carry are no longer machine requirements
+Packed on a CUDA "devel" image, a run can load a CUDA library (for example
+`libcublasLt.so.12`) from the image's CUDA toolkit while the environment's NVIDIA Python
+packages carry the same library. Pack recorded it as a system library the restore machine
+had to install (`libcublas-12-8`), a package only NVIDIA's own package source has, so a
+restore on an image with the usual Ubuntu sources stopped before downloading anything.
+Pack now leaves such a library off the machine list and says why. Separately, when
+restore tries to install a package and the machine's package sources do not have it, it
+no longer tells you to run that same install again: it says the package is not in this
+machine's sources, and gives the two ways on (`--force` to go ahead, which works if the
+nest's Python packages provide the library, or the image the nest was packed on).
+
+### A damaged code archive fails with a plain sentence
+When a code folder's archive held a link to a file the archive does not contain, restore
+stopped with only `KeyError: linkname '...' not found`. It now names the folder, says the
+archive is damaged, and that re-running will not help: whoever packed it needs to pack it
+again.
+
+### Symlinks that point outside the environment no longer break the restore
+A code folder holding a symlink to somewhere outside the environment (an absolute path,
+or a relative one that leads out of it) used to pack the link as it was. The link
+carried this machine's path, often a home folder with your user name, and restore
+refused to unpack it, so the whole restore stopped while packing had said the link would
+only come back dead. Such links are now left out of the code archive and not followed;
+pack names each one, and the manifest lists it under that folder's `exclude`. Links that
+stay inside the environment travel as before.
+
+### Packing your own folder from outside the environment shows how much goes in
+When a package installed editable from a folder outside the environment is carried into
+the nest, pack (and `--dry-run`) now says how many files and how many bytes of that
+folder go in. Sizes in the dry run no longer count what a symlink points at, since only
+the link would travel.
+
+### A credential in a `.env` file is reported once, not contradicted
+When a `.env` (or another file with a credential-like name) held something shaped like a
+token, pack stopped and named it, but also printed "We did not find a credential in it"
+about the same file. That second line is gone for files the scan stopped on.
+
+### When ffmpeg could not be installed, the last words say so
+If a custom node runs ffmpeg and restore could not install it (no root and sudo asks for
+a password, no package manager it can drive, you said no, or the install failed), the
+restore still finishes, but its closing line used to be a plain "✅ Done". It now starts
+"Restored, but not complete", names ffmpeg, the node that runs it and the command to
+install it. `--json` readers get the same in `machine_programs_missing` on the result
+event. A failed install at that point no longer says the files "have not been downloaded
+yet": they have. The escape hatch `restore.sh` repeats its ffmpeg notice after "Your
+setup is back" as well.
+
+### Models inside a node's folder are recognised by what they are, not by their name
+Since 0.1.21, a model file that a custom node keeps in its own folder leaves the node's code
+archive and gets its own licence check, so a hand-off does not pass it on under the node's
+licence. That only caught the usual model file endings (`.safetensors`, `.pth`, `.ckpt` and
+a few more). A model saved as `.pkl`, `.npy`, `.h5`, `.zip`, or with no extension at all,
+still went inside the code archive. Pack now looks at the file's contents: pickles, zip and
+other archives, NumPy, HDF5, GGUF, safetensors and TFLite files from 64 KiB up, and any other
+non-text file of 1 MiB or more that is not a program, image, font, audio, video or PDF, are
+stored as files of their own. Whatever we cannot confirm may be passed on stays restricted:
+your own restores get it, a hand-off does not. This is about passing files on only, not about
+how you or anyone else may use them. The same applies to folders installed from outside the
+environment (`local-packages/`), to files you name with `--add` (a model put in the input
+folder is no longer treated as your own input material), and to a second copy of a file the
+nest already lists, which now leaves the code archive under the listed copy's licence. Icons,
+fonts, web files, text and small data files stay with the code.
+
 ## 0.1.21 — 2026-10-09
 
 ### `pack --dest hosted` now says that it reports progress, and what

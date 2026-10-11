@@ -35,9 +35,19 @@ __all__ = [
     "ENV_ROOT_TOKEN",
     "tokenise_env_root",
     "resolve_env_root_token",
+    "HOME_ROOT_DIR",
+    "HOME_CACHE_PREFIXES",
+    "HOME_WRITE_PREFIXES",
+    "HOME_CACHE_ENV",
+    "HOME_NEVER_CARRY",
+    "carries_hf_hub",
+    "home_paths",
+    "home_cache_env",
+    "home_cache_env_rel",
+    "home_writes",
 ]
 
-FILE_ROOTS = ("env", "hf_hub", "hf_home")
+FILE_ROOTS = ("env", "hf_hub", "hf_home", "home")
 
 #: How many files one nest may hold at most: 50,000.
 #: The 32 MB size ceiling (`config.JSON_SOURCE_MAX_BYTES`) still leaves room for a hundred
@@ -53,6 +63,14 @@ MAX_MANIFEST_FILES = 50_000
 ROOT_PATH_PATTERNS: dict[str, re.Pattern[str]] = {
     "hf_hub": re.compile(r"^models--[^/]+/(refs/[^/]+|snapshots/[0-9a-f]{40}/.+)$"),
     "hf_home": re.compile(r"^accelerate/[^/]+\.yaml$"),
+    # Format 2.14: model caches some nodes keep under the home folder (see HOME_CACHE_PREFIXES
+    # below; this pattern is the same list, spelled out once more for the schema mirror).
+    # ``.no_exist/<commit>/...``: Hugging Face's own record of a file it asked for and the
+    # repository does not have (empty files). Without them a restored cache asks the
+    # network again for every optional file on the first load (U7, 2026-10-11).
+    "home": re.compile(r"^(\.cache/huggingface/hub/models--[^/]+/"
+                       r"(refs/[^/]+|snapshots/[0-9a-f]{40}/.+|\.no_exist/[0-9a-f]{40}/.+)"
+                       r"|\.rembg/.+|\.transparent-background/.+|\.insightface/.+)$"),
 }
 
 
@@ -80,6 +98,10 @@ def resolve_file_root(root: str, env_root: Path, env: Mapping[str, str] | None =
         if e.get("HF_HOME"):
             return Path(e["HF_HOME"])
         return home / ".cache" / "huggingface"
+    if root == "home":
+        # Inside the restore target, never the restoring user's home folder: the app is
+        # started with each library's own setting pointed here (home_cache_env).
+        return env_root / HOME_ROOT_DIR
     return env_root
 
 
@@ -170,6 +192,15 @@ def bad_root_entry(f: object) -> str | None:
     pat = ROOT_PATH_PATTERNS.get(root)
     if pat is not None and not pat.match(str(p)):
         return f"a path that is not allowed under {root}: {p!r}"
+    if root == "home":
+        # Never a credential, whatever folder it sits in (Hugging Face keeps the access
+        # token beside the hub cache). And outside the Hugging Face snapshots -- which may
+        # hold a model's own modeling_*.py, as the hf_hub root allows -- no program code.
+        if PurePosixPath(str(p)).name in HOME_NEVER_CARRY:
+            return f"a credential file, which never travels: {p!r}"
+        if not str(p).startswith(".cache/huggingface/hub/"):
+            return code_position(str(p))
+        return None
     # Check four covers the env root only -- the two model cache roots are not
     # on any execution path, and the allowlist above already pins their shape
     # to a specific commit of a specific HF repository (full reasoning in the
@@ -295,3 +326,89 @@ def tokenise_env_root(lock_text: str, env_root: Path) -> tuple[str, int]:
 def resolve_env_root_token(lock_text: str, env_root: Path) -> str:
     """Rebuild end: swap the token back for this machine's rebuild root."""
     return lock_text.replace(ENV_ROOT_TOKEN, str(Path(env_root).resolve()))
+
+
+# -- The home-cache root (format 2.14) ----------------------------------------
+# Some nodes keep the weights they download under the home folder, not in models/:
+# Hugging Face's hub cache (CLIPSeg, grounding-dino), rembg (~/.rembg), the
+# transparent-background package (~/.transparent-background), insightface
+# (~/.insightface). Measured on Spark 2026-10-10 against current releases.
+#
+# **These files never land in the restoring user's home folder by default.** They land
+# inside the restore target, at ``<target>/.renest/home/<the same relative path>``, and
+# the app is started with each library's own setting pointed there. Only insightface has
+# no such setting (its root is a function default); its files are copied into
+# ``~/.insightface`` as a separate, named step -- asked about for a handed-on nest, never
+# overwriting a different file -- see :func:`home_writes`.
+HOME_ROOT_DIR = ".renest/home"
+
+#: Path prefixes a ``home`` entry may have, relative to the home folder. An allowlist:
+#: anything else (``.bashrc``, ``.ssh/...``) is refused by the product and needs an
+#: explicit confirmation in the escape hatch.
+HOME_CACHE_PREFIXES = (".cache/huggingface/hub/", ".rembg/", ".transparent-background/",
+                       ".insightface/")
+
+#: The prefixes whose files must also be written into the real home folder, because the
+#: library reading them has no setting to look elsewhere.
+HOME_WRITE_PREFIXES = (".insightface/",)
+
+#: Which setting points each library at the copy inside the restore target. Values are
+#: relative to the target. TRANSPARENT_BACKGROUND_FILE_PATH names the folder that holds
+#: ``.transparent-background``; REMBG_HOME the rembg data folder itself (rembg 2.0.85,
+#: ``sessions/base.py``; U2NET_HOME would switch it to the old flat layout, so it is not
+#: used); HF_HUB_CACHE the hub cache itself.
+HOME_CACHE_ENV = (
+    (".cache/huggingface/hub/", "HF_HUB_CACHE", f"{HOME_ROOT_DIR}/.cache/huggingface/hub"),
+    (".rembg/", "REMBG_HOME", f"{HOME_ROOT_DIR}/.rembg"),
+    (".transparent-background/", "TRANSPARENT_BACKGROUND_FILE_PATH", HOME_ROOT_DIR),
+)
+
+#: Never carried from a home cache, whatever the run did: Hugging Face keeps the
+#: user's access token(s) next to the hub cache.
+HOME_NEVER_CARRY = frozenset({"token", "stored_tokens"})
+
+
+def carries_hf_hub(manifest: Mapping) -> bool:
+    """Does this nest carry anything from a Hugging Face hub cache (either root)?"""
+    for f in manifest.get("files") or []:
+        if not isinstance(f, Mapping) or not isinstance(f.get("path"), str):
+            continue
+        if f.get("root") == "hf_hub" or (
+                f.get("root") == "home" and f["path"].startswith(".cache/huggingface/hub/")):
+            return True
+    return False
+
+
+def home_paths(manifest: Mapping) -> list[str]:
+    """The ``path`` of every ``files[]`` entry under the ``home`` root."""
+    return [str(f.get("path")) for f in manifest.get("files") or []
+            if isinstance(f, Mapping) and f.get("root") == "home"
+            and isinstance(f.get("path"), str)]
+
+
+def home_cache_env(manifest: Mapping, target: Path) -> dict[str, str]:
+    """The settings to start the app with so each library finds its cache inside the
+    restore target: only for the caches this nest carries."""
+    return {var: str(Path(target) / rel) for var, rel in home_cache_env_rel(manifest).items()}
+
+
+def home_cache_env_rel(manifest: Mapping) -> dict[str, str]:
+    """:func:`home_cache_env` with each value relative to the restore target -- the form
+    ``renest start`` keeps in its facts file, joined again when it starts the app."""
+    paths = home_paths(manifest)
+    return {var: rel for prefix, var, rel in HOME_CACHE_ENV
+            if any(p.startswith(prefix) for p in paths)}
+
+
+def home_writes(manifest: Mapping, target: Path, home: Path) -> list[tuple[Path, Path]]:
+    """``(the copy inside the target, where it goes under the home folder)`` for each file
+    that must also be written into the real home folder (insightface). Allowlist-checked
+    again here, on the restoring machine -- never trusting that packing did it."""
+    out: list[tuple[Path, Path]] = []
+    for p in home_paths(manifest):
+        if bad_root_entry({"root": "home", "path": p}) is not None:
+            continue
+        if not p.startswith(HOME_WRITE_PREFIXES):
+            continue
+        out.append((Path(target) / HOME_ROOT_DIR / p, Path(home) / p))
+    return out

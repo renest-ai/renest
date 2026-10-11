@@ -55,6 +55,7 @@ from .doctor import (
     LEVEL_WARNING,
     PRECHECK_CLASS,
     PrecheckReport,
+    check_system_layer,
     compare_fingerprint,
     python_is_obtainable,
     run_precheck,
@@ -84,13 +85,20 @@ from .roots import (
     ROOT_PATH_PATTERNS,
     bad_entrypoint_env,
     bad_root_entry,
+    carries_hf_hub,
     materialise_entrypoint_env,
+    home_cache_env,
+    home_cache_env_rel,
+    home_writes,
     resolve_env_root_token,
     resolve_file_root,
     unsafe_relpath,
 )
 from .wheels import audit_lock_urls, dead_wheel_fallback, unfingerprinted_packages
 from . import systools
+from .unlisted import notable_folders, unlisted_files
+from .gaps import gap_line, has_required, valid_gaps
+from .unlisted import snapshot as unlisted_snapshot
 from .envlock import canonical_name
 from .vendored import substitute_vendored, vendored_requirement, wheel_fit
 from .uvbin import uv_executable
@@ -128,13 +136,13 @@ __all__ = [
     "restore",
 ]
 
-FORMAT_VERSION = "2.13"
+FORMAT_VERSION = "2.14"
 # 2.0 made `code_deps[].role` mandatory and dropped 1.3, so that the consumer
 # side need not sniff /custom_nodes/ paths forever. 2.1 through 2.11 only added
 # fields or relaxed required ones, so **every 2.x package still reads** —
 # nothing here may tighten without a version bump.
 SUPPORTED_FORMAT_VERSIONS = ("2.0", "2.1", "2.2", "2.3", "2.4", "2.5", "2.6", "2.7", "2.8",
-                             "2.9", "2.10", "2.11", "2.12", "2.13")
+                             "2.9", "2.10", "2.11", "2.12", "2.13", "2.14")
 
 
 def _highest_version(versions: tuple[str, ...]) -> str:
@@ -895,6 +903,12 @@ def whats_next_lines(
             env_note = " (with " + ", ".join(f"{k}={v}" for k, v in kvs.items()) + " set)"
         except ValueError:
             env_note = ""  # S4's own refusal names the problem; don't paraphrase it
+    # Format 2.14: the model caches this nest put inside the restore folder. `renest
+    # start` sets these by itself; a hand-built start command has to say them.
+    _hce = home_cache_env(manifest, target)
+    if _hce:
+        env_note = ((env_note[:-len(" set)")] + ", " if env_note else " (with ")
+                    + ", ".join(f"{k}={v}" for k, v in _hce.items()) + " set)")
 
     if oneshot is not None:
         # A fine-tuning nest: the run finished; the person's work starts from
@@ -1015,6 +1029,7 @@ def write_start_facts(
     listen_port: int | None,
     sidebar_workflow: str | None = None,
     sidebar_source: Path | None = None,
+    home_env: Mapping[str, str] | None = None,
 ) -> Path | None:
     """Leave behind what ``renest start`` needs to re-run the entrypoint.
 
@@ -1041,6 +1056,10 @@ def write_start_facts(
         # so a start.json an older restore left behind is never read as this.
         "listen_port": listen_port,
     }
+    if home_env:
+        # Format 2.14: where each library finds the model cache this nest put inside the
+        # restore folder; relative to it, joined again by `renest start`.
+        facts["home_cache_env"] = dict(home_env)
     if sidebar_workflow:
         facts["sidebar_workflow"] = sidebar_workflow
         if sidebar_source is not None:
@@ -1902,9 +1921,13 @@ class ComfyUILauncher:
         python_bin: Path,
         log_path: Path,
         entrypoint: dict | None = None,
+        extra_env: Mapping[str, str] | None = None,
     ) -> LaunchHandle:
         """Read the command and the probe from ``manifest.entrypoint``; absent or
         not a service falls back to the legacy hard-coded shape.
+
+        ``extra_env``: settings added on top of this process's environment -- the
+        home-cache redirects (:func:`renest.roots.home_cache_env`, format 2.14).
 
         Two argv adaptations stay here as adapter-layer knowledge, out of the
         core format: a python ``argv[0]`` is swapped for the interpreter we
@@ -1939,6 +1962,7 @@ class ComfyUILauncher:
             cwd=str(app_dir),
             stdout=logf,
             stderr=subprocess.STDOUT,
+            env={**os.environ, **extra_env} if extra_env else None,
         )
         handle = LaunchHandle(proc=proc, port=port, log_path=log_path, logf=logf, smoke_path=smoke_path)
         url = f"http://127.0.0.1:{port}{ready_path}"
@@ -2309,6 +2333,28 @@ class RestoreReport:
     #: may never touch those nodes — but the reader must be told, not left with a
     #: green tick and a quietly degraded environment.
     plugins_degraded: list[dict] = field(default_factory=list)
+    #: Programs the restored code starts by name (ffmpeg for video nodes) that are still
+    #: not on this machine at the end -- no privilege to install, no package manager,
+    #: declined, or the install failed. One entry per program:
+    #: ``{"program": ..., "needed_by": ..., "install_command": ...}``. Warn-only (the rest
+    #: of the environment runs), but the closing words must not read as a full success.
+    programs_missing: list[dict] = field(default_factory=list)
+    #: Files that appeared under the restore folder while the app started and ran its
+    #: test render, and that the nest does not carry (batch 24: a face-swap node fetched
+    #: 8 model files, ~0.88 GB, and the online test render hid it). One entry per
+    #: folder: ``{"folder", "files", "size_bytes", "paths"}``. **Information only**:
+    #: the verdict and the exit code never move on it.
+    fetched_while_running: list[dict] = field(default_factory=list)
+    #: What the packing machine recorded this nest does not carry (manifest
+    #: ``capture_gaps``, :mod:`renest.gaps`), shape-checked and copied for ``--json``
+    #: readers. Only an entry with ``required: "yes"`` turns the closing words into
+    #: "Restored, but not complete"; the exit code never moves on it.
+    capture_gaps: list[dict] = field(default_factory=list)
+    #: Files written into the restoring user's home folder (format 2.14, insightface only):
+    #: ``{"path", "status"}`` with status ``written`` / ``already_there`` /
+    #: ``kept_yours`` (a different file was there; never overwritten) /
+    #: ``missing_in_restore``.
+    home_files: list[dict] = field(default_factory=list)
     #: End-of-run words ("Done", where things landed, what's next). Collected
     #: here and printed by the CLI **after** the json document: printed inside
     #: restore() they landed above it and scrolled away under it (2026-09-13,
@@ -2345,6 +2391,10 @@ class RestoreReport:
             "check_only": self.check_only,
             "plan": self.plan,
             "plugins_degraded": self.plugins_degraded,
+            "programs_missing": self.programs_missing,
+            "fetched_while_running": self.fetched_while_running,
+            "capture_gaps": self.capture_gaps,
+            "home_files": self.home_files,
             "closing_lines": self.closing_lines,
         }
 
@@ -3244,6 +3294,49 @@ def every_missing_library(hit: list[str], precheck: dict | None) -> list[str]:
     return out
 
 
+def capture_gaps_heading(gaps: list[dict]) -> str:
+    """The line above the list of what the packing machine recorded as not carried."""
+    return (f"The machine this nest was packed on recorded {len(gaps)} thing(s) it does "
+            f"not carry:")
+
+
+def capture_gaps_closing(gaps: list[dict]) -> str:
+    """The closing reminder when none of the recorded gaps is marked as needed."""
+    return (f"Packing recorded {len(gaps)} thing(s) this nest does not carry (listed near "
+            f"the start). None is marked as needed by the run; if something fails to load, "
+            f"look there first.")
+
+
+def fetched_while_running_message(rows: list[dict]) -> str:
+    """Name the files the app fetched for itself while it ran, and how to carry them.
+
+    ``rows`` is :func:`renest.unlisted.notable_folders` output. Information only: it
+    never says the restore failed, because it did not -- it says what this machine's
+    internet access quietly made up for, which a machine without it would not."""
+    shown = rows[:6]
+    where = "; ".join(
+        f"{r['folder']} ({r['files']} file{'' if r['files'] == 1 else 's'}, "
+        f"{_unlisted_size(r['size_bytes'])})" for r in shown)
+    more = f"; and {len(rows) - 6} more folder(s)" if len(rows) > 6 else ""
+    total = sum(r["size_bytes"] for r in rows)
+    adds = " ".join(f"--add {shlex.quote(r['folder'])}" for r in shown)
+    return (
+        f"⚠ While the app started and ran, files the nest does not carry appeared under "
+        f"the restore folder ({_unlisted_size(total)} in all): {where}{more}. The app most "
+        f"likely fetched them from the network, so this step worked because this machine "
+        f"is online; on a machine without internet access it would most likely fail. To "
+        f"carry them next time, pack again with {adds}. This does not change the result "
+        f"of this restore."
+    )
+
+
+def _unlisted_size(n: int) -> str:
+    for unit, k in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+        if n >= k:
+            return f"{n / k:.1f} {unit}"
+    return f"{n} bytes"
+
+
 def missing_library_advice(libs: str | list[str], base_image: str | None = None,
                            recorded: dict | None = None, *, restored: bool = True) -> str:
     """What is missing, and the ways out — surest one first.
@@ -3498,6 +3591,12 @@ _MISSING_DATA_MARKERS = (
     "found 0 images",
     "dataset is empty",
     "no training data",
+)
+
+#: Added to the "Handed to you by …" line when the nest carries custom nodes.
+HANDOFF_CUSTOM_NODES_NOTE = (
+    "Custom nodes in this nest are the sender's code and run on this machine when "
+    "the app starts."
 )
 
 
@@ -4083,7 +4182,14 @@ def restore(
                         if handed_off_relayed
                         else ""
                     )
-                    + ".",
+                    + "."
+                    # The stop-and-ask above covers setup commands and download
+                    # sources; custom nodes are neither, and they run without a
+                    # question the moment the app starts. Said once, same calm tone,
+                    # and only when the nest carries any (2026-10-09, founder).
+                    + (" " + HANDOFF_CUSTOM_NODES_NOTE
+                       if any(d.get("role") != "host" for d in mani.get("code_deps") or [])
+                       else ""),
                     stage="S1",
                 )
         else:
@@ -4095,6 +4201,14 @@ def restore(
                     narrate(f"Reading this nest's files from the folder it was packed into: "
                             f"{_store}")
         _validate_manifest(mani, narrate=narrate)
+        # What the packing machine knew this nest leaves out, said before anything is
+        # fetched: on the packing machine it was a warning that scrolled away; here is
+        # where it matters (format 2.14, renest.gaps).
+        report.capture_gaps = valid_gaps(mani.get("capture_gaps"))
+        if report.capture_gaps:
+            narrate(capture_gaps_heading(report.capture_gaps), stage="S1", level="warning")
+            for _g in report.capture_gaps:
+                narrate(f"  · [{_g['kind']}] {gap_line(_g)}", stage="S1", level="warning")
         # The assets that do not travel with the nest: say it all **before the
         # run starts**, instead of discovering missing files at the very end.
         # Restricted assets never serve bytes across users, so without this the
@@ -4207,6 +4321,13 @@ def restore(
             # legal for an older nest to carry no gpu block, and then this check
             # is skipped entirely.
             nest_gpu=mani.get("gpu"),
+            # Packages whose build targets packing ran out of time to read (format
+            # 2.14 capture_gaps): the card check says "unknown" for them, never "pass".
+            # Passed only when there are any, so a stand-in precheck needs no new
+            # parameter.
+            **({"nest_arch_unread": _unread_arch} if (_unread_arch := [
+                g["subject"] for g in valid_gaps(mani.get("capture_gaps"))
+                if g["kind"] == "native_arch_unread"]) else {}),
             egress_url=_probe_url,
             egress_bytes=sum(i.size_bytes for i in plan.items),
             # Whether the bulk files cross the internet — decides whether "slow
@@ -4226,6 +4347,8 @@ def restore(
             force=opts.force,
         )
         report.precheck = pr.to_dict()
+        # Kept so the install below can look at the machine again once it has changed it.
+        state["precheck_report"] = pr
         # **Run the same fingerprint comparison `renest doctor` runs.** Until
         # 2026-08-22 restore never called it: a nest whose critical packages did not
         # match this machine made `doctor` exit 61 and `restore` exit 0, so any script
@@ -4376,10 +4499,30 @@ def restore(
         def _recheck(libs: list[str]) -> list[str]:
             return missing_native_libs(libs, this_platform_tag())
 
+        _forced = (f"{opts.rerun_command} --force" if opts.rerun_command
+                   else "the same `renest restore` command with --force")
+        _image = (f" ({plan.base_image_ref})" if plan.base_image_ref
+                  else " (the nest does not record its name)")
         outcome = systools.ensure_system_tools(
             sp, assume_yes=opts.assume_yes, say=_say_to_terminal, rerun=_rerun(),
             machine=machine, recheck_libs=_recheck,
+            # Batch 24: the old words told the user to run the very apt command that had
+            # just failed with "Unable to locate package". Give the ways that can work.
+            if_not_in_sources=(
+                f"Two ways on: go ahead without it with {_forced} -- the restore then "
+                f"carries on, and works if the nest's Python packages provide what is "
+                f"missing; or restore on the image this nest was packed on{_image}, "
+                f"whose package sources have it."),
         )
+        if outcome.status in ("installed", "failed"):
+            # The install ran, so the machine is no longer the one S0 looked at. Look
+            # again, or everything after this -- the closing words, the report, the
+            # --json result -- keeps saying a library is missing that renest itself just
+            # put there, and tells the user to install it a second time (batch 22 C5B,
+            # 2026-10-11: "Installed: ... libatomic1." and, at the end of the same run,
+            # "missing 1 library file(s) ... apt-get install -y libatomic1").
+            # A failed install is looked at too: it may have brought some of them.
+            _look_at_the_system_layer_again()
         if outcome.failed:
             if opts.force:
                 narrate("⚠ Carrying on without them because you passed --force.",
@@ -4388,6 +4531,18 @@ def restore(
             # S0 has no class for this, and a new one is a format change: it rides the
             # stage's unclassified slot (exit 60), and the words carry the attribution.
             raise NestFailure("S0", ErrorClass.UNKNOWN, outcome.message)
+
+    def _look_at_the_system_layer_again() -> None:
+        """Re-run the one S0 check an install can change, and put the fresh answer
+        where the stale one was. Same function S0 called, not a second way of asking."""
+        pr = state.get("precheck_report")
+        if pr is None:
+            return
+        for i, check in enumerate(pr.checks):
+            if check.name == "system_layer":
+                pr.checks[i] = check_system_layer(mani.get("runtime", {}))
+                report.precheck = pr.to_dict()
+                return
 
     def s2_called_programs() -> None:
         """Programs the restored code starts by name (ffmpeg for video nodes) that this
@@ -4409,9 +4564,27 @@ def restore(
             return
         outcome = systools.ensure_system_tools(
             sp, assume_yes=opts.assume_yes, say=_say_to_terminal, rerun=_rerun(),
-            machine=machine)
+            machine=machine,
+            # The files are already here by now; the default opening ("have not been
+            # downloaded yet") is the S0 sentence and would be false at this point.
+            before="Everything else is in place. ")
+        if outcome.status in ("installed", "failed"):
+            # A program brings system libraries with it; same reason as at S0.
+            _look_at_the_system_layer_again()
         if outcome.failed:
             narrate(outcome.message, stage="S2", level="warning")
+        if outcome.status != "installed":
+            # Whatever the reason (no rights, no package manager, declined, failed),
+            # the program is not here: the closing words have to say so, not "Done".
+            _cmd = sp.command(sudo=True if sp.privilege == "none" else None)
+            for n in sp.missing:
+                if systools.tool_present(n.tool, machine):
+                    continue
+                report.programs_missing.append({
+                    "program": systools.LABEL[n.tool],
+                    "needed_by": n.why,
+                    "install_command": _cmd,
+                })
 
     def _tool_failure(stage: str, klass: ErrorClass, text: str | None) -> NestFailure | None:
         """A later failure that comes down to git / git-lfs / a C compiler not being
@@ -4789,6 +4962,85 @@ def restore(
         return (f"{state['blobs_downloaded']} downloaded, "
                 f"{state['blobs_cached'] - len(to_copy)} already here{copied}")
 
+    # -- S2: model caches some nodes keep under the home folder (format 2.14) --
+    def s2_home_caches() -> None:
+        """Say where the home-cache files landed and, for the one library that cannot be
+        pointed elsewhere (insightface), copy them into the real home folder.
+
+        **[SECURITY-REVIEW]** The only step that writes outside the restore target.
+        Every file is named first. A nest someone handed you stops here unless you
+        named the sender (``--trust-sender``) or said yes up front (``--yes``) -- the
+        same gate as setup commands. A file already there with different bytes is
+        never overwritten: it is kept, and said. The allowlist is checked again here
+        (:func:`renest.roots.home_writes`), never trusting the packing side.
+        """
+        env = home_cache_env(mani, target)
+        if env:
+            narrate(
+                "Model caches this nest carries are inside the restore folder, under "
+                f"{target / '.renest' / 'home'}. The app is started with "
+                + ", ".join(f"{k}={v}" for k, v in env.items())
+                + " so it finds them there.",
+                stage="S2",
+            )
+        writes = home_writes(mani, target, Path.home())
+        if not writes:
+            return
+        listing = "\n".join(f"    {dst}" for _src, dst in writes)
+        if opts.no_setup:
+            narrate(
+                f"Skipped writing {len(writes)} file(s) into your home folder (--no-setup); "
+                f"they stay inside the restore folder. Whatever reads them there will not "
+                f"find them:\n{listing}",
+                stage="S2", level="warning",
+            )
+            report.setup_skipped.append("home-folder files")
+            return
+        if not (sender_named(handed_off_from, opts.trust_sender) or opts.assume_yes):
+            raise NestFailure(
+                "S2",
+                ErrorClass.UNTRUSTED_SETUP,
+                f"{handed_off_from} handed you this nest, and it wants to write "
+                f"{len(writes)} file(s) into your home folder, outside the restore folder.\n"
+                "  Stopped — nothing was written there.\n"
+                f"\n  What it would write:\n{listing}\n"
+                "\n  Why: the library that reads these (insightface) only looks in your home"
+                "\n  folder; it has no setting to look anywhere else. An existing file is never"
+                "\n  overwritten."
+                "\n"
+                "\n  If you trust them, name them — spell it exactly as shown:"
+                f'\n        --trust-sender "{handed_off_from}"'
+                "\n  or answer yes up front with --yes."
+                "\n  Only want the files? Use --no-setup; they stay inside the restore folder.",
+            )
+        narrate(
+            f"Writing {len(writes)} file(s) into your home folder — the library that reads "
+            f"them (insightface) only looks there. Nothing that is already there with "
+            f"different bytes is overwritten:\n{listing}",
+            stage="S2", level="warning",
+        )
+        for src, dst in writes:
+            rel = str(dst)
+            if not src.is_file():
+                report.home_files.append({"path": rel, "status": "missing_in_restore"})
+                continue
+            if dst.exists() or dst.is_symlink():
+                if dst.is_file() and not dst.is_symlink() and _sha256_file(dst) == _sha256_file(src):
+                    report.home_files.append({"path": rel, "status": "already_there"})
+                    continue
+                report.home_files.append({"path": rel, "status": "kept_yours"})
+                narrate(
+                    f"Kept your own {dst}: it is different from the one in this nest, and an "
+                    f"existing file is never overwritten. The nest's copy is at {src}.",
+                    stage="S2", level="warning",
+                )
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dst.with_name(dst.name + ".renest-part")
+            shutil.copyfile(src, tmp)
+            os.replace(tmp, dst)
+            report.home_files.append({"path": rel, "status": "written"})
+
     # -- S2 layout: full re-verify + self-heal re-pull + unpack --
     def s2_place() -> str:
         assert plan is not None and journal is not None
@@ -4970,6 +5222,18 @@ def restore(
                 raise NestFailure("S2", klass, f"Could not unpack {name}: {e}") from e
             except (tarfile.TarError, ValueError) as e:
                 raise NestFailure("S2", ErrorClass.UNKNOWN, f"Could not unpack {name}: {e}") from e
+            except KeyError as e:
+                # tarfile raises a bare KeyError when a link inside the archive points
+                # at a file the archive does not hold. Without this the user only saw
+                # "KeyError: linkname '...' not found" from the stage backstop.
+                missing = e.args[0] if e.args else ""
+                raise NestFailure(
+                    "S2",
+                    ErrorClass.UNKNOWN,
+                    f"Could not unpack {name}: the archive is damaged - a link inside it "
+                    f"points at a file the archive does not contain ({missing}). "
+                    f"Re-running will not help; whoever packed it needs to pack it again.",
+                ) from e
             # Same bad-byte discipline as the assets above, on the other half of
             # the nest: the code folder that just landed. Report, never block --
             # the bytes match the nest exactly, so there is nothing this machine
@@ -5049,6 +5313,7 @@ def restore(
         # Re-anchored from recorded facts only (see training.reanchor_target); when the
         # arithmetic does not work out, nothing is touched and the sentence below stands
         # on its own, exactly as before.
+        s2_home_caches()
         s2_called_programs()
         report.reanchored = reanchor_recorded_paths(mani, target)
         for moved in report.reanchored:
@@ -5552,8 +5817,26 @@ def restore(
                     )
             return f"The run finished with code {res.exit_code} in {res.seconds:.0f}s, as packed"
         try:
+            # The home-cache redirects (format 2.14): passed only when this nest carries
+            # such files, so a stand-in launcher needs no new parameter.
+            _hce = home_cache_env(mani, target)
+            # This app is the one the test render (S5) runs on, and it is shut down
+            # after it -- so starting it offline is what proves the nest brought every
+            # Hugging Face file the run needs (U7, 2026-10-11: with the network up, each
+            # load still asked huggingface.co for metadata). Until then hf_offline_env
+            # was wired into the run-to-completion runner only. Only when the nest
+            # carries Hugging Face files, and never over the user's own setting.
+            # `renest start` (normal use) is not offline: there a node may fetch a new
+            # model later, and huggingface_hub falls back to the cache by itself.
+            if carries_hf_hub(mani):
+                _off = hf_offline_env(os.environ)
+                if _off:
+                    narrate(HF_OFFLINE_SAY, stage="S4")
+                    _hce = {**_hce, **_off}
+                    handle_box["hf_offline"] = True
             handle_box["h"] = launcher.launch(
-                plan.app_dir, py, evidence / "app-launch.log", entrypoint=plan.entrypoint
+                plan.app_dir, py, evidence / "app-launch.log", entrypoint=plan.entrypoint,
+                **({"extra_env": _hce} if _hce else {}),
             )
         except NestFailure:
             raise
@@ -5692,6 +5975,23 @@ def restore(
             # A GPU that never came up is read across the exception *and* the log
             # together: the exception usually only says "a node raised", which the
             # first classify below would take, while CUDA's own words sit in the log.
+            # We started the app offline on purpose (S4), so a Hugging Face file the
+            # nest did not bring now reads as "could not connect". Say which it is and
+            # how to let this check fetch -- the setting is ours, so explaining it is too.
+            if handle_box.get("hf_offline") and looks_like_a_file_the_nest_did_not_bring(
+                    f"{e}\n{_slog_tail or ''}"):
+                raise NestFailure(
+                    "S5",
+                    ErrorClass.NODE_RUNTIME_ERROR,
+                    "The test render asked for a model file from Hugging Face that this nest "
+                    "did not bring back, so there was nothing on disk to read it from. The "
+                    "test render runs offline, because a nest is packed to run without the "
+                    "network. To let this check fetch what is missing, set HF_HUB_OFFLINE=0 "
+                    "in your environment and run this again."
+                    + (f" The app's own log: {_slog}" if _slog.exists() else ""),
+                    detail=_tail(_slog) if _slog.exists() else str(e),
+                    context={"hf_file_not_in_nest": True, "render_failure": str(e)[:400]},
+                ) from e
             if gpu_did_not_start(f"{e}\n{_slog_tail or ''}"):
                 _verdict = (ErrorClass.UNKNOWN, GPU_DID_NOT_START_SAY)
             else:
@@ -5785,6 +6085,14 @@ def restore(
         run_stage("S2", s2_place)
         run_stage("S3", s3_deps)
         reread_fingerprint_from_rebuild()
+        # What is under the restore folder before the app first runs, so that what it
+        # fetches for itself at start-up or during the test render can be named after.
+        # Not for a run-to-completion nest (training): its run writes its own products
+        # (checkpoints, adapters) wherever its recipe says, and those are the point of
+        # the run, not files it fetched.
+        if not opts.skip_launch and not _is_oneshot():
+            with contextlib.suppress(OSError):
+                state["before_launch"] = unlisted_snapshot(target)
         run_stage("S4", s4_launch)
         run_stage("S5", s5_smoke)
     except NestFailure as e:
@@ -5821,6 +6129,15 @@ def restore(
     report.exit_code = int(ExitCode.OK) if failure is None else failure.exit_code
     if failure:
         report.failure = failure.to_error_object()
+    # Files the app fetched for itself while it started and ran the test render, that
+    # the nest does not carry. Said, never judged: verdict and exit code stay as they are.
+    if "before_launch" in state and any(s.name == "S4" for s in report.stages):
+        with contextlib.suppress(OSError):
+            report.fetched_while_running = notable_folders(
+                unlisted_files(target, mani, before=state["before_launch"]))
+        if report.fetched_while_running:
+            narrate(fetched_while_running_message(report.fetched_while_running),
+                    stage="S5", level="warning")
     # Machine libraries the working run really loaded that this machine does not have.
     # Read here as well as in the closing words below, because it decides the exit code.
     yours = your_own_material_still_missing(mani, target)
@@ -5891,13 +6208,58 @@ def restore(
                 json.dumps(report.failure, ensure_ascii=False, indent=2)
             )
 
-    if report.ok:
+    if report.ok and report.programs_missing:
+        # A program the restored code runs by name is still not installed (S2 could not
+        # install it). Files and dependencies are back, but this is not a full success:
+        # the node that calls it fails on first use. Say it in the closing words, where
+        # people stop reading -- the S2 notice is far up the screen by now.
+        _progs = sorted({p["program"] for p in report.programs_missing})
+        _cmd = next((p["install_command"] for p in report.programs_missing
+                     if p.get("install_command")), "")
+        closing(
+            f"⚠ Restored, but not complete: {', '.join(_progs)} is not installed on this "
+            f"machine, and {'; '.join(p['needed_by'] for p in report.programs_missing)}. "
+            f"Whatever calls it will fail until it is installed"
+            + (f": {_cmd}" if _cmd else " with your system's own installer")
+            + f". Every file was checked: {report.blobs_downloaded} files downloaded, "
+            f"{report.blobs_cached} already here. "
+            f"Took {human_duration(report.metrics['total_seconds'])}. "
+            f"Logs and evidence: {evidence}",
+            level="warn",
+        )
+    elif report.ok and has_required(report.capture_gaps):
+        # The packing machine marked something this run needs as not carried. Every
+        # file that is in the nest was checked, but the environment is not whole.
+        _need = [g["subject"] for g in report.capture_gaps if g["required"] == "yes"]
+        closing(
+            f"⚠ Restored, but not complete: the machine this was packed on recorded that "
+            f"this nest does not carry {', '.join(_need[:4])}"
+            + (f" and {len(_need) - 4} more" if len(_need) > 4 else "")
+            + f", which the run needs. Every file in the nest was checked: "
+            f"{report.blobs_downloaded} files downloaded, {report.blobs_cached} already here. "
+            f"Took {human_duration(report.metrics['total_seconds'])}. "
+            f"Logs and evidence: {evidence}",
+            level="warn",
+        )
+    elif report.ok:
         closing(
             f"✅ Done: {report.blobs_downloaded} files downloaded, {report.blobs_cached} already here. "
             f"Took {human_duration(report.metrics['total_seconds'])}. "
             f"Logs and evidence: {evidence}"
         )
+    if report.fetched_while_running:
+        closing(fetched_while_running_message(report.fetched_while_running),
+                stage="S5", level="warning")
+    if report.ok and report.capture_gaps and not has_required(report.capture_gaps):
+        closing(capture_gaps_closing(report.capture_gaps), stage="S5")
+    if report.ok:
         closing(cache_landing_line(mani, target))
+        # Format 2.14: the one thing a restore may put outside the target. Said again here,
+        # so "everything is under <target>" is never the whole story.
+        _home_written = [h for h in report.home_files if h.get("status") == "written"]
+        if _home_written:
+            closing(f"{len(_home_written)} file(s) were also copied into your home folder, "
+                    f"under {Path.home() / '.insightface'} (insightface only looks there).")
         # Where the toolchain went is kept in the event log (the evidence), not on
         # screen: on 2026-10-02 it was the longest line of a successful restore and
         # answered a question nobody had asked yet.
@@ -5933,6 +6295,7 @@ def restore(
             if (report.oneshot is None and isinstance(_ep_argv, list)) else None,
             sidebar_workflow=_sidebar_name if _sidebar is not None else None,
             sidebar_source=_sidebar_src if _sidebar is not None else None,
+            home_env=home_cache_env_rel(mani),
         ) is not None
         # The entry points into the user's own work (B12): start command, where
         # output lands, how to reach the app from their browser, how to move
@@ -6011,6 +6374,13 @@ def restore(
         # in ``exit_code`` (61) and in this list, which names the libraries outright so a
         # ``--json`` reader never has to parse the English sentence to find out.
         machine_libraries_missing=short_libs,
+        # Programs the restored code runs by name that are still not installed (see
+        # RestoreReport.programs_missing) -- same reason: a --json reader must not have
+        # to parse the closing sentence to learn that ffmpeg is missing.
+        machine_programs_missing=report.programs_missing,
+        # What the packing machine recorded this nest does not carry (format 2.14), as
+        # data, so a --json reader never has to parse the lines printed at S1.
+        capture_gaps=report.capture_gaps,
         # The S0 precheck report (whole thing, checks included). It already lives on
         # the report object, but a verdict only there is invisible to a --json reader
         # -- same rule as checks_after_deps above. Measured 2026-09-25 (batch 15):

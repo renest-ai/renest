@@ -36,7 +36,9 @@ from .restore import (
     start_listen_port,
     system_dir_refusal,
 )
-from .roots import materialise_entrypoint_env
+from .roots import HOME_CACHE_ENV, materialise_entrypoint_env, unsafe_relpath
+
+_HOME_CACHE_VARS = frozenset(var for _prefix, var, _rel in HOME_CACHE_ENV)
 
 __all__ = [
     "StartFailure",
@@ -186,6 +188,14 @@ def start_command(
                 f"here ({e}). The closing lines of the restore printed them — set them "
                 f"by hand and run the command it printed.",
             ) from e
+    # Format 2.14: model caches some nodes keep under the home folder landed inside the
+    # restore folder; point each library there. Only the names the restore wrote, and
+    # only folders inside the target -- a hand-edited facts file cannot aim them elsewhere.
+    hce = facts.get("home_cache_env")
+    if isinstance(hce, dict):
+        for k, v in hce.items():
+            if k in _HOME_CACHE_VARS and isinstance(v, str) and not unsafe_relpath(v):
+                env_extra[k] = str(target / v)
     return cmd, cwd, env_extra
 
 

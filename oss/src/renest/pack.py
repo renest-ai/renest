@@ -35,7 +35,7 @@ import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 from urllib.parse import unquote, urlparse
 
@@ -43,9 +43,13 @@ import httpx
 
 from .capture import (
     UNKNOWN_LICENCE_DEFAULT,
+    _human_size,
+    _kind_of_folder,
     _parse_extra_model_paths,
     capture,
+    drop_carried_from_report,
     is_tool_default_licence,
+    replace_lines,
     unknown_licence_gap,
 )
 from .envlock import (
@@ -88,6 +92,7 @@ from .syslibs import (
     collect_native_libs_with_layers,
     contested_winners,
     interpreter_site_packages,
+    is_cuda_toolkit_path,
     node_declared_machine_libs,
     node_requirement_names,
     read_run_record,
@@ -101,9 +106,11 @@ from .integrity import (
     looks_like_lfs_pointer,
     probe_model_bytes,
     serialization_of,
-    upstream_match,
     WEIGHT_SUFFIXES,
+    upstream_match,
 )
+from .payload import payload_kind
+from .gaps import gap, gap_line
 from .licensing import (
     licence_text_path,
     lookup as _licence_lookup,
@@ -758,6 +765,23 @@ def _symlinks_leaving_the_archive(src_dir: Path, exclude=()) -> list[tuple[str, 
     return sorted(out)
 
 
+def _links_naming_this_machine(src_dir: Path, root: Path,
+                               escaping: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """The subset of ``escaping`` (from :func:`_symlinks_leaving_the_archive`) that
+    stores an absolute path or resolves outside the environment root ``root``: links
+    that can only mean something on this machine."""
+    env = root.resolve()
+    out: list[tuple[str, str]] = []
+    for rel, target in escaping:
+        if os.path.isabs(target):
+            out.append((rel, target))
+            continue
+        with contextlib.suppress(OSError):
+            if not (src_dir / rel).resolve().is_relative_to(env):
+                out.append((rel, target))
+    return out
+
+
 def _lfs_pointer_files(src_dir: Path, exclude=()) -> list[str]:
     """Files that are Git LFS pointer text instead of the real content — a clone
     where `git lfs pull` never ran holds a few hundred bytes of text per file."""
@@ -852,6 +876,10 @@ def _dir_size_as_packed(src_dir: Path, exclude=()) -> int:
         return 0
     total = 0
     for _rel, p in _packed_files(src_dir, exclude):
+        # A symlink travels as a link, not as the bytes behind it: counting its
+        # target here showed a link into a model cache as gigabytes to upload.
+        if p.is_symlink():
+            continue
         with contextlib.suppress(OSError):
             total += p.stat().st_size
     return total
@@ -888,7 +916,7 @@ def _declared_assets_inside(spec: dict, install_path: str, already=()) -> list[s
 
 
 def _weights_inside_code_dir(src_dir: Path, exclude=()) -> list[str]:
-    """Model weight files a code folder would otherwise carry in its archive.
+    """Model weights and other data payloads a code folder would otherwise carry.
 
     Returned relative to the folder, like any other exclude. A code archive travels
     under the code's own licence, and the server never holds one back from a
@@ -899,20 +927,88 @@ def _weights_inside_code_dir(src_dir: Path, exclude=()) -> list[str]:
     of the archive and travels as an ordinary ``files[]`` entry instead, with its
     own licence check by sha256 -- and restricted when nothing vouches for it.
 
-    "Weight file" is the suffix table the integrity probe already uses
-    (``integrity.WEIGHT_SUFFIXES``), not a new list. A Git LFS placeholder is left
+    What counts is decided by content, not by name (``payload.payload_kind`` holds
+    the rule and its thresholds): a ``.pkl``, ``.npy``, ``.zip`` or extensionless
+    weight is caught as surely as a ``.safetensors``. A Git LFS placeholder is left
     alone: it is a few hundred bytes of text, and ``_settle_lfs`` decides what
     happens to it.
     """
     out: list[str] = []
     for rel, p in _packed_files(src_dir, exclude):
-        if Path(rel).suffix.lower() not in WEIGHT_SUFFIXES:
+        if payload_kind(p) is None:
             continue
         with contextlib.suppress(OSError):
             if looks_like_lfs_pointer(p):
                 continue
         out.append(rel)
     return sorted(out)
+
+
+def _listed_file_source(root: Path, fspec: dict) -> Path | None:
+    """Where packing will read this ``files[]`` entry from, or None if nowhere."""
+    if not isinstance(fspec, dict) or not fspec.get("path") or _bad_root_entry(fspec):
+        return None
+    froot = fspec.get("root", "env")
+    if fspec.get("source_path"):
+        src = _spec_source(root, fspec, fspec["path"])
+    elif froot == "env":
+        src = root / fspec["path"]
+        if not src.is_file():
+            src = _resolve_via_extra_model_paths(root, fspec["path"]) or src
+    else:
+        try:
+            src = resolve_file_root(froot, root) / fspec["path"]
+        except Exception:  # noqa: BLE001 - an unknown root is reported where it is packed
+            return None
+    return src if src.is_file() else None
+
+
+def _copies_of_listed_files(root: Path, src_dir: Path, exclude, listed: list[dict]
+                            ) -> list[tuple[str, dict]]:
+    """Files in a code folder that are byte for byte a ``files[]`` entry elsewhere.
+
+    The same weight can sit twice: once as a model the nest lists, once inside a
+    plugin folder. The listed copy is held back from a hand-off when restricted; the
+    copy in the archive would be handed over all the same. Each copy found comes
+    back with the entry it duplicates, so it leaves the archive under that entry's
+    licence (same bytes, same licence). Sizes are compared first; only an equal
+    size costs a read.
+    """
+    by_size: dict[int, list[tuple[Path, dict]]] = {}
+    for f in listed:
+        src = _listed_file_source(root, f)
+        if src is None:
+            continue
+        with contextlib.suppress(OSError):
+            by_size.setdefault(src.stat().st_size, []).append((src, f))
+    if not by_size:
+        return []
+    digests: dict[Path, str] = {}
+
+    def _digest(p: Path) -> str:
+        if p not in digests:
+            h = hashlib.sha256()
+            with p.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            digests[p] = h.hexdigest()
+        return digests[p]
+
+    out: list[tuple[str, dict]] = []
+    for rel, p in _packed_files(src_dir, exclude):
+        try:
+            same = by_size.get(p.stat().st_size)
+            if not same:
+                continue
+            for src, f in same:
+                if src.resolve() == p.resolve():
+                    continue
+                if _digest(src) == _digest(p):
+                    out.append((rel, f))
+                    break
+        except OSError:
+            continue
+    return out
 
 
 def _find_so_files(src_dir: Path, exclude=()) -> list[Path]:
@@ -1001,14 +1097,33 @@ def _probe_so_arch(so_path: Path) -> list[str] | None:
 
 #: Ceilings on reading installed binaries. One environment can hold hundreds of
 #: them and each is opened on its own, so without a ceiling this one step could
-#: outlast the packing of the bytes themselves. Order decides what fits: the
-#: packages a rebuild is known to fail on go first, the rest alphabetically.
+#: outlast the packing of the bytes themselves. Order decides what fits -- see
+#: :func:`_package_so_files`.
 _ARCH_SCAN_MAX_FILES = 200
 _ARCH_SCAN_BUDGET_S = 180.0
+#: Binaries read side by side. Each read is its own ``cuobjdump`` process and the
+#: large vendor libraries spend most of their time in it, so a few at once turn
+#: the same budget into several times the coverage.
+_ARCH_SCAN_WORKERS = 4
+
+#: Read last, in this order. These are the giant binaries (hundreds of MB each) the
+#: budget used to spend itself on, and the ones whose answer is the least news:
+#: PyTorch's own targets are already in ``gpu.torch_cuda_arch_list`` and judged by
+#: the PyTorch check, and the ``nvidia`` runtime libraries ship as one build per CUDA
+#: line beside it. Measured batch 24 (2026-10-09): with these read first, a 180 s
+#: budget recorded 12 binaries and stopped inside ``nvidia/cudnn``; every package
+#: after ``nvidia`` in the alphabet -- the separately built extensions most likely to
+#: cover one card only -- was never read.
+_ARCH_SCAN_LAST: tuple[str, ...] = ("torch", "nvidia")
 
 
 def _package_so_files(site: Path) -> list[Path]:
     """Compiled binaries installed under ``site``, most decisive first.
+
+    Separately built extensions first (the packages a rebuild is known to fail on
+    ahead of the rest), then PyTorch, then the CUDA runtime libraries
+    (:data:`_ARCH_SCAN_LAST`). Every file is returned; the caller applies the
+    ceilings, so it can say what they left unread.
 
     Fixed order, so two packs of one environment record the same thing. A file
     sitting straight in ``site`` with no package folder above it is left out --
@@ -1023,13 +1138,13 @@ def _package_so_files(site: Path) -> list[Path]:
                 continue
             seen.setdefault(p, None)
     critical = set(CRITICAL_PACKAGES)
-    return sorted(
-        seen,
-        key=lambda p: (
-            0 if p.relative_to(site).parts[0] in critical else 1,
-            p.relative_to(site).as_posix(),
-        ),
-    )[:_ARCH_SCAN_MAX_FILES]
+
+    def _key(p: Path) -> tuple:
+        top = p.relative_to(site).parts[0]
+        last = _ARCH_SCAN_LAST.index(top) + 1 if top in _ARCH_SCAN_LAST else 0
+        return (last, 0 if top in critical else 1, p.relative_to(site).as_posix())
+
+    return sorted(seen, key=_key)
 
 
 def _target_site_packages(python_path: str | None) -> Path | None:
@@ -1048,7 +1163,7 @@ def _target_site_packages(python_path: str | None) -> Path | None:
     return Path(here) if here else None
 
 
-def _collect_package_native_archs(site: Path) -> list[dict]:
+def _collect_package_native_archs(site: Path, skipped: list[str] | None = None) -> list[dict]:
     """Which card generations each installed compiled package was built for.
 
     Reading PyTorch's own list alone is wrong in both directions (measured
@@ -1061,19 +1176,84 @@ def _collect_package_native_archs(site: Path) -> list[dict]:
     that measurement gave nothing (pure-CPU libraries, non-NVIDIA variants, C++
     glue). Those are left out entirely -- never written down as "no targets",
     which a reader would take for a positive finding.
+
+    ``skipped``, when given, receives the packages that had a binary left unread
+    because the time or file ceiling ran out -- for them the list says nothing,
+    which is not the same as saying they carry no card code.
     """
     if _cuobjdump() is None:
         return []
+    files = _package_so_files(site)
     deadline = time.monotonic() + _ARCH_SCAN_BUDGET_S
-    out: list[dict] = []
-    for so in _package_so_files(site):
+
+    def _read(so: Path) -> tuple[bool, list[str] | None]:
+        # Checked when a worker picks the file up, so nothing new starts once the
+        # budget is spent; a file already being read gets its own 30 s.
         if time.monotonic() > deadline:
-            break
-        archs = _probe_so_arch(so)
-        if not archs:
-            continue
+            return False, None
+        return True, _probe_so_arch(so)
+
+    with ThreadPoolExecutor(max_workers=_ARCH_SCAN_WORKERS) as pool:
+        results = list(pool.map(_read, files[:_ARCH_SCAN_MAX_FILES]))
+    out: list[dict] = []
+    unread: dict[str, None] = {}
+    for i, so in enumerate(files):
         rel = so.relative_to(site)
-        out.append({"package": rel.parts[0], "path": rel.as_posix(), "sm_list": archs})
+        read, archs = results[i] if i < len(results) else (False, None)
+        if not read:
+            unread.setdefault(rel.parts[0], None)
+        elif archs:
+            out.append({"package": rel.parts[0], "path": rel.as_posix(), "sm_list": archs})
+    if skipped is not None:
+        skipped.extend(unread)
+    return out
+
+
+def _wheel_native_archs(wheel: Path) -> list[dict]:
+    """Which card generations the compiled files inside one stored wheel were built for.
+
+    Same entries as :func:`_collect_package_native_archs` (``package`` = the top folder,
+    ``path`` = where the file lands in site-packages, which is its path in the wheel).
+    Read off the wheel itself, not the installed copy: the installed-package scan runs
+    under a time and file budget that spends itself on the large vendor libraries first,
+    and a package built here from source is exactly the one most likely to cover only
+    this card. Measured batch 24 (2026-10-09): SageAttention built on an RTX 4090
+    (sm_89 only) and stored in the nest was missing from the list, so the card check on
+    an sm_86 machine said every compiled extension could run there.
+    """
+    if _cuobjdump() is None:
+        return []
+    import tempfile
+    import zipfile
+
+    out: list[dict] = []
+    try:
+        with zipfile.ZipFile(wheel) as zf, tempfile.TemporaryDirectory() as tmp:
+            for name in sorted(zf.namelist()):
+                rel = PurePosixPath(name)
+                if (len(rel.parts) < 2 or ".." in rel.parts or rel.is_absolute()
+                        or rel.parts[0].endswith((".dist-info", ".data"))
+                        or not (rel.name.endswith(".so") or ".so." in rel.name)):
+                    continue
+                dest = Path(tmp) / "x.so"
+                dest.write_bytes(zf.read(name))
+                archs = _probe_so_arch(dest)
+                if archs:
+                    out.append({"package": rel.parts[0], "path": rel.as_posix(),
+                                "sm_list": archs})
+    except (OSError, zipfile.BadZipFile, RuntimeError):
+        return out
+    return out
+
+
+def _merge_native_archs(existing: list[dict] | None, more: list[dict]) -> list[dict]:
+    """``existing`` plus ``more``; an entry for a path already listed is not repeated."""
+    out = list(existing or [])
+    seen = {e.get("path") for e in out if isinstance(e, dict)}
+    for e in more:
+        if e.get("path") not in seen:
+            out.append(e)
+            seen.add(e.get("path"))
     return out
 
 
@@ -1208,11 +1388,26 @@ class PackReport:
     #: carrying its own way out. Kept apart from ``findings``: warnings scroll,
     #: this is the fact a hand-off or a restore decision hangs on.
     unrestorable_reasons: list[str] = field(default_factory=list)
+    #: What this nest knowingly does not carry, one entry per thing
+    #: (:mod:`renest.gaps`): ``{kind, subject, detail, required}``.
+    capture_gaps: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         d = asdict(self)
         d.pop("manifest", None)  # keep report light; manifest lives on disk
         return d
+
+
+def _gaps_of(spec: dict | None) -> list[dict]:
+    """The spec's collected gaps, one per (kind, subject), in the order found."""
+    seen: set[tuple[str, str]] = set()
+    out: list[dict] = []
+    for g in (spec or {}).get("_capture_gaps") or []:
+        key = (g.get("kind"), g.get("subject"))
+        if key not in seen:
+            seen.add(key)
+            out.append(dict(g))
+    return out
 
 
 def offline_effects(
@@ -1523,6 +1718,25 @@ def _scan_spec_for_secrets(root: Path, spec: dict) -> tuple[list, list[str]]:
                     p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
                     cfg_hits += scan_recipe_json(p, label=label)
 
+    # [SECURITY-REVIEW] Files carried out of the home-folder model caches (format 2.14).
+    # The hub cache sits next to Hugging Face's access token, and these files are picked
+    # by what a run touched, not named by anyone -- so every one that is not a weight
+    # (configs, tokenizers, README text) is read for credentials like code is. The token
+    # files themselves never get this far (roots.HOME_NEVER_CARRY).
+    for f in spec.get("files") or []:
+        if not (isinstance(f, dict) and f.get("root") == "home" and f.get("source_path")):
+            continue
+        # Through the link: a hub snapshot entry is a link into blobs/, and the scanner
+        # skips links. The name decides "is it a weight", so it comes from the entry.
+        src = Path(os.path.realpath(str(f["source_path"])))
+        try:
+            if src.stat().st_size > (4 << 20) or Path(str(f.get("path"))).suffix.lower() in (
+                    WEIGHT_SUFFIXES) or payload_kind(src):
+                continue
+        except OSError:
+            continue
+        cfg_hits += scan_file(src, label=f"~/{f.get('path')}")
+
     deps = [d for d in (spec.get("code_deps") or []) if isinstance(d, dict)]
     paths = [str(d.get("install_path") or "").strip("/") for d in deps]
     hits: list = []
@@ -1717,6 +1931,15 @@ def _base_image_for_manifest(spec_img: object, warnings: list[str]) -> dict | No
     out["digest_kind"] = "index"
     return out
 
+
+#: The sha256 of zero bytes, and the licence an empty file gets: it holds no content,
+#: so it may travel anywhere and never needs a download address.
+EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+EMPTY_FILE_LICENCE: dict = {
+    "shareable": True, "serving_scope": "open", "tag": "permissive",
+    "declared_by": "detected",
+    "note": "An empty file: it holds no content, so there is nothing to licence.",
+}
 
 #: Largest saved workflow read for model addresses; a workflow is a few hundred KB.
 _SAVED_WORKFLOW_MAX = 8 << 20
@@ -1956,12 +2179,15 @@ def _store_vendored_wheels(
     client: httpx.Client | None,
     warnings: list[str],
     emitter: EventEmitter | None = None,
+    native_archs: list[dict] | None = None,
 ) -> list[dict]:
     """Put the installed wheel of each git / direct-URL package into the nest (2.13).
 
     Returns the ``python_lock.vendored_wheels`` entries (empty = write nothing). A
     package whose wheel cannot be obtained keeps today's behaviour -- the lock's own
     source line -- and gets one plain line in the warnings; packing never stops here.
+    ``native_archs``, when given, collects what each stored wheel's compiled files were
+    built for (see :func:`_wheel_native_archs`), for ``gpu.package_native_archs``.
     """
     cands = vendor_candidates(lock_text)
     if not cands:
@@ -1989,6 +2215,8 @@ def _store_vendored_wheels(
     warnings.extend(misses)
     entries: list[dict] = []
     for w in got:
+        if native_archs is not None:
+            native_archs.extend(_wheel_native_archs(w.path))
         blob = place(w.path, hardlink=False)
         c = w.candidate
         if c.kind == "git":
@@ -2060,7 +2288,7 @@ def _build_manifest(
     # from "hung".
     tracker = _ProgressTracker(emitter, root, spec) if (emitter and not dry_run) else None
     manifest: dict = {
-        "format_version": "2.13",
+        "format_version": "2.14",
         "id": nest_id,
         "created_at": _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "runtime": spec["runtime"],
@@ -2146,9 +2374,22 @@ def _build_manifest(
         # same block after the code_deps loop below.
         _site = _target_site_packages(py)
         if _site is not None and _site.is_dir():
-            _pkg_archs = _collect_package_native_archs(_site)
+            _unread: list[str] = []
+            _pkg_archs = _collect_package_native_archs(_site, skipped=_unread)
             if _pkg_archs:
                 manifest.setdefault("gpu", {})["package_native_archs"] = _pkg_archs
+            for _pkg in _unread:
+                spec.setdefault("_capture_gaps", []).append(gap(
+                    "native_arch_unread", _pkg,
+                    "Its GPU build targets were not read before the time budget ran out, so "
+                    "the card check cannot speak for it."))
+            if _unread:
+                _more = f" and {len(_unread) - 8} more" if len(_unread) > 8 else ""
+                warnings.append(
+                    f"Stopped before reading which GPU generations these installed "
+                    f"packages were built for: {', '.join(_unread[:8])}{_more}. The "
+                    f"card check before a restore cannot speak for them."
+                )
         # Two facts that decide whether a pre-built wheel can install on the target
         # (format 2.4). The platform tag is the authority; the C library is one of
         # the things that shapes it. Measured: one machine accepted 690 tags.
@@ -2202,6 +2443,23 @@ def _build_manifest(
         # it, and the video-memory reading further down reads the same record.
         _rec_roots = _run_record_roots(root, spec, program_dir)
         libs, _own = collect_native_libs_with_layers(root, py, record_roots=_rec_roots)
+        _toolkit = {k: v for k, v in _own.items() if is_cuda_toolkit_path(v)}
+        _own = {k: v for k, v in _own.items() if k not in _toolkit}
+        if _toolkit:
+            # Loaded from the machine's CUDA toolkit, but the environment's own NVIDIA
+            # packages carry the same library and a rebuild reinstalls them. Recorded as a
+            # machine requirement, it stopped a restore on an image whose package sources
+            # have no such package (batch 24, libcublasLt.so.12 -> libcublas-12-8).
+            _tk_where = sorted({str(Path(p).parent) for p in _toolkit.values()})
+            warnings.append(
+                f"{len(_toolkit)} CUDA librar{'y' if len(_toolkit) == 1 else 'ies'} this run "
+                f"loaded from the machine's CUDA toolkit ({', '.join(_tk_where[:2])}) "
+                f"{'is' if len(_toolkit) == 1 else 'are'} also in this environment's NVIDIA "
+                f"Python packages: {', '.join(sorted(_toolkit)[:5])}"
+                f"{'…' if len(_toolkit) > 5 else ''}. They are not recorded as machine "
+                f"requirements, because a rebuild installs those packages and gets them "
+                f"from there."
+            )
         if _own:
             # Left off the list on purpose, and said out loud rather than dropped: a
             # rebuild creates its own interpreter, so a machine without these is short
@@ -2331,9 +2589,36 @@ def _build_manifest(
             dep_ex += _settle_lfs(src_dir, dep["install_path"], dep_ex, dry_run=dry_run,
                                   warnings=warnings, lfs=lfs)
 
-        # Model weights inside a code folder (a plugin that downloads its own models
-        # on first run) never travel under the code's licence: each one comes out of
-        # the archive and joins files[], where it gets its own licence verdict.
+        # A second copy of a file the nest already lists (the same weight as a model
+        # and inside a plugin folder) leaves the archive under the listed copy's
+        # licence: otherwise the archive hands over what files[] holds back.
+        if src_dir.is_dir():
+            _copies = _copies_of_listed_files(root, src_dir, dep_ex, spec.get("files") or [])
+            if _copies:
+                _ip = str(dep["install_path"]).strip("/")
+                for inner, twin in _copies:
+                    dep_ex.append(inner)
+                    if any(c["path"] == f"{_ip}/{inner}" for c in carved_files):
+                        continue
+                    fs = {"path": f"{_ip}/{inner}",
+                          "license": dict(twin.get("license") or UNKNOWN_LICENCE_DEFAULT),
+                          "kind": twin.get("kind") or "other"}
+                    if dep.get("source_path"):
+                        fs["source_path"] = str(src_dir / inner)
+                    carved_files.append(fs)
+                shown = ", ".join(i for i, _t in _copies[:3]) + (
+                    f" and {len(_copies) - 3} more" if len(_copies) > 3 else "")
+                warnings.append(
+                    f"{dep['name']}: {len(_copies)} file(s) in this code folder are copies of "
+                    f"files this nest already lists ({shown}). They are left out of its "
+                    f"archive and stored as files of their own, under the same licence entry "
+                    f"as the listed copy."
+                )
+
+        # Model weights and other data inside a code folder (a plugin that downloads
+        # its own models on first run) never travel under the code's licence: each one
+        # comes out of the archive and joins files[], where it gets its own licence
+        # verdict. Decided by content (payload.payload_kind), not by file name.
         if src_dir.is_dir():
             _weights = _weights_inside_code_dir(src_dir, dep_ex)
             if _weights:
@@ -2354,7 +2639,8 @@ def _build_manifest(
                     f"folder ({shown}). They are left out of its archive and stored as "
                     f"files of their own, each with its own licence check: the code's "
                     f"licence does not cover models it downloaded. Any we cannot confirm "
-                    f"are restricted -- your own restores get them, a hand-off does not."
+                    f"may be passed on are restricted -- your own restores get them, a "
+                    f"hand-off does not."
                 )
 
         # -- "strip by default, tell the user to recompile": node .so routing --
@@ -2372,7 +2658,18 @@ def _build_manifest(
             # say what the restore does about it.
             if role != "host":
                 home_use = _keeps_files_in_home(src_dir)
+                # Said only when nothing from the home folder's .cache travels: when the run's
+                # own files there were carried (format 2.14), "not carried" would be false.
+                if home_use and any(f.get("root") == "home"
+                                    and str(f.get("path", "")).startswith(".cache/")
+                                    for f in spec.get("files") or [] if isinstance(f, dict)):
+                    home_use = None
                 if home_use:
+                    spec.setdefault("_capture_gaps", []).append(gap(
+                        "home_cache_not_carried", home_use.split(",", 1)[0],
+                        f"{dep['name']} keeps what it downloads on first use here; the nest "
+                        f"does not carry it, so a new machine fetches it again.",
+                        required="cache"))
                     warnings.append(
                         f"{dep['name']} keeps files under the home folder ({home_use}) — "
                         f"typically something it downloads on first use and reads afterwards. "
@@ -2392,6 +2689,25 @@ def _build_manifest(
             # a link into a shared model cache would drag that whole cache into the
             # code archive, and the manifest's files[] paths say nothing about links.
             escaping = _symlinks_leaving_the_archive(src_dir, dep_ex)
+            # A link that stores an absolute path, or leads out of the environment
+            # altogether, can only name a place on this machine: in the archive it
+            # carries this machine's path (often a home folder with the user's name)
+            # to whoever restores it, and the restore refuses to unpack such a link at
+            # all, so the whole rebuild stopped on it. Leave those links out (said
+            # here, recorded in the archive's exclude list); a relative link that
+            # stays inside the environment keeps travelling as before.
+            _gone = _links_naming_this_machine(src_dir, root, escaping)
+            if _gone:
+                dep_ex += [rel for rel, _t in _gone]
+                escaping = [e for e in escaping if e not in _gone]
+                shown = "; ".join(f"{rel} -> {target}" for rel, target in _gone[:3])
+                warnings.append(
+                    f"{dep['name']}: {len(_gone)} symlink(s) point outside the environment, "
+                    f"so they are left out of the code archive and not followed ({shown}). "
+                    f"A link only stores a path on this machine, which nobody restoring the "
+                    f"nest has. If the rebuild needs what they point at, replace them with "
+                    f"the real files and pack again."
+                )
             if escaping:
                 shown = "; ".join(f"{rel} -> {target}" for rel, target in escaping[:3])
                 warnings.append(
@@ -2544,11 +2860,39 @@ def _build_manifest(
             continue
         for rel, lit, src_file in _data_files_named_outside(
                 root, _spec_source(root, dep, dep["install_path"]), packed_dirs, _packed_files):
+            spec.setdefault("_capture_gaps", []).append(gap(
+                "data_outside_node", rel,
+                f"{dep['name']} names {lit!r} in its code ({src_file}); this file sits outside "
+                f"everything the nest carries."))
             warnings.append(
                 f"{dep['name']} names the file {lit!r} in its code ({src_file}), and a file by "
                 f"that name sits at {rel} — outside everything this nest carries, so it will "
                 f"not come back with it. If the node reads it, pack again with --add {rel}"
             )
+
+    # Node settings kept under the home folder (ComfyUI-LoRA-Manager keeps its own under
+    # ~/.config). Every node folder counts, whether it rides in its own archive or inside
+    # the host's -- `--auto` with nothing to single out packs them all in the host's.
+    _node_dirs: dict[str, Path] = {}
+    for dep in spec.get("code_deps", []):
+        src = _spec_source(root, dep, dep["install_path"])
+        if dep.get("role") == "host":
+            with contextlib.suppress(OSError):
+                for d in sorted((src / "custom_nodes").iterdir()):
+                    if d.is_dir() and not d.name.startswith((".", "__")):
+                        _node_dirs.setdefault(d.name, d)
+        elif "custom_nodes" in str(dep["install_path"]):
+            _node_dirs[str(dep.get("name") or src.name)] = src
+    for _name, _src in _node_dirs.items():
+        for cfg in _home_config_dirs(_src, _name):
+            spec.setdefault("_capture_gaps", []).append(gap(
+                "home_config", cfg,
+                f"{_name} keeps its own settings here, in the home folder; the nest does not "
+                f"carry them, so it starts with defaults."))
+            warnings.append(
+                f"{_name} keeps its settings under the home folder ({cfg}). A nest does not "
+                f"carry the home folder, so on the new machine the node starts with its "
+                f"defaults; copy that folder across yourself if the settings matter.")
 
     # -- python_lock: four tiers, in order (the format spec carries the full table) --
     #   1. a lock file in the environment → pack it as-is;
@@ -2849,11 +3193,19 @@ def _build_manifest(
         # with its original source kept beside it -- so a restore needs neither git,
         # nor a compiler, nor that host to be up. Read off the lock before pinning:
         # pinning only rewrites `name==version+local` lines, never `name @ url` ones.
+        _vendored_archs: list[dict] = []
         _vendored = _store_vendored_wheels(
             lock_text, _plumbing_sp, _plumbing_py or _env_python_for(root, env_python),
             work, place=place, dry_run=dry_run, online=pin_wheels, client=client,
-            warnings=warnings, emitter=emitter,
+            warnings=warnings, emitter=emitter, native_archs=_vendored_archs,
         )
+        if _vendored_archs:
+            # A stored wheel's compiled files count in the card check like any installed
+            # package's; read off the wheel because the installed-package scan's budget
+            # can run out before reaching them (batch 24: SageAttention, sm_89 only).
+            _g = manifest.setdefault("gpu", {})
+            _g["package_native_archs"] = _merge_native_archs(
+                _g.get("package_native_archs"), _vendored_archs)
         if _vendored:
             manifest["python_lock"]["vendored_wheels"] = _vendored
             for _vw in _vendored:
@@ -3316,6 +3668,11 @@ def _build_manifest(
                 ),
             ),
         }
+        if blob["size_bytes"] == 0 and blob["sha256"] == EMPTY_SHA256:
+            # Zero bytes carry no content, so there is nothing to licence and nothing
+            # to fetch from anywhere: never restricted, never asked for an address
+            # (Hugging Face's `.no_exist/` markers, U7 rerun 2026-10-11).
+            entry["license"] = dict(EMPTY_FILE_LICENCE)
         # capture said "license unknown, restricted by default" before any lookup ran;
         # once the lookup lets the file travel, that line is no longer true.
         _lic = entry["license"]
@@ -3429,6 +3786,12 @@ def _build_manifest(
         manifest["evidence"] = {
             k: v for k, v in _ev.items() if k in ("source", "note") and v
         }
+    # What this nest knowingly does not carry (format 2.14). Written only when there is
+    # something: an absent block says "nothing recorded", never "nothing missing" -- a
+    # spec handed in ready-made is not looked at for run downloads at all.
+    _gaps = _gaps_of(spec)
+    if _gaps:
+        manifest["capture_gaps"] = _gaps
 
     # -- invariant sweep, record layer (2026-09-06). One judgment, every
     # consumer: `renest lint` reads the same functions off renest.invariants, so
@@ -3517,14 +3880,25 @@ def _hash_record(cache: HashCache | None, env_root: Path, full_rehash: bool) -> 
 
 
 def _apply_add(root: Path, spec: dict, adds: list[str], warnings: list[str]) -> str | None:
-    """Put each ``--add`` path into ``spec["files"]``. Returns why it cannot, or None.
+    """Put each ``--add`` path into ``spec["files"]``. Returns why it cannot, or None."""
+    why, added = _add_paths(root, spec, adds, warnings)
+    if why is None and added:
+        shown = ", ".join(added[:5]) + ("…" if len(added) > 5 else "")
+        warnings.append(f"Packed because you asked with --add: {len(added)} file(s) ({shown})")
+    return why
+
+
+def _add_paths(root: Path, spec: dict, adds: list[str],
+               warnings: list[str]) -> tuple[str | None, list[str]]:
+    """Put each path into ``spec["files"]``: ``(why it cannot, or None; what was added)``.
 
     A folder adds every file under it. A path is looked for under the environment
     root first, then where the command was run. A file the nest already carries --
     named by the workflow, or inside a code folder's archive -- is said once and not
     added twice. Outside the environment only extra_model_paths folders count: those
     are recorded under the standard models folder, like capture does."""
-    from .capture import CATEGORIES, INPUT_ASSET_LICENCE_DEFAULT, UNKNOWN_LICENCE_DEFAULT
+    from .capture import (CATEGORIES, INPUT_ASSET_LICENCE_DEFAULT, UNKNOWN_LICENCE_DEFAULT,
+                          _kind_of_folder)
 
     files = spec.setdefault("files", [])
     have = {f.get("path") for f in files if isinstance(f, dict)}
@@ -3540,7 +3914,7 @@ def _apply_add(root: Path, spec: dict, adds: list[str], warnings: list[str]) -> 
         src = next((c for c in cands if c.exists()), None)
         if src is None:
             return (f"--add {raw}: no such file or folder (looked under {root} and in the "
-                    f"current folder)")
+                    f"current folder)"), added
         targets = [src] if src.is_file() else sorted(
             p for p in src.rglob("*") if p.is_file() and not p.name.startswith("."))
         for t in targets:
@@ -3560,13 +3934,15 @@ def _apply_add(root: Path, spec: dict, adds: list[str], warnings: list[str]) -> 
                 return (f"--add {raw}: {t} is outside the environment being packed ({root}) "
                         f"and outside every extra_model_paths folder, so a rebuild would have "
                         f"nowhere to put it. Move it under {root / host_dir / 'models'} and "
-                        f"pack again")
+                        f"pack again"), added
             if rel in have:
                 continue
             owner = None
-            # A model file never rides inside a code archive (_weights_inside_code_dir),
-            # so one asked for by name is added like any other file.
-            for d in ([] if Path(rel).suffix.lower() in WEIGHT_SUFFIXES else deps):
+            # A model or data file never rides inside a code archive
+            # (_weights_inside_code_dir, decided by content), so one asked for by name is
+            # added like any other file.
+            payload = payload_kind(t)
+            for d in ([] if payload else deps):
                 ip = str(d["install_path"]).strip("/")
                 if rel.startswith(ip + "/"):
                     inner = rel[len(ip) + 1:]
@@ -3584,18 +3960,199 @@ def _apply_add(root: Path, spec: dict, adds: list[str], warnings: list[str]) -> 
                 kind = "input_asset"
             else:
                 kind = dir_kind.get(sub) or (
-                    parts[2] if len(parts) > 3 and parts[1] == "models" else "other")
-            lic = INPUT_ASSET_LICENCE_DEFAULT if kind == "input_asset" else UNKNOWN_LICENCE_DEFAULT
+                    _kind_of_folder(parts[2]) if len(parts) > 3 and parts[1] == "models"
+                    else "other")
+            # Input material (an image, a mask) is treated as the user's own; a model
+            # or data file dropped into the input folder is not input material, and
+            # gets the same unconfirmed-means-restricted default as any other model.
+            lic = (INPUT_ASSET_LICENCE_DEFAULT if kind == "input_asset" and not payload
+                   else UNKNOWN_LICENCE_DEFAULT)
             entry: dict = {"path": rel, "license": dict(lic), "kind": kind}
             if source is not None:
                 entry["source_path"] = str(source)
             files.append(entry)
             have.add(rel)
             added.append(rel)
+    return None, added
+
+
+def _carry_run_downloads(root: Path, spec: dict, cdir: Path, program_dir: Path | None,
+                         possibly_used: list[dict], warnings: list[str]) -> list[str]:
+    """Carry what the working run fetched for itself into the models folders
+    (:mod:`renest.rundownloads`); record what was not carried as gaps. Returns the paths
+    added to ``files[]``.
+
+    No window to measure against (``--workflow`` with no picture, ComfyUI not running,
+    or restarted since): nothing is carried on a guess -- the files capture could only
+    name stay named, with the ``--add`` command, and each is recorded as a gap."""
+    from . import rundownloads as rd
+
+    gaps = spec.setdefault("_capture_gaps", [])
+    window, why_not = rd.run_window(
+        [d for d in (program_dir, cdir) if d is not None], rd.run_end_from_spec(spec))
+    added: list[str] = []
+    if window is not None:
+        emp = _parse_extra_model_paths(cdir)
+        dirs = [cdir / "models", *[d for ds in emp.values() for d in ds]]
+        listed = [_listed_file_source(root, f) for f in spec.get("files") or []
+                  if isinstance(f, dict)]
+        fetched = rd.files_fetched_in(window, dirs, [p for p in listed if p is not None])
+        held = rd.held_open(window.pid)
+        split = rd.split_by_use(fetched, held) if fetched else rd.Fetched()
+        _carry_home_caches(spec, window, held, warnings)
+        # A file that appeared in a folder ComfyUI itself loads models from **by name**
+        # (checkpoints/, loras/, diffusion_models/, ...) is the recipe's business: the
+        # recipe names what it loads there, and capture already took those. A new file
+        # there that the recipe does not name and the run is not holding is somebody's
+        # download for later, not something this run fetched for itself. Measured on Spark
+        # 2026-10-11: a long-running ComfyUI service, two models (29.6 GB) downloaded by
+        # hand while it ran, carried into a nest whose recipe never touched them. Nodes
+        # download into their own folders (insightface/, LLM/, facerestore_models/).
+        from .capture import CATEGORIES, _standard_model_folders  # noqa: PLC0415
+
+        std = _standard_model_folders(program_dir or cdir) | {
+            Path(sd).name for sds, _ in CATEGORIES.values() for sd in sds}
+        by_name: list[Path] = []
+        for f in list(split.carry):
+            rel = _rel_for_gap(root, cdir, f).split("/")
+            folder = rel[2] if len(rel) > 3 and rel[1] == "models" else ""
+            if folder in std and (held is None or os.path.realpath(f) not in held):
+                split.carry.remove(f)
+                by_name.append(f)
+        split.undetermined = [d for d in split.undetermined
+                              if any(f.parent == d for f in split.carry)]
+        for f in by_name:
+            gaps.append(gap("runtime_download", _rel_for_gap(root, cdir, f),
+                            "Appeared while the run went, in a folder ComfyUI loads models "
+                            "from by name; the recipe does not name it and the run did not "
+                            "hold it open, so it was not carried."))
+        if by_name:
+            shown = ", ".join(_rel_for_gap(root, cdir, f) for f in by_name[:5])
+            warnings.append(
+                f"{len(by_name)} file(s) appeared while the run went in folders ComfyUI loads "
+                f"models from by name ({shown}{'…' if len(by_name) > 5 else ''}), but the recipe "
+                f"does not name them and the run was not holding them, so they were not "
+                f"carried. If this run does use one, pack again with --add <path>.")
+        if split.carry:
+            why, added = _add_paths(root, spec, [str(p) for p in split.carry], warnings)
+            if why is not None:  # outside every place a rebuild could land it
+                warnings.append(f"Not carried: {why}")
+                added = []
+        if added:
+            by_rel = {str(f.get("path")): f for f in spec.get("files") or [] if isinstance(f, dict)}
+            sizes = []
+            for rel in added:
+                src = _listed_file_source(root, by_rel.get(rel) or {"path": rel})
+                n = src.stat().st_size if src is not None and src.exists() else 0
+                sizes.append((rel, n))
+            total = sum(n for _, n in sizes)
+            lines = "\n".join(f"  {rel} ({_human_size(n)})" for rel, n in sizes)
+            warnings.append(
+                f"Carried {len(sizes)} file(s) ({_human_size(total)}) that appeared in the "
+                f"models folders while the working run was going -- something it fetched for "
+                f"itself, which a new machine would otherwise fetch again or not at all. Each "
+                f"one is checked and licence-looked-up like any other model:\n{lines}")
+        for f, beside in split.unused:
+            rel = _rel_for_gap(root, cdir, f)
+            gaps.append(gap("runtime_download", rel,
+                            f"Fetched during the working run, but the run held {beside.name} "
+                            f"open beside it and never this one; left out as an unused "
+                            f"duplicate."))
+        if split.unused:
+            shown = ", ".join(_rel_for_gap(root, cdir, f) for f, _ in split.unused[:5])
+            warnings.append(
+                f"Left out {len(split.unused)} file(s) the working run fetched but never "
+                f"loaded ({shown}): the run was holding another weight file in the same "
+                f"folder. If this run does need one of them, pack again with --add <path>.")
+        if split.undetermined:
+            shown = ", ".join(_rel_for_gap(root, cdir, d) for d in split.undetermined[:5])
+            warnings.append(
+                f"Could not tell which of the files fetched into {shown} the run actually "
+                f"loaded (none was held open when packing looked), so all of them were "
+                f"carried.")
+    now = {f.get("path") for f in spec.get("files") or [] if isinstance(f, dict)}
+    for c in possibly_used:
+        if c.get("path") in now:
+            continue
+        detail = ("May be used by this run; not carried. "
+                  + ("It was there before the run started. " if window is not None else
+                     f"Nothing to measure the run against ({why_not}). ")
+                  + "Pack again with --add to carry it.")
+        gaps.append(gap("runtime_download", str(c["path"]), detail))
+    return added
+
+
+def _carry_home_caches(spec: dict, window, held: set[str] | None,
+                       warnings: list[str]) -> list[str]:
+    """Carry the files the working run used out of the allowlisted home-folder model
+    caches (format 2.14, ``files[].root == "home"``; :func:`renest.rundownloads.
+    home_cache_files`). They land inside the restore target and the app is pointed there
+    on restore. Returns the paths added.
+
+    Read with the running app's own settings (``/proc/<pid>/environ``): where rembg or
+    Hugging Face keeps its cache is decided by the app's environment, not ours."""
+    from . import rundownloads as rd
+
+    found = rd.home_cache_files(window, held, rd.home_cache_roots(rd.process_environ(window.pid)))
+    files = spec.setdefault("files", [])
+    have = {(f.get("root", "env"), f.get("path")) for f in files if isinstance(f, dict)}
+    gaps = spec.setdefault("_capture_gaps", [])
+    added: list[tuple[str, int]] = []
+    for src, rel in found.carry:
+        if ("home", rel) in have:
+            continue
+        parts = rel.split("/")
+        entry: dict = {"path": rel, "root": "home", "source_path": str(src),
+                       "license": dict(UNKNOWN_LICENCE_DEFAULT)}
+        if rel.startswith(".cache/huggingface/hub/"):
+            repo, rest = parts[3], "/".join(parts[4:])
+            repo_id = repo[len("models--"):].replace("--", "/")
+            if rest.startswith("snapshots/"):
+                _snap, rev, fname = rest.split("/", 2)
+                entry["origin_url"] = f"https://huggingface.co/{repo_id}/resolve/{rev}/{fname}"
+                entry["kind"] = ("model_config" if fname.endswith("config.json")
+                                 else "checkpoint" if rd._is_weight(Path(fname))
+                                 else "other")
+            else:
+                entry["kind"] = "other"
+        else:
+            entry["kind"] = _kind_of_folder(parts[0].lstrip("."))
+        files.append(entry)
+        have.add(("home", rel))
+        try:
+            added.append((rel, src.stat().st_size))
+        except OSError:
+            added.append((rel, 0))
     if added:
-        shown = ", ".join(added[:5]) + ("…" if len(added) > 5 else "")
-        warnings.append(f"Packed because you asked with --add: {len(added)} file(s) ({shown})")
-    return None
+        lines = "\n".join(f"  ~/{rel} ({_human_size(n)})" for rel, n in added)
+        warnings.append(
+            f"Carried {len(added)} file(s) ({_human_size(sum(n for _, n in added))}) the working "
+            f"run used from model caches under the home folder. They go back inside the "
+            f"restore folder, and the app is started pointed at them; each is checked and "
+            f"licence-looked-up like any other model:\n{lines}")
+    for rel, beside in found.unused:
+        gaps.append(gap("home_cache_not_carried", f"~/{rel}",
+                        f"Appeared during the working run, but the run held {beside} open "
+                        f"beside it and never this one; left out as an unused duplicate."))
+    if found.undetermined:
+        warnings.append(
+            f"Could not tell which of the files in ~/{', ~/'.join(found.undetermined[:4])} the "
+            f"run actually loaded (none was held open when packing looked), so every one "
+            f"that appeared during the run was carried.")
+    return [rel for rel, _ in added]
+
+
+def _rel_for_gap(root: Path, cdir: Path, p: Path) -> str:
+    """A path for a gap's subject: relative to the environment root, or to the models
+    folder for an extra_model_paths file -- never this machine's absolute path."""
+    with contextlib.suppress(ValueError):
+        return Path(os.path.abspath(p)).relative_to(root).as_posix()
+    real = Path(os.path.realpath(p))
+    for key, dirs in _parse_extra_model_paths(cdir).items():
+        for d in dirs:
+            with contextlib.suppress(ValueError):
+                return f"{cdir.name}/models/{key}/{real.relative_to(d).as_posix()}"
+    return p.name
 
 
 #: Where a package installed editable from a folder outside the environment lands in
@@ -3635,6 +4192,7 @@ def _carry_outside_editables(root: Path, spec: dict, env_python: str | None,
     deps = spec.setdefault("code_deps", [])
     taken = {str(d.get("install_path") or "").strip("/") for d in deps if isinstance(d, dict)}
     carried: dict[str, str] = {}
+    sizes: dict[str, str] = {}
     for _name, url in sorted(dists_built_from_a_directory(sp).items()):
         # renest itself, installed for development into the environment it packs, is
         # not the user's code to hand on (its own test fixtures look like credentials).
@@ -3651,7 +4209,8 @@ def _carry_outside_editables(root: Path, spec: dict, env_python: str | None,
             continue
         # A whole project checkout (data, weights, build trees) is not "a small local
         # package"; past this size the old advice stands instead of a surprise upload.
-        if _dir_size_as_packed(folder, []) > CARRY_LOCAL_PACKAGE_MAX_BYTES:
+        size = _dir_size_as_packed(folder, [])
+        if size > CARRY_LOCAL_PACKAGE_MAX_BYTES:
             continue
         ip, n =f"{LOCAL_PACKAGES_DIR}/{folder.name}", 2
         while ip in taken:
@@ -3660,10 +4219,14 @@ def _carry_outside_editables(root: Path, spec: dict, env_python: str | None,
         deps.append({"name": Path(ip).name, "role": "user_code", "install_path": ip,
                      "source_path": str(folder)})
         carried[url] = ip
+        n_files = sum(1 for _r, f in _packed_files(folder, []) if not f.is_symlink())
+        sizes[url] = f"{n_files} file(s), {_human_size(size)}"
     if carried:
         spec["_carried_local_packages"] = carried
-        shown = ", ".join(f"{Path(u[len('file://'):]).name} -> {ip}" for u, ip in
-                          list(carried.items())[:3])
+        # How much of the user's own folder goes up is the one thing to check before
+        # it does, so the dry run names it: file count and size, per folder.
+        shown = ", ".join(f"{Path(u[len('file://'):]).name} -> {ip} ({sizes[u]})"
+                          for u, ip in list(carried.items())[:3])
         warnings.append(
             f"{len(carried)} package(s) were installed editable from a folder outside this "
             f"environment ({shown}). That folder is your own code and would not have "
@@ -3750,6 +4313,72 @@ def _keeps_files_in_home(code_dir: Path) -> str | None:
         if _HOME_CALL.search(text) and _HOME_CACHE_LITERAL.search(text):
             return f"~/.cache, in {py.relative_to(code_dir).as_posix()}"
     return None
+
+
+#: Home-folder places a node keeps its own settings (the XDG config and data homes).
+_HOME_CONFIG_PLACES = (".config", ".local/share")
+
+
+def _squash(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def _home_config_dirs(code_dir: Path, dep_name: str) -> list[str]:
+    """``["~/.config/ComfyUI-LoRA-Manager"]``: folders under the home folder's config
+    and data places that belong to this node -- named like its folder (case and
+    punctuation aside), or named in its code as a string. Seen on the batch-24 pack
+    machines: of everything nodes wrote under the home folder, the one thing that was
+    not a cache or telemetry was ComfyUI-LoRA-Manager's settings under ``~/.config``."""
+    home = Path.home()
+    want = {_squash(dep_name), _squash(code_dir.name)} - {""}
+    literals: set[str] | None = None
+    out: list[str] = []
+    for place in _HOME_CONFIG_PLACES:
+        base = home / place
+        try:
+            entries = sorted(p for p in base.iterdir() if p.is_dir())
+        except OSError:
+            continue
+        for e in entries:
+            sq = _squash(e.name)
+            if len(sq) < 5 or sq in ("renest", "comfyui"):
+                continue
+            hit = sq in want
+            if not hit:
+                # Named in the code only as part of a path to that very folder
+                # (".config/civitai/..."): a bare word is not enough. Measured on Spark
+                # 2026-10-11: matching the bare name tied ~/.local/share/nvidia to an NVIDIA
+                # node and ~/.config/civitai to rgthree, whose code merely says "nvidia" and
+                # "civitai".
+                if literals is None:
+                    literals = _string_literals(code_dir)
+                needle = f"{place}/{e.name}"
+                hit = any(needle in lit for lit in literals)
+            if hit:
+                out.append(f"~/{place}/{e.name}")
+    return out
+
+
+def _string_literals(code_dir: Path) -> set[str]:
+    """Every string constant in a node's Python source (bounded like the other reads)."""
+    import ast  # noqa: PLC0415
+
+    found: set[str] = set()
+    if not code_dir.is_dir():
+        return found
+    for py in sorted(code_dir.rglob("*.py"))[:400]:
+        if any(p in _DATA_SKIP for p in py.relative_to(code_dir).parts):
+            continue
+        try:
+            if py.stat().st_size > (1 << 20):
+                continue
+            tree = ast.parse(py.read_text(encoding="utf-8", errors="ignore"))
+        except (OSError, SyntaxError, ValueError):
+            continue
+        found.update(n.value for n in ast.walk(tree)
+                     if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                     and len(n.value) < 200)
+    return found
 
 
 def _repoint_carried_lines(lock_text: str, carried: dict[str, str]) -> tuple[str, int]:
@@ -4363,17 +4992,35 @@ def pack(
             report.exit_code = int(ExitCode.USAGE)
             report.findings = warnings + [_why]
             return report
-        # What --add just put in is no longer "possibly used, not packed": withdraw those
-        # lines, so the closing command does not ask for the same files again.
-        _now = {f.get("path") for f in spec.get("files") or [] if isinstance(f, dict)}
-        _cap = report.capture_report or {}
-        _gone = [c for c in _cap.get("possibly_used_files") or [] if c.get("path") in _now]
-        if _gone:
-            _cap["possibly_used_files"] = [
-                c for c in _cap["possibly_used_files"] if c.get("path") not in _now]
-            _said = {f"pack again with --add {c['path']}" for c in _gone}
-            warnings[:] = [w for w in warnings
-                           if not ("is NOT packed" in w and any(w.endswith(s) for s in _said))]
+    if isinstance(spec, dict) and framework is None and report.capture_report is not None:
+        # The working run's own downloads (batch 24 U1, batch 22 C6): carried when they
+        # appeared during the run in a folder ComfyUI loads models from; otherwise named
+        # and recorded. Only on the routes that read the environment -- a spec written
+        # by hand says what it wants.
+        try:
+            _cdir = _locate_comfyui_dir(root, comfyui_dir)
+        except (OSError, ValueError):
+            _cdir = None
+        if _cdir is not None:
+            _host = next((d for d in spec.get("code_deps") or []
+                          if isinstance(d, dict) and d.get("role") == "host"), None)
+            _prog = _program_dir or (_spec_source(root, _host, _host.get("install_path", ""))
+                                     if _host and _host.get("source_path") else None)
+            _carry_run_downloads(root, spec, _cdir, _prog,
+                                 list(report.capture_report.get("possibly_used_files") or []),
+                                 warnings)
+    if isinstance(spec, dict) and report.capture_report is not None:
+        # What --add or the run's own downloads just put in is no longer "possibly used,
+        # not packed": withdraw those lines, so the closing command does not ask for the
+        # same files again.
+        # Done on the report's own lists, and the lines are written again from them
+        # (capture.drop_carried_from_report): filtering only the printed sentences left
+        # the same lines in `--json`'s capture_report.gaps (0.1.22 U1, 2026-10-11).
+        _now = {f.get("path") for f in spec.get("files") or []
+                if isinstance(f, dict) and f.get("root", "env") == "env"}
+        _old, _new = drop_carried_from_report(report.capture_report, _now)
+        if _old:
+            warnings[:] = replace_lines(warnings, _old, _new)
     if isinstance(spec, dict):
         # Before the credential scan on purpose: a folder carried this way is code
         # handed to whoever restores the nest, so it goes through the same scan.
@@ -4434,7 +5081,12 @@ def pack(
     # dry_run branch — even a dry run has to tell the user "packing like this
     # would carry your keys out".
     secret_hits, suspicious = _scan_spec_for_secrets(root, spec or {})
+    # A file that holds a hit is named by the hard stop below; saying "we did not find a
+    # credential in it" about that same file contradicted the stop one line later.
+    _hit_paths = {h.path for h in secret_hits}
     for s in suspicious:
+        if s in _hit_paths:
+            continue
         warnings.append(
             f"{s} is going into the nest. We did not find a credential in it, but files with "
             f"that name usually hold one — open it before you hand this nest to anyone"
@@ -4506,6 +5158,7 @@ def pack(
                 report.total_bytes = sum(i.get("size_bytes", i.get("approx_bytes", 0)) for i in inventory)
                 report.findings = warnings
                 report.restorable = not unrestorable
+                report.capture_gaps = _gaps_of(spec)
                 report.unrestorable_reasons = list(unrestorable)
                 report.ok = True
                 report.exit_code = int(ExitCode.OK)
@@ -4607,6 +5260,7 @@ def pack(
 
             report.findings = warnings
             report.restorable = not unrestorable
+            report.capture_gaps = _gaps_of(spec)
             report.unrestorable_reasons = list(unrestorable)
             report.ok = True
             report.exit_code = int(ExitCode.OK)
@@ -5178,6 +5832,10 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
             print("→ To pack the files named above as possibly used by this run, run:",
                   file=sys.stderr)
             print(f"  {_cmd}", file=sys.stderr)
+        if report.ok and report.capture_gaps:
+            print(f"■ Not in this nest ({len(report.capture_gaps)}):", file=sys.stderr)
+            for _g in report.capture_gaps:
+                print(f"  · [{_g['kind']}] {gap_line(_g)}", file=sys.stderr)
         if report.ok and not report.dry_run:
             print(sealed_summary(report), file=sys.stderr)
             if args.workflow and not getattr(args, "workflow_ui", None):

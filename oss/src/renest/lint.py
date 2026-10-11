@@ -395,6 +395,24 @@ def lint(
              "read as 'nobody looked' -- which is the honest reading for a nest built "
              "from a hand-written spec, and a gap for one packed from an environment.")
 
+    # Format 2.14: what the packing machine recorded as not carried. The schema holds the
+    # shape; two things it cannot say. An empty list reads as "looked, nothing missing",
+    # which no writer may claim (the writer contract is: leave the block out). And a gap
+    # marked as needed means a restore of this nest ends "not complete" -- worth knowing
+    # before anyone is handed it.
+    _cg = m.get("capture_gaps")
+    if isinstance(_cg, list) and not _cg:
+        warn("capture-gaps-empty",
+             "`capture_gaps` is an empty list. Absent means nothing was recorded; an empty "
+             "list reads as 'nothing is missing', which no packer can know. Leave it out.")
+    _needed = [g.get("subject") for g in _cg if isinstance(g, dict)
+               and g.get("required") == "yes"] if isinstance(_cg, list) else []
+    if _needed:
+        warn("capture-gap-needed",
+             f"the packing machine recorded that this nest does not carry something the run "
+             f"needs ({', '.join(str(s) for s in _needed[:4])}); a restore of it ends with "
+             f"'restored, but not complete'.")
+
     # Format 2.8: contested modules. The schema holds the shape (the fingerprint
     # must be 64 lower-case hex characters, the method one of two words); this is
     # the one relation the schema cannot say. The winner is what a restore

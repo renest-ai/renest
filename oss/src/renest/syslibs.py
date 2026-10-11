@@ -42,7 +42,9 @@ __all__ = [
     "elf_needed",
     "elf_runpaths",
     "elf_soname",
+    "env_cuda_sonames",
     "interpreter_site_packages",
+    "is_cuda_toolkit_path",
     "library_layer",
     "lock_requirement_for",
     "lock_requirements",
@@ -51,6 +53,7 @@ __all__ = [
     "missing_native_libs",
     "node_declared_machine_libs",
     "split_by_layer",
+    "split_toolkit_carried",
     "this_platform_tag",
 ]
 
@@ -620,7 +623,9 @@ def collect_native_libs_with_layers(
     The first half is the nest's list -- None when nothing could be established, in
     which case write nothing rather than an empty list that reads like "this run
     needed none". The second half is what was **deliberately left off**: libraries the
-    run loaded out of the packing interpreter's own installation. It is returned rather
+    run loaded out of the packing interpreter's own installation, and CUDA toolkit
+    libraries the environment's NVIDIA packages also carry (:func:`split_toolkit_carried`;
+    tell the two apart with :func:`is_cuda_toolkit_path`). It is returned rather
     than discarded so the packing side can tell the user, which is the whole complaint
     this function was changed for -- the fact was being established and then thrown
     away in the same breath. Empty on an environment whose Python is uv-managed or the
@@ -639,9 +644,12 @@ def collect_native_libs_with_layers(
     nest_roots = [root]
     site_dirs: list[Path] = []
     venv, home = _interpreter_prefixes(python) if python else (None, None)
+    env_sites: list[Path] = []
     if python and venv is not None:
         nest_roots.append(venv)
         site_dirs += sorted(venv.glob("lib/python*/site-packages"))
+        env_sites = sorted(venv.glob("lib/python*/site-packages")) + sorted(
+            venv.glob("lib/python*/dist-packages"))
     if home is not None:
         # Whether the interpreter's own libraries count depends on which Python this
         # environment uses. One managed by uv brings them along, so that layer needs no
@@ -675,6 +683,8 @@ def collect_native_libs_with_layers(
             break
     if recorded:
         by_path, theirs = split_by_layer(recorded, nest_roots, interp)
+        by_path, carried = split_toolkit_carried(by_path, env_sites)
+        theirs = {**theirs, **carried}
         if by_path and looks_like_the_working_run(list(by_path)):
             # **Ask the package manager about the file that was really loaded**, which
             # the record carried all along. This is the path a real pack takes: measured
@@ -685,6 +695,8 @@ def collect_native_libs_with_layers(
     pids = _pids_running_in(by_exe, [root])
     seen = _loaded_machine_libs(pids, nest_roots) if pids else {}
     by_path, theirs = split_by_layer(seen, nest_roots, interp)
+    by_path, carried = split_toolkit_carried(by_path, env_sites)
+    theirs = {**theirs, **carried}
     loaded = sorted(by_path)
     # **Better a truthful fallback than a false authority.** A process matched here may
     # simply have been passing through; if what it loaded does not look like the run that
@@ -738,6 +750,60 @@ def split_by_layer(
         elif layer == LAYER_MACHINE:
             mine[name] = path
     return mine, theirs
+
+
+#: Where a CUDA toolkit installs its libraries: ``/usr/local/cuda``, ``/usr/local/cuda-12.8``
+#: (and their ``targets/<arch>/lib`` folders), ``/opt/cuda``. The CUDA "devel" images put
+#: one there and point the loader at it.
+_CUDA_TOOLKIT_DIR = re.compile(r"^/(?:usr/local|opt)/cuda(?:-[\d.]+)?(?:/|$)")
+
+
+def is_cuda_toolkit_path(path: str | os.PathLike[str]) -> bool:
+    """Does this file sit inside a CUDA toolkit installation?"""
+    return bool(_CUDA_TOOLKIT_DIR.match(str(path)))
+
+
+def env_cuda_sonames(site_dirs: Sequence[Path]) -> set[str]:
+    """CUDA library file names that the environment's own Python packages carry.
+
+    PyTorch's wheels pull in NVIDIA's ``nvidia-cublas-cu12``, ``nvidia-cudnn-cu12`` and
+    the rest, each of which installs its libraries under ``site-packages/nvidia/<x>/lib``.
+    A rebuild reinstalls those packages from the lock, so a library of the same name is
+    on the rebuilt machine whatever its operating system provides."""
+    out: set[str] = set()
+    for sp in site_dirs:
+        nv = Path(sp) / "nvidia"
+        if not nv.is_dir():
+            continue
+        for p in nv.glob("*/lib/*.so*"):
+            out.add(p.name)
+    return out
+
+
+def split_toolkit_carried(
+    by_path: dict[str, str], site_dirs: Sequence[Path]
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Split machine libraries into ``(still the machine's, carried by the Python packages)``.
+
+    Only a library loaded **out of a CUDA toolkit folder** whose name the environment's
+    NVIDIA packages also carry moves to the second half. Measured batch 24 (2026-10-09):
+    a pack on RunPod's CUDA devel image loaded ``libcublasLt.so.12`` from the toolkit
+    while ``nvidia/cublas/lib/libcublasLt.so.12`` sat in the environment; recorded as a
+    machine requirement (package ``libcublas-12-8``, which only NVIDIA's own package
+    source has), it stopped a restore on an Ubuntu-sourced image before a byte moved.
+    A same-named file elsewhere is **not** enough: a library a package keeps for itself
+    is not one another program can load, and dropping a true requirement is a silent
+    gap, which costs more than a warning."""
+    carried_names = env_cuda_sonames(site_dirs) if by_path else set()
+    mine: dict[str, str] = {}
+    carried: dict[str, str] = {}
+    for name, path in by_path.items():
+        if is_cuda_toolkit_path(path) and (name in carried_names
+                                           or Path(path).name in carried_names):
+            carried[name] = path
+        else:
+            mine[name] = path
+    return mine, carried
 
 
 def _with_packages(out: dict, by_path: dict[str, str]) -> dict:

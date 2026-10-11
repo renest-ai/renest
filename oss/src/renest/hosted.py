@@ -552,6 +552,13 @@ class HostedUploader:
         # The plan comes back from the server; the channel to speak on is ours, so it is
         # attached here rather than asked of the API.
         mp = plan.get("multipart")
+        put_url = plan.get("put_url")
+        if not isinstance(mp, dict) and isinstance(put_url, str) and put_url:
+            # One plain PUT: what the server plans for an empty file (no multi-part
+            # upload to open for zero bytes). Same trust boundary as a part URL.
+            data = path.read_bytes()
+            store_put(client, put_url, data, resumable=True, notice=self._log)
+            return len(data)
         if isinstance(mp, dict):
             mp.setdefault("notice", self._log)
         return upload_blob_multipart(client, path, plan, max_parallel=MAX_PARALLEL_PUT)
@@ -980,7 +987,9 @@ def upload_blob_multipart(
         with path.open("rb") as f:          # every worker gets its own handle
             f.seek(offset)
             chunk = f.read(part_size)
-        if not chunk:
+        # An empty file is one empty part (a server that predates the single-PUT plan
+        # still plans one part for zero bytes; U7 rerun 2026-10-11 stopped here).
+        if not chunk and not (total == 0 and n == 1):
             raise PackError(
                 f"Local blob {plan['sha256'][:12]} is shorter than the upload plan "
                 f"(part {n} starts past the end of the file). Was the pack directory "

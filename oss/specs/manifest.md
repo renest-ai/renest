@@ -1,4 +1,4 @@
-# manifest v2.13 · Nest manifest specification
+# manifest v2.14 · Nest manifest specification
 
 <!-- Version tripwire: the line "current version **x.y**" below is parsed by
      oss/tests/consistency/test_format_version_pinned.py and must agree with
@@ -6,11 +6,11 @@
      top line of the change log. This is the fifth place the version appears --
      the prose is not allowed to drift from the other four. -->
 
-> Status: **current version 2.13** (2026-10-07). Any field change is a format
+> Status: **current version 2.14** (2026-10-11). Any field change is a format
 > change: bump the version and update `manifest.schema.json`, `restore.sh` and
 > `renest lint` in the same change.
 >
-> **Readable versions**: `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` / `2.10` / `2.11` / `2.12` / `2.13`, plus **any future minor
+> **Readable versions**: `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` / `2.10` / `2.11` / `2.12` / `2.13` / `2.14`, plus **any future minor
 > version of the same major** (a reader meeting a newer minor number warns and
 > continues; it does not reject the nest -- see §2).
 > **1.x is refused outright** (a one-time clean break taken while there were no
@@ -29,7 +29,9 @@
 > this nest work), 2.12 in §19 (what each custom node's own compiled files
 > need the machine to provide), 2.13 in §20 (which instruction-set extensions
 > the packing machine's CPU had, and the wheels of packages installed from a git
-> repository or a direct download address travelling inside the nest).
+> repository or a direct download address travelling inside the nest), 2.14 in §21
+> (what the packing machine knew a nest does not carry, and model caches some nodes
+> keep under the home folder).
 > **Every 2.x nest still reads**: no version after 2.0 tightened anything.
 >
 > This document is the **frozen description** of the format: written field by
@@ -75,7 +77,7 @@ have restored perfectly into a brick.
 
 | Field | Required | Type | One line |
 |---|---|---|---|
-| `format_version` | ✔ | enum `2.0` … `2.13` | Format version (the schema enum is the only source of truth) |
+| `format_version` | ✔ | enum `2.0` … `2.14` | Format version (the schema enum is the only source of truth) |
 | `id` | ✔ | string (ULID) | Nest identifier, 26-character Crockford base32 |
 | `created_at` | ✔ | date-time | When it was packed |
 | `name` | | string ≤120 | Human-chosen name |
@@ -93,6 +95,7 @@ have restored perfectly into a brick.
 | `evidence` | | object | **Added in 2.11**: whether anyone ever saw this nest work, and how strong the proof is (§18) |
 | `derived_from` | | object | **Added in 2.4, reserved**: which nest this one was made from (§6.2) |
 | `api_deps` | | array | External API dependencies (honest boundary) |
+| `capture_gaps` | | array | **Added in 2.14**: what this nest knowingly does not carry, as the packing machine recorded it (§6.3) |
 
 **Required set** (schema `required`): `format_version`, `id`, `created_at`,
 `runtime`, `code_deps`, `python_lock`, `files`. Everything else is optional.
@@ -119,7 +122,7 @@ of truth.
 
 ## 2. Identity and metadata
 
-### `format_version` — enum `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` / `2.10` / `2.11` / `2.12` / `2.13` `[schema]`
+### `format_version` — enum `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` / `2.10` / `2.11` / `2.12` / `2.13` / `2.14` `[schema]`
 
 **The `enum` in the schema is the only source of truth.** Everywhere else,
 including this document, is a restatement. Changing the version means changing
@@ -1062,6 +1065,56 @@ by hand, for the escape hatch to run.
 Metadata about where the nest was created: `cloud`, `region`,
 `upload_bandwidth_mbps`, `agent_version`.
 
+### 6.3 `capture_gaps` (optional, array, added in 2.14) — what this nest knowingly does not carry `[schema]` `[measured]`
+
+**Why the format carries this.** Packing has long known a few things a nest leaves
+out, and said them as warnings: files a node fetched for itself while the working run
+went that were not carried (batch 24 U1: 13 files, 0.88 GB, fetched again on restore
+without a word), a data file a node names that sits outside everything packed
+(probe G2), settings a node keeps under the home folder, a cache a node fills there
+(probe J), packages whose GPU build targets were not read before the time budget ran
+out. A warning scrolls away on the packing machine; the person restoring never sees
+it. Recorded here, the restore says it again on the machine where it matters.
+
+Each entry:
+
+| Field | Req. | Type | Meaning |
+|---|---|---|---|
+| `kind` | ✔ | string `^[a-z][a-z0-9_]*$` | What sort of gap. **Open-ended** (see below) |
+| `subject` | ✔ | string, never starting with `/` | A path relative to the environment root, a home-folder path written `~/...`, or a package name. **Never an absolute path on the packing machine** |
+| `detail` | | string ≤600 | One short English sentence: why it is not carried, or what it is |
+| `required` | ✔ | `yes` / `maybe` / `cache` | `yes` = the run needs it; `maybe` = it may; `cache` = a cache the app refills by itself while its source is reachable |
+
+Kinds written today:
+
+| `kind` | `subject` | `required` | Written when |
+|---|---|---|---|
+| `runtime_download` | path | `maybe` | A file the working run fetched into a models folder that was **not** carried (an unused duplicate beside the weights the run held open), or a file the run may use that could only be named because there was no run window to measure against |
+| `data_outside_node` | path | `maybe` | A node names a data file in its code (a string constant) and a file by that name sits under the environment root, outside everything packed |
+| `native_arch_unread` | package name | `maybe` | Packing ran out of its time budget before reading which GPU generations this package's binaries were built for |
+| `home_config` | `~/.config/...` or `~/.local/share/...` | `maybe` | A folder there belongs to a node (named like the node's folder, or named in its code) |
+| `home_cache_not_carried` | `~/.cache` | `cache` | A node's code builds a path under the home folder's `.cache`: first-use downloads the nest does not carry |
+
+**Absent is not empty.** Absent = an older nest, or a packer that recorded nothing. It
+never means "nothing is missing". A writer leaves the block out instead of writing
+`[]` (`renest lint` warns `capture-gaps-empty`).
+
+**Reader obligations.**
+1. Print every entry: kind, subject, how much it is needed, detail. Both restore
+   legs print one line per entry (`oss/tests/consistency/test_both_legs_agree_on_capture_gaps.py`
+   feeds both the same manifests and compares the lines and the verdict).
+2. Only an entry with `required: "yes"` may turn a restore's closing words into
+   "restored, but not complete". **No entry changes an exit code or stops a restore**
+   (the escape hatch only tells, ruling of 2026-07-15). Nothing writes `yes` today.
+3. A `kind` the reader does not know gets the same line as any other. New kinds are
+   added without a format change; a reader never refuses a nest over one.
+4. An entry of kind `native_arch_unread` makes the compiled-extension card check report
+   "unknown -- not read at pack time" for that package, **never "pass"**.
+
+**What it is not.** It is not a list of everything outside the nest (models the recipe
+never names are listed by the pack report, not here), and it is not a promise that
+everything not listed travelled: it records what packing *knew* it left out.
+
 ### 6.2 `derived_from` (optional, added in 2.4) — reserved `[schema]`
 
 Which nest this one was made from, when splitting or merging nests produced it.
@@ -1851,3 +1904,47 @@ application does not start; it never refuses and never changes an exit code.
 | No wheels for vendor-only pins (`torch==…+cu124`) | They come from an index, not from a direct address, and are handled by pinning (`pinned_wheel_urls`) |
 | No editing of the lock in the nest | The lock keeps the original source; the swap happens in a working copy at restore time, so the byte check of the lock is unaffected and an older reader sees what it always saw |
 | No glibc-version check in "fits" | The same matching the pinning step uses. A `manylinux_2_28` wheel on an older glibc is refused by the installer with its own message; the lock in the nest still names the original source for a manual retry. Stored wheels are built on the packing machine, so in practice their glibc floor is that machine's |
+
+## 21. What 2.14 changed (2026-10-11)
+
+Two additions, both optional, and one of them a new landing root. Every 2.0–2.13
+nest reads unchanged.
+
+| What | Breaking? | Why |
+|---|---|---|
+| `capture_gaps` (top level) -- what the packing machine knew this nest does not carry (§6.3) | No (additive, optional) | Packing has said these things only as warnings, which scroll away on the packing machine; the person restoring never saw them. Batch 24 U1 (2026-10-09): a face-swap node fetched 13 files (0.88 GB) on first use, packing only named them, and the restore fetched them again without a word |
+| `files[].root: "home"` -- model caches some nodes keep under the home folder (§5.1) | No for nests that do not use it. A 2.13 reader meeting a `home` entry refuses that nest at its landing gate ("unknown place to put files"), as it was written to | Measured 2026-10-10 against current releases: Hugging Face's hub cache (CLIPSeg, grounding-dino), rembg (`~/.rembg/models/<name>/<name>.onnx`, 176 MB for u2net), transparent-background and insightface keep real weights under the home folder and no nest ever carried them |
+
+### 21.1 The `home` root
+
+- **Allowlist only**: `.cache/huggingface/hub/models--*/(refs/<branch>|snapshots/<40-hex>/…|.no_exist/<40-hex>/…)`
+  (`.no_exist` holds Hugging Face's empty markers for files the repository does not have),
+  `.rembg/…`, `.transparent-background/…`, `.insightface/…`. Nothing else under the home
+  folder qualifies; a file named `token` or `stored_tokens` never does; outside the Hugging
+  Face snapshots, program code never does. Readers enforce this again on the restoring
+  machine.
+- **It lands inside the rebuild target**, at `<target>/.renest/home/<path>`, not in the
+  restoring user's home folder. The app is started with each library's own setting
+  pointed there: `HF_HUB_CACHE=<target>/.renest/home/.cache/huggingface/hub`,
+  `REMBG_HOME=<target>/.renest/home/.rembg`, `TRANSPARENT_BACKGROUND_FILE_PATH=<target>/.renest/home`
+  (only for the caches the nest carries). The escape hatch prints them as `export` lines.
+- **insightface has no such setting** (its root is a function default), so its files are
+  also copied into `~/.insightface` -- the one place a nest writes outside the target.
+  The agent names every file first, stops and asks for a nest someone handed you (as
+  for setup commands; `--yes` answers), and never overwrites an existing file with
+  different bytes. The escape hatch names them, warns, and goes ahead only on a typed
+  `yes` or `RENEST_ACCEPT_HOME_WRITES=1` (ruling of 2026-10-09: on a risk, warn loudly
+  and ask; never refuse on the user's behalf).
+- **What a packer carries**: only what the working run used -- files the run's process
+  held open, or that appeared between that process's start and the picture the nest
+  records. A Hugging Face snapshot the run touched brings `refs/<branch>` and its small
+  companions (config, tokenizer); its entries travel as real files, never links. A cache
+  is never swept whole.
+
+### Explicitly not done (2.14)
+
+| Not done | Why |
+|---|---|
+| No `home` root for arbitrary home-folder paths | A nest is someone else's bytes; an allowlist that grows by measurement is the only safe shape |
+| No `required: "yes"` written by any packer | Nothing measured today can say "the run needs this" with certainty; the reader plumbing exists so the day it can, the closing words are already honest |
+| `capture_gaps` never changes an exit code | It is disclosure, like `evidence`; a restore that got every listed byte back succeeded at what it promised |

@@ -53,6 +53,8 @@ PROBE_TIMEOUT_S = 5.0
 DOWNLOAD_TIMEOUT_S = 30.0  # per-read timeout (not overall wall clock); 30s stall = dead
 RANGE_WORKERS = 8  # measured choice: 8 concurrent ranges
 SINGLE_STREAM_MAX = 8 * 1024 * 1024  # below 8 MiB, segmentation is not worth it
+#: The sha256 of zero bytes: an empty blob needs no source at all.
+EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 UNSUPPORTED_KINDS = frozenset({"torrent", "magnet"})
 
 
@@ -472,6 +474,16 @@ def resolve(
             blob.sha256,
             [{"host": "-", "kind": "-", "url": "-", "reason": "the manifest lists no sources"}],
         )
+    if blob.size_bytes == 0 and blob.sha256 == EMPTY_SHA256:
+        # Nothing to fetch: zero bytes have exactly one sha256, so the empty file *is*
+        # the verified file. (Hugging Face's `.no_exist/` markers travel this way. Asking
+        # a source would only cost a request -- and a `Range: 0-0` probe of an empty
+        # object answers 416, which would read as a dead source.)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"")
+        return ResolveReport(sha256=blob.sha256, winner_host="-", winner_kind="none",
+                             mode="empty", transfer_seconds=0.0, verify_seconds=0.0,
+                             mbps=0.0)
     own_client = client is None
     client = client or httpx.Client(follow_redirects=True)
     attribution: list[dict] = []
