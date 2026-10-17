@@ -2,6 +2,40 @@
 
 What changed for the person using `renest`. Dates are the release date.
 
+## 0.1.25 — 2026-10-17
+
+### When your drive can't take a nest, the panel says why and what to do next
+Saving from the ComfyUI panel used to end on "Job failed" when the Renest drive refused the
+upload. Now the panel shows the drive's own explanation with a link to fix it ("See plans",
+or "Make room or upgrade" when your storage is full) and offers to keep the nest on the
+machine instead. A plan that can't store nests of your own is now told so before you are
+asked to approve anything. Any other failure now carries its real reason too.
+
+### "Save on this machine only" in the ComfyUI panel
+After the preview, the panel offers two ways: save to your Renest drive (approved once per upload in
+your browser) or save on this machine only. The
+second is free, needs no account and uploads nothing; the panel says where the nest is and
+that it is gone when the machine is.
+This needs comfyui-renest 0.1.11 or later.
+
+## 0.1.24 — 2026-10-17
+
+### Save from the ComfyUI panel straight to your Renest drive, approved in your browser
+New `renest login`: run it once in the machine's terminal, open the link it prints in a
+browser where you are signed in, check the code, approve. What the machine keeps can only
+*ask* for an upload. Each time you save from the ComfyUI panel, the panel shows a code and a
+link; you approve that one upload in your browser, and only the account that signed the
+machine in can approve it. The permission covers that one upload and is switched off when it
+ends, fails or is cancelled. Cancelling while it waits withdraws the request.
+`renest login` leaves an access token the machine already has alone; `--replace` swaps it.
+This needs comfyui-renest 0.1.10 or later.
+
+### A nest no longer carries the last nest inside it
+When the folder you pack holds your nodes and models but not ComfyUI's own `main.py` (the
+desktop app's layout, or ComfyUI started with `--base-directory`), nests land in a
+`renest-nests` folder inside it. The next pack read that folder too, so every nest carried
+the previous one and grew by its size. `renest-nests` is now never packed.
+
 ## 0.1.23 — 2026-10-11
 
 ### Restoring a nest someone handed you: every file that does not travel is named first

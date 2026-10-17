@@ -302,7 +302,8 @@ COMFYUI_CORE_EXCLUDE = ["models", "output", "temp", "input", "user"]
 #: pinned together by ``test_two_trees.test_never_archived_mirrors_pack``. Read
 #: here so the second-tree check below does not count a folder that would leave
 #: the archive empty anyway.
-_NEVER_ARCHIVED = frozenset({".git", "__pycache__", ".venv", "venv", "node_modules", ".renest"})
+_NEVER_ARCHIVED = frozenset({".git", "__pycache__", ".venv", "venv", "node_modules", ".renest",
+                             "renest-nests"})
 
 
 def _data_tree_leftovers(comfyui_dir: Path, exclude: Iterable[str]) -> list[str]:

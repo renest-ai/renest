@@ -26,6 +26,7 @@ from . import doctor as _doctor
 from . import export as _export
 from . import lint as _lint
 from . import listing as _listing
+from . import login as _login
 from . import pack as _pack
 from . import presign as _presign
 from . import restore as _restore
@@ -56,6 +57,7 @@ _SUMMARY = {
     "support": "turn a failed run into something you can read, then paste into a ticket",
     "list": "list the nests on your Renest drive (add an id to see its versions)",
     "export": "take a complete copy of a nest off your drive — to this machine, or on into your own bucket",
+    "login": "sign this machine in, so the ComfyUI panel can ask you to approve each upload",
 }
 
 #: subcommand -> (add_arguments, run_from_args) for wired commands.
@@ -81,6 +83,9 @@ _HANDLERS = {
     # The self-serve way out of the hosted drive: download the whole archive,
     # optionally push it on into the user's own bucket.
     "export": (_export.add_arguments, _export.run_from_args),
+    # Signs this machine in from its own terminal (device sign-in, approved in the
+    # browser). The token it keeps can only ask for one upload to be approved.
+    "login": (_login.add_arguments, _login.run_from_args),
 }
 
 #: subcommand -> note for commands not built yet (none left).

@@ -28,6 +28,7 @@ import secrets
 import sys
 import tempfile
 import threading
+import time
 import urllib.parse
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -259,6 +260,94 @@ class _JobCancelled(Exception):
     """Raised inside the event sink to unwind a running job cooperatively."""
 
 
+class _JobFailed(Exception):
+    """Ends a job as ``failed`` with a ready error object (no traceback text)."""
+
+    def __init__(self, error: dict) -> None:
+        super().__init__(error.get("human", ""))
+        self.error = error
+
+
+#: Said when the panel asks for an upload and this machine has no Renest sign-in.
+#: The panel shows the command with a Copy button; keep the command last.
+NOT_SIGNED_IN = "This machine is not signed in to Renest. In its terminal, run: renest login"
+
+#: Bounds on how often serve asks whether an upload was approved.
+APPROVAL_MIN_INTERVAL_S = 1.0
+APPROVAL_MAX_INTERVAL_S = 30.0
+
+
+def _failure(stage: str, error_class: str, human: str,
+             actions: list[dict] | None = None) -> dict:
+    out = {"stage": stage, "error_class": error_class, "detail": human, "human": human}
+    if actions:
+        # Ways forward the Renest service offered (``[{"label", "url"}]``, web pages
+        # only -- approval._actions dropped anything else); the panel shows them as links.
+        out["actions"] = list(actions)
+    return out
+
+
+def _approval_refusal(stage: str, e: Any) -> dict:
+    """A refusal from the approval endpoints, as the job's error.
+
+    401 stays ``NOT_SIGNED_IN`` (the panel answers it with ``renest login``); any other
+    refusal the service named keeps the service's own code, sentence and ways forward,
+    so a paywall reads as a paywall and not as "the upload was not approved".
+    """
+    if e.status == 401:
+        return _failure(stage, "NOT_SIGNED_IN", e.human)
+    return _failure(stage, e.code or "UPLOAD_NOT_APPROVED", e.human, e.actions)
+
+
+#: Said when a job ends red and nothing more specific survived. Never "Job failed":
+#: that sentence is how a 402 from the drive reached a person on 2026-10-17.
+UNEXPLAINED_FAILURE = ("Packing stopped without saying why. The log below shows the last "
+                       "thing it was doing.")
+
+
+def _job_error(failure: Any, findings: Any, stage: str) -> dict:
+    """The job's error object from what a red report carried.
+
+    * a failure object the drive refusal filled in (``context.server_code``) is handed
+      on as the service said it: its code, its sentence, its ways forward;
+    * any other failure object goes through unchanged;
+    * none at all (most ``PackError``s carry only a sentence): the last thing the report
+      said, which is that sentence -- dropping it is how "Job failed" happened.
+    """
+    if isinstance(failure, dict) and failure:
+        ctx = failure.get("context") if isinstance(failure.get("context"), dict) else {}
+        code = ctx.get("server_code")
+        if isinstance(code, str) and code:
+            out = dict(failure)
+            out["error_class"] = code
+            out["human"] = failure.get("human") or failure.get("detail") or UNEXPLAINED_FAILURE
+            if ctx.get("actions"):
+                out["actions"] = list(ctx["actions"])
+            return out
+        return failure
+    said = [f for f in (findings or []) if isinstance(f, str) and f.strip()]
+    human = said[-1] if said else UNEXPLAINED_FAILURE
+    return {"stage": stage or "?", "error_class": "UNKNOWN", "detail": human, "human": human}
+
+
+def _console_base(verify_url: str) -> str | None:
+    """The web console's address, read off the approval page the service named.
+
+    The engine has no setting of its own for it, and inventing one would drift from
+    the console the person actually approved in.
+    """
+    try:
+        u = urllib.parse.urlsplit(verify_url)
+    except ValueError:
+        return None
+    if u.scheme not in ("https", "http") or not u.netloc:
+        return None
+    path = u.path
+    cut = path.rfind("/approve")
+    prefix = path[:cut] if cut >= 0 else ""
+    return f"{u.scheme}://{u.netloc}{prefix}"
+
+
 # --------------------------------------------------------------------------
 # job
 # --------------------------------------------------------------------------
@@ -286,6 +375,11 @@ class Job:
         self.error: dict | None = None
         self.log_path = log_path
         self.cancel_requested = threading.Event()
+        #: While an upload waits for the person's approval: what the panel shows
+        #: (``user_code``, ``verify_url``, ``expires_at``). Never a credential.
+        self.approval: dict | None = None
+        #: Where the upload landed on the Renest drive; folded into ``result``.
+        self.drive: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -300,6 +394,7 @@ class Job:
             "logs_tail": list(self.logs),
             "result": self.result,
             "error": self.error,
+            "approval": self.approval,
         }
 
 
@@ -322,6 +417,11 @@ class ServeApp:
         pack_fn: Callable[..., Any] | None = None,
         restore_fn: Callable[..., Any] | None = None,
         creds_fn: Callable[..., Any] | None = None,
+        signin_token_fn: Callable[[], str | None] | None = None,
+        origin: str | None = None,
+        http_client_fn: Callable[[], Any] | None = None,
+        uploader_cls: Callable[..., Any] | None = None,
+        approval_min_interval: float = APPROVAL_MIN_INTERVAL_S,
     ) -> None:
         self.token_file = Path(token_file)
         self.state_dir = Path(state_dir) if state_dir else Path(platformdirs.user_state_dir(APP_NAME))
@@ -335,6 +435,13 @@ class ServeApp:
         self._pack_fn = pack_fn or _default_pack_fn
         self._restore_fn = restore_fn or _default_restore_fn
         self._creds_fn = creds_fn or resolve_credentials
+        # Upload path (panel → Renest drive). The sign-in token is read fresh for each
+        # job and the upload-once token never leaves the job's own stack frame.
+        self._signin_token_fn = signin_token_fn or _default_signin_token
+        self._origin = origin
+        self._http_client_fn = http_client_fn or _default_http_client
+        self._uploader_cls = uploader_cls
+        self._approval_min_interval = approval_min_interval
         #: What the last preview already read, kept for the pack behind the
         #: button. One slot, keyed by target -- see :meth:`_read_record_for`.
         self._read_record: tuple[str, Any] | None = None
@@ -623,13 +730,20 @@ class ServeApp:
         except _JobCancelled:
             self._settle_cancelled(job)
             return
+        except _JobFailed as e:
+            job.state = "failed"
+            job.approval = None
+            job.error = e.error
+            job.finished_at = _iso_now()
+            self._persist(job)
+            return
         except Exception as e:  # backstop: a crash still yields a truthful job
             job.state = "failed"
             job.error = {
                 "stage": job.stage or "?",
                 "error_class": "UNKNOWN",
                 "detail": f"{type(e).__name__}: {e}",
-                "human": str(e),
+                "human": str(e) or f"{type(e).__name__}. {UNEXPLAINED_FAILURE}",
             }
             job.finished_at = _iso_now()
             self._persist(job)
@@ -642,6 +756,7 @@ class ServeApp:
         self._settle_report(job, report)
 
     def _settle_cancelled(self, job: Job) -> None:
+        job.approval = None
         job.state = "cancelled"
         job.finished_at = _iso_now()
         self._persist(job)
@@ -652,21 +767,196 @@ class ServeApp:
         if ok:
             job.state = "succeeded"
             job.result = report.to_dict()
+            if job.drive:
+                job.result["drive"] = job.drive
             if job.kind == "pack" and job.params.get("shutdown_after"):
                 # advisory only: serve records intent, never kills the host itself
                 job.result["shutdown_at"] = _iso_now()
             self._record_nest(job.kind, report, job.params.get("name"))
         else:
             job.state = "failed"
-            job.error = getattr(report, "failure", None) or {
-                "stage": job.stage or "?",
-                "error_class": "UNKNOWN",
-                "detail": "The job failed but carried no error object",
-                "human": "Job failed",
-            }
+            job.error = _job_error(getattr(report, "failure", None),
+                                   getattr(report, "findings", None), job.stage or "?")
         self._persist(job)
 
     def _run_pack(self, job: Job) -> Any:
+        if job.params.get("upload") is True:
+            return self._run_pack_upload(job)
+        return self._pack_once(job)
+
+    # -- upload to the Renest drive, approved once in the person's browser ------
+    def signed_in(self) -> bool:
+        return bool(self._signin_token())
+
+    def _signin_token(self) -> str | None:
+        try:
+            return self._signin_token_fn() or None
+        except Exception:  # an unreadable config is "not signed in", never a crash
+            return None
+
+    def _api_origin(self) -> str:
+        if self._origin:
+            return self._origin
+        from .update_rules import DEFAULT_ORIGIN
+
+        return os.environ.get("RENEST_ORIGIN") or DEFAULT_ORIGIN
+
+    def _run_pack_upload(self, job: Job) -> Any:
+        """Pack, then upload to the Renest drive under an approval given in the browser.
+
+        [SECURITY-REVIEW] Order matters: (1) no sign-in, stop before reading a byte;
+        (2) ask the service for an approval naming this nest and its size; (3) wait
+        for the person to approve it in their own browser; (4) only then hold the
+        upload-once token, in this frame's locals and the uploader it is handed to,
+        pack + upload with it, and revoke it with ``/finish`` however the run ends.
+        The machine's sign-in token is never used to upload, and neither token is
+        written to the job, its log, its persisted state or an error.
+        """
+        from .approval import (
+            ApprovalError,
+            cancel_upload_approval,
+            finish_upload,
+            request_upload_approval,
+        )
+        from .login import machine_label
+
+        signin = self._signin_token()
+        if not signin:
+            raise _JobFailed(_failure("approval", "NOT_SIGNED_IN", NOT_SIGNED_IN))
+        try:
+            preview = self.pack_dry_run(job.params)
+        except ServeError as e:
+            raise _JobFailed(_failure("P1", "UNKNOWN", e.human)) from None
+        name = job.params.get("name")
+        name = name.strip() if isinstance(name, str) and name.strip() else preview["default_name"]
+        size = int(preview.get("size_estimate_bytes") or 0)
+
+        origin = self._api_origin()
+        client = self._http_client_fn()
+        upload_token: str | None = None
+        approval_id: str | None = None
+        outcome = "failed"
+        try:
+            try:
+                approval = request_upload_approval(
+                    client, origin, signin, nest_name=name, size_bytes=size,
+                    machine_label=machine_label())
+            except ApprovalError as e:
+                # Before anything was read for the upload: a refused plan or a full
+                # drive ends here, with the service's own sentence and ways forward.
+                raise _JobFailed(_approval_refusal("approval", e)) from None
+            approval_id = approval.approval_id
+            job.stage = "approval"
+            job.approval = {
+                "user_code": approval.user_code,
+                "verify_url": approval.verify_url,
+                "expires_at": datetime.fromtimestamp(
+                    time.time() + approval.expires_in, UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            self._on_event(job, {"type": "stage_start", "stage": "approval",
+                                 "desc": "Waiting for you to approve this upload in your browser"})
+            self._persist(job)
+
+            upload_token = self._await_approval(job, client, origin, signin, approval)
+            job.approval = None
+            job.stage = "P1"
+            self._on_event(job, {"type": "stage_end", "stage": "approval",
+                                 "desc": "Upload approved in your browser"})
+            self._persist(job)
+
+            if self._uploader_cls is not None:
+                uploader_cls = self._uploader_cls
+            else:
+                from .hosted import HostedUploader as uploader_cls
+
+            def say(message: str) -> None:
+                self._on_event(job, {"type": "info", "stage": "P3", "human": str(message)})
+
+            uploader = uploader_cls(
+                origin, upload_token, nest_name=name, client=client, log=say, notice=say,
+                challenges=False, check_name=False, upload_once=True,
+            )
+            report = self._pack_once(job, uploader=uploader)
+            landed = getattr(uploader, "result", None)
+            uploader = None  # it holds the upload-once token; let it go with the run
+            ok = getattr(report, "ok", False) and int(getattr(report, "exit_code", 1)) == 0
+            if job.cancel_requested.is_set():
+                outcome = "cancelled"
+            elif ok and landed is not None and getattr(landed, "nest_id", None):
+                outcome = "succeeded"
+                nest_id = str(landed.nest_id)
+                base = _console_base(approval.verify_url)
+                job.drive = {
+                    "nest_id": nest_id,
+                    "nest_version_id": getattr(landed, "nest_version_id", None),
+                    "version_no": getattr(landed, "version_no", None),
+                    "nest_name": getattr(landed, "nest_name", None) or name,
+                    "console_url": (f"{base}/nests/{urllib.parse.quote(nest_id, safe='')}"
+                                    if base else None),
+                }
+            elif ok:
+                # A pack that says ok without the drive naming where it landed is not
+                # a nest anyone can find; never call it saved.
+                raise _JobFailed(_failure(
+                    "P3", "UNKNOWN",
+                    "The nest was packed, but your Renest drive did not confirm where it "
+                    "landed. Check the drive before packing again."))
+            return report
+        except _JobCancelled:
+            outcome = "cancelled"
+            raise
+        finally:
+            if upload_token is not None and approval_id is not None:
+                finish_upload(client, origin, upload_token, approval_id, outcome)
+            elif approval_id is not None and signin:
+                # Cancelled or failed while the approval was still open: withdraw it, so a
+                # token approved a moment too late is revoked by the service, not left to
+                # its hard cap. The sign-in token is used here only to withdraw.
+                cancel_upload_approval(client, origin, signin, approval_id)
+            upload_token = None
+            signin = None
+            with contextlib.suppress(Exception):
+                client.close()
+
+    def _await_approval(self, job: Job, client: Any, origin: str, signin: str,
+                        approval: Any) -> str:
+        """Poll until the person approves or denies, the request expires, or the job
+        is cancelled. Returns the upload-once token; everything else ends the job."""
+        from .approval import ApprovalError, poll_upload_approval
+
+        def fail(human: str, error_class: str = "UPLOAD_NOT_APPROVED") -> _JobFailed:
+            return _JobFailed(_failure("approval", error_class, human))
+
+        deadline = time.monotonic() + approval.expires_in + 5
+        gap = min(max(approval.interval, self._approval_min_interval), APPROVAL_MAX_INTERVAL_S)
+        while True:
+            if job.cancel_requested.wait(gap):
+                # The caller withdraws the approval on the way out (see its finally).
+                raise _JobCancelled()
+            try:
+                got = poll_upload_approval(client, origin, signin, approval.approval_id)
+            except ApprovalError as e:
+                raise _JobFailed(_approval_refusal("approval", e)) from None
+            status = str(got.get("status") or "")
+            if status == "approved":
+                token = got.get("upload_token")
+                if isinstance(token, str) and token:
+                    return token
+                raise fail("The upload was approved, but the approval could not be collected. "
+                           "Press \"Nest this run\" again to ask once more.")
+            if status == "denied":
+                raise fail("The upload was denied in the browser. Nothing was uploaded.")
+            if status == "expired" or time.monotonic() > deadline:
+                raise fail("Nobody approved the upload in time, so nothing was uploaded. "
+                           "Press \"Nest this run\" again to ask once more.")
+            if status in ("consumed", "finished"):
+                raise fail("This approval was already used. Press \"Nest this run\" again to "
+                           "ask once more.")
+            if status not in ("", "pending"):
+                raise fail(f"The approval ended in a state this version does not know "
+                           f"({status[:40]}). Nothing was uploaded.")
+
+    def _pack_once(self, job: Job, uploader: Any = None) -> Any:
         body = job.params
         spec, workflow = self._resolve_spec(body)
         # ``out`` = the local folder the nest lands in (as the CLI ``--out``); left
@@ -675,6 +965,7 @@ class ServeApp:
         # the CLI ``--dest``, which means "which cloud to upload to".
         dest = body.get("out") or body.get("dest") or str(default_out_dir(body["target"]))
         emitter = EventEmitter(json_mode=False, sink=self._make_sink(job))
+        extra: dict[str, Any] = {"uploader": uploader} if uploader is not None else {}
         return self._pack_fn(
             body["target"],
             spec,
@@ -700,6 +991,7 @@ class ServeApp:
             # tree when the desktop build keeps it apart; env_python = the running
             # interpreter, read live when there is no lock file.
             **_env_hints(body),
+            **extra,
         )
 
     def _run_restore(self, job: Job) -> Any:
@@ -710,6 +1002,19 @@ class ServeApp:
 # --------------------------------------------------------------------------
 # default (production) executors — call the real modules read-only
 # --------------------------------------------------------------------------
+def _default_signin_token() -> str | None:
+    """This machine's Renest sign-in (``renest login``) or a personal access token."""
+    from .config import resolve_token
+
+    return resolve_token()
+
+
+def _default_http_client() -> Any:
+    import httpx
+
+    return httpx.Client()
+
+
 def _default_pack_fn(*args: Any, **kwargs: Any) -> Any:
     from .pack import pack  # local import: keeps `serve` import light
 
@@ -867,6 +1172,11 @@ def make_handler(app: ServeApp) -> type[BaseHTTPRequestHandler]:
                     self._send(200, self.app.pack_dry_run(body))
                 except ServeError as e:
                     self._send(e.status, {"error": e.human})
+                return
+            if body.get("upload") is True and not self.app.signed_in():
+                # Said before anything is queued or read: nothing can be uploaded
+                # until the machine is signed in from its own terminal.
+                self._send(409, {"error": NOT_SIGNED_IN, "error_class": "NOT_SIGNED_IN"})
                 return
             self._enqueue("pack", body)
 

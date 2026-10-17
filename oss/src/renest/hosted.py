@@ -312,6 +312,29 @@ def _error_message(resp: httpx.Response) -> str:
     return f"HTTP {resp.status_code}"
 
 
+def _named_refusal(resp: httpx.Response) -> dict | None:
+    """The error object for a refusal the service named (``PLAN_CANNOT_PACK``,
+    ``QUOTA_EXCEEDED``, ...), so whoever drives the pack can hand on the service's own
+    sentence and ways forward instead of only our wrapped line. ``None`` when the
+    service named nothing: then the wrapped line is all there is.
+
+    The code rides in ``context.server_code`` rather than ``error_class``, which stays
+    the contract-1.3 vocabulary.
+    """
+    from .approval import server_refusal
+
+    code, message, actions = server_refusal(resp)
+    if not code:
+        return None
+    context: dict = {"server_code": code, "http_status": resp.status_code}
+    if actions:
+        context["actions"] = actions
+    return NestFailure(
+        "P3", ErrorClass.UNKNOWN, message or code, context=context,
+        exit_code=int(ExitCode.USAGE),
+    ).to_error_object()
+
+
 class HostedUploader:
     """Uploader with the shape ``(blobs_dir, manifest) -> {sha256: size}``, which
     can be injected into pack().
@@ -334,11 +357,22 @@ class HostedUploader:
         report: bool = True,
         full_disclosure: bool = False,
         notice: Callable[[str], None] | None = None,
+        challenges: bool = True,
+        check_name: bool = True,
+        upload_once: bool = False,
     ) -> None:
         """``notice`` is where the reporting disclosure is written. It is separate from
         ``log`` on purpose: ``--json`` silences ``log``, but a run that reports must still
         say so (on stderr, like restore does, so stdout stays clean). ``full_disclosure``
         swaps the five-line note for the field-by-field list (an explicit ``--verbose``).
+
+        ``challenges=False`` and ``check_name=False`` are for an upload made with an
+        upload-once token (the ComfyUI panel path): that token may announce **one**
+        upload session and reach nothing outside the upload itself, so the byte spot
+        check (which re-announces when a check fails) and the name lookup (which lists
+        the drive) are both left out. ``upload_once=True`` says the token is such an
+        upload-once token, so a refusal is explained in those terms rather than with
+        advice about generating an access token.
         """
         self._origin = origin.rstrip("/")
         self._token = token
@@ -349,6 +383,9 @@ class HostedUploader:
         self._report_enabled = report
         self._full_disclosure = full_disclosure
         self._notice = notice or _stderr_notice
+        self._challenges = challenges
+        self._check_name = check_name
+        self._upload_once = upload_once
         self._disclosed = False
         # After one failed report, this process stops trying (same rule as the
         # restore side).
@@ -428,6 +465,12 @@ class HostedUploader:
             headers={"Authorization": f"Bearer {self._token}"},
             timeout=_API_TIMEOUT,
         )
+        if resp.status_code == 401 and self._upload_once:
+            raise PackError(
+                "This upload's approval was withdrawn or ran out. Start the upload again "
+                "from the panel.",
+                exit_code=int(ExitCode.CONFIG_OR_CREDENTIAL),
+            )
         if resp.status_code == 401:
             raise PackError(
                 "Your sign-in token is invalid or expired. Generate a new one in the web "
@@ -445,7 +488,8 @@ class HostedUploader:
                 exit_code=int(ExitCode.USAGE),
             )
         if resp.status_code >= 400:
-            raise PackError(f"Hosted storage refused this upload: {_error_message(resp)}")
+            raise PackError(f"Hosted storage refused this upload: {_error_message(resp)}",
+                            failure=_named_refusal(resp))
         return resp
 
     def _await_verdict(
@@ -669,14 +713,15 @@ class HostedUploader:
                 # Declare that this client can answer byte spot checks. A correct
                 # answer skips the upload; failing to answer always falls back to
                 # uploading the file in full.
-                "challenges": True,
+                "challenges": self._challenges,
             }
             if self._nest_id:
                 body["nest_id"] = self._nest_id
             else:
                 bucket = self._api(client, "POST", "/buckets/provision", json_body={}).json()
                 name = self._nest_name or str(manifest.get("name") or "") or f"nest-{manifest['id']}"
-                self._warn_if_name_taken(client, name)
+                if self._check_name:
+                    self._warn_if_name_taken(client, name)
                 body["new_nest"] = {"name": name, "bucket_id": bucket["id"]}
                 self.result.nest_name = name
                 self.result.created_new_nest = True
@@ -693,6 +738,15 @@ class HostedUploader:
             # the local copy, and a correct answer skips the upload. If anything
             # cannot be proven, announce once more without challenges so the whole
             # run falls back to full uploads — a saving must never block a finish.
+            if not self._challenges and any(
+                    p.get("action") not in ("upload", "already_owned") for p in plans):
+                # Asked for no spot checks, so anything but upload / already there is a
+                # plan this run cannot follow without announcing a second session.
+                raise PackError(
+                    "The server's upload plan asks for a step this upload cannot take "
+                    "(a spot check was not offered). Nothing was sent.",
+                    exit_code=int(ExitCode.S1_STORAGE_UNAVAILABLE),
+                )
             spot_checks = [p for p in plans
                            if p.get("action") == "challenge_available" and p["sha256"] in wanted]
             if spot_checks:

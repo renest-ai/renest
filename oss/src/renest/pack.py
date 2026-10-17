@@ -274,7 +274,10 @@ HASH_CACHE_REL = ".renest/state/hash-cache.json"
 #: said they mirrored each other, and a test could pass against one while the other
 #: still let the file through (found 2026-08-23, by a falsification that refused to
 #: go red).
-ARCHIVE_JUNK = (".git", "__pycache__", ".venv", "venv", "node_modules", ".renest")
+#: ``renest-nests`` is where nests land by default -- inside the packed folder when that
+#: folder is a data tree with no main.py. Archived, every pack would carry the last one
+#: and grow by its size (measured 2026-10-16: 389 MB, then 674 MB on the next preview).
+ARCHIVE_JUNK = (".git", "__pycache__", ".venv", "venv", "node_modules", ".renest", "renest-nests")
 _HASH_CACHE_FORMAT = 1
 
 

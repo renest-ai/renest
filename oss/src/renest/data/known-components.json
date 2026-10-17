@@ -269,6 +269,366 @@
       "verdict": "restricted",
       "reason": "No licence is stated for these weights: the author's Hugging Face repository declares none, and the MIT licence of the code repository github.com/G-U-N/AnimateLCM does not mention the weights.",
       "provenance": "Checked 2026-10-11. sha256 equals the lfs.oid Hugging Face gives for this path at the pinned revision (size 134621556). The Hugging Face API for wangfuyun/AnimateLCM returns no licence in cardData and no licence tag, and the model card (main, read 2026-10-11) contains no licence statement. The code repository github.com/G-U-N/AnimateLCM carries an MIT licence; its README does not say that licence covers the released weights. With nothing stated for the weights the default answer applies. Without this row a content-hash lookup on Civitai finds a re-upload whose permission flags allow passing it on, and the file is released on a stranger's say-so. spdx is not on the allow-list on purpose, so a client that predates the verdict field reads this row as releasing nothing. The pinned address is kept so a recipient is told where to fetch the file."
+    },
+    {
+      "sha256": "6125cacc01fa93bdc98a0c5101cefcd69b2ed1f8ab4f38d86f4ad5984f5dc863",
+      "name": "google/siglip2-base-patch16-256 model.safetensors",
+      "origin_url": "https://huggingface.co/google/siglip2-base-patch16-256",
+      "path": "model.safetensors",
+      "revision": "3f9f96cb90da5dbc758b01813f2f6f1aee24c1ab",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 3f9f96cb gives lfs.oid equal to this sha256 (size 1500985224). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Google is the author and the publisher. The code repository github.com/google-research/big_vision, which the SigLIP papers release from, is Apache-2.0."
+    },
+    {
+      "sha256": "9f6da5ad2e3178b0c1197b740c9ffefee0bc733ee8759095a5ea8c4c845a3f4e",
+      "name": "google/siglip2-giant-opt-patch16-384 model-00001-of-00002.safetensors",
+      "origin_url": "https://huggingface.co/google/siglip2-giant-opt-patch16-384",
+      "path": "model-00001-of-00002.safetensors",
+      "revision": "a713301b217d38485fb2204c808367d10bc3cc40",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit a713301b gives lfs.oid equal to this sha256 (size 4994453512). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Google is the author and the publisher. The code repository github.com/google-research/big_vision, which the SigLIP papers release from, is Apache-2.0."
+    },
+    {
+      "sha256": "06e64949dd7cafc4d278723533e2591145ae8e5616d2c0c5d8458de25ceede34",
+      "name": "google/siglip2-giant-opt-patch16-384 model-00002-of-00002.safetensors",
+      "origin_url": "https://huggingface.co/google/siglip2-giant-opt-patch16-384",
+      "path": "model-00002-of-00002.safetensors",
+      "revision": "a713301b217d38485fb2204c808367d10bc3cc40",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit a713301b gives lfs.oid equal to this sha256 (size 2493222896). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Google is the author and the publisher. The code repository github.com/google-research/big_vision, which the SigLIP papers release from, is Apache-2.0."
+    },
+    {
+      "sha256": "612923381c76ec5a9bed335d1c48827e3f2e506ac31b044b63b2031fadee6a0b",
+      "name": "google/siglip2-base-patch16-224 model.safetensors",
+      "origin_url": "https://huggingface.co/google/siglip2-base-patch16-224",
+      "path": "model.safetensors",
+      "revision": "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 75de2d55 gives lfs.oid equal to this sha256 (size 1500800904). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Google is the author and the publisher. The code repository github.com/google-research/big_vision, which the SigLIP papers release from, is Apache-2.0."
+    },
+    {
+      "sha256": "2c63cb7d1f2e95ba501893cbb8faeb4ea9a3af295498d35097126228659c2af8",
+      "name": "google/siglip-base-patch16-224 model.safetensors",
+      "origin_url": "https://huggingface.co/google/siglip-base-patch16-224",
+      "path": "model.safetensors",
+      "revision": "7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 7fd15f06 gives lfs.oid equal to this sha256 (size 812672320). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Google is the author and the publisher. The code repository github.com/google-research/big_vision, which the SigLIP papers release from, is Apache-2.0."
+    },
+    {
+      "sha256": "eb93f7f526b0a1b0e5f0612630f142bc5b6c05d329edff70478ff0a83e2bcd6e",
+      "name": "google/siglip-base-patch16-224 pytorch_model.bin",
+      "origin_url": "https://huggingface.co/google/siglip-base-patch16-224",
+      "path": "pytorch_model.bin",
+      "revision": "7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 7fd15f06 gives lfs.oid equal to this sha256 (size 812762989). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Google is the author and the publisher. The code repository github.com/google-research/big_vision, which the SigLIP papers release from, is Apache-2.0."
+    },
+    {
+      "sha256": "ea2abad2b7f8a9c1aa5e49a244d5d57ffa71c56f720c94bc5d240ef4d6e1d94a",
+      "name": "google/siglip-so400m-patch14-384 model.safetensors",
+      "origin_url": "https://huggingface.co/google/siglip-so400m-patch14-384",
+      "path": "model.safetensors",
+      "revision": "9fdffc58afc957d1a03a25b10dba0329ab15c2a3",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 9fdffc58 gives lfs.oid equal to this sha256 (size 3511950624). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Google is the author and the publisher. The code repository github.com/google-research/big_vision, which the SigLIP papers release from, is Apache-2.0."
+    },
+    {
+      "sha256": "ac5f28bbdf92c0c1696ccbd3ce716426049cd67ad8045b66d0d938b0f9c8bbec",
+      "name": "google/siglip2-base-patch16-naflex model.safetensors",
+      "origin_url": "https://huggingface.co/google/siglip2-base-patch16-naflex",
+      "path": "model.safetensors",
+      "revision": "b53b807d3a2d5e2b3911292f2d69e5341cdc064c",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit b53b807d gives lfs.oid equal to this sha256 (size 1500985224). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Google is the author and the publisher. The code repository github.com/google-research/big_vision, which the SigLIP papers release from, is Apache-2.0."
+    },
+    {
+      "sha256": "9f4f4a49f908ef0c979bce8ff5a5c0e88882dc6c5dc4304387cbbd152558e2c2",
+      "name": "google/siglip2-so400m-patch14-384 model.safetensors",
+      "origin_url": "https://huggingface.co/google/siglip2-so400m-patch14-384",
+      "path": "model.safetensors",
+      "revision": "e8e487298228002f3d8a82e0cd5c8ea9c567f57f",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit e8e48729 gives lfs.oid equal to this sha256 (size 4544143072). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Google is the author and the publisher. The code repository github.com/google-research/big_vision, which the SigLIP papers release from, is Apache-2.0."
+    },
+    {
+      "sha256": "b6c4d44f9d96ca3fa76dd3bbb153989a60b4ad5526559f3c598562a368d687ec",
+      "name": "Intel/dpt-hybrid-midas pytorch_model.bin",
+      "origin_url": "https://huggingface.co/Intel/dpt-hybrid-midas",
+      "path": "pytorch_model.bin",
+      "revision": "11eaf7a1cf4bd70740697dbc216f98980c0aeb03",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 11eaf7a1 gives lfs.oid equal to this sha256 (size 489648389). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Intel is the author and the publisher; the model card says 'License | Apache 2.0'. The original code repository github.com/isl-org/DPT is MIT, which is also a licence we pass on."
+    },
+    {
+      "sha256": "8c0506e7f4936fa7e26183a4fd8da4e2bdbc5990ba64ae441f965d51228f36ea",
+      "name": "black-forest-labs/FLUX.2-klein-4B text_encoder/model-00001-of-00002.safetensors",
+      "origin_url": "https://huggingface.co/black-forest-labs/FLUX.2-klein-4B",
+      "path": "text_encoder/model-00001-of-00002.safetensors",
+      "revision": "e7b7dc27f91deacad38e78976d1f2b499d76a294",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit e7b7dc27 gives lfs.oid equal to this sha256 (size 4967215360). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Black Forest Labs is the author and the publisher. The README of github.com/black-forest-labs/flux2 says '4B models are Apache 2.0' and lists this model as apache-2.0; the model card says the weights are available under the Apache 2.0 license."
+    },
+    {
+      "sha256": "82f2bd839378541b0557bfabaf37c7d3d637071fdcb73302dedd7cf61162ce07",
+      "name": "black-forest-labs/FLUX.2-klein-4B text_encoder/model-00002-of-00002.safetensors",
+      "origin_url": "https://huggingface.co/black-forest-labs/FLUX.2-klein-4B",
+      "path": "text_encoder/model-00002-of-00002.safetensors",
+      "revision": "e7b7dc27f91deacad38e78976d1f2b499d76a294",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit e7b7dc27 gives lfs.oid equal to this sha256 (size 3077766632). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Black Forest Labs is the author and the publisher. The README of github.com/black-forest-labs/flux2 says '4B models are Apache 2.0' and lists this model as apache-2.0; the model card says the weights are available under the Apache 2.0 license."
+    },
+    {
+      "sha256": "9f29f9edcfdae452a653ffb51a534ca4decd389952c225724ff3b94042612a6e",
+      "name": "black-forest-labs/FLUX.2-klein-4B transformer/diffusion_pytorch_model.safetensors",
+      "origin_url": "https://huggingface.co/black-forest-labs/FLUX.2-klein-4B",
+      "path": "transformer/diffusion_pytorch_model.safetensors",
+      "revision": "e7b7dc27f91deacad38e78976d1f2b499d76a294",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit e7b7dc27 gives lfs.oid equal to this sha256 (size 7751109744). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Black Forest Labs is the author and the publisher. The README of github.com/black-forest-labs/flux2 says '4B models are Apache 2.0' and lists this model as apache-2.0; the model card says the weights are available under the Apache 2.0 license."
+    },
+    {
+      "sha256": "e109674697ffa1a3983126e32512f5428a9442bd8df59f9c95566ee90a473bb6",
+      "name": "black-forest-labs/FLUX.2-klein-base-4B transformer/diffusion_pytorch_model.safetensors",
+      "origin_url": "https://huggingface.co/black-forest-labs/FLUX.2-klein-base-4B",
+      "path": "transformer/diffusion_pytorch_model.safetensors",
+      "revision": "a3b4f4849157f664bdbc776fd7453c2783562f4d",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit a3b4f484 gives lfs.oid equal to this sha256 (size 7751109744). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Black Forest Labs is the author and the publisher. The README of github.com/black-forest-labs/flux2 says '4B models are Apache 2.0' and lists this model as apache-2.0; the model card says the weights are available under the Apache 2.0 license."
+    },
+    {
+      "sha256": "edfb0462392541fca9af44ff039bfb32dbd0c939997f3abb77a26e23af7afd7c",
+      "name": "facebook/sam-vit-huge model.safetensors",
+      "origin_url": "https://huggingface.co/facebook/sam-vit-huge",
+      "path": "model.safetensors",
+      "revision": "87aecf0df4ce6b30cd7de76e87673c49644bdf67",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 87aecf0d gives lfs.oid equal to this sha256 (size 2564432288). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Meta is the author and the publisher. The README of github.com/facebookresearch/segment-anything says 'The model is licensed under the Apache 2.0 license.'"
+    },
+    {
+      "sha256": "9a14fd58481d203300024d94128edfce246b4b0db7e0b548ed52bf63578cbc38",
+      "name": "facebook/sam-vit-huge pytorch_model.bin",
+      "origin_url": "https://huggingface.co/facebook/sam-vit-huge",
+      "path": "pytorch_model.bin",
+      "revision": "87aecf0df4ce6b30cd7de76e87673c49644bdf67",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 87aecf0d gives lfs.oid equal to this sha256 (size 2564565013). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Meta is the author and the publisher. The README of github.com/facebookresearch/segment-anything says 'The model is licensed under the Apache 2.0 license.'"
+    },
+    {
+      "sha256": "dc407dce21301fd94abb395c5099b4f2c455fdc8a8f261ac3d0ea6d4cd197230",
+      "name": "facebook/sam2.1-hiera-large model.safetensors",
+      "origin_url": "https://huggingface.co/facebook/sam2.1-hiera-large",
+      "path": "model.safetensors",
+      "revision": "665f8e2ad61cf5f53d65644ff27c8ee525124610",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 665f8e2a gives lfs.oid equal to this sha256 (size 897897416). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Meta is the author and the publisher. The README of github.com/facebookresearch/sam2 says 'The SAM 2 model checkpoints, SAM 2 demo code (front-end and back-end), and SAM 2 training code are licensed under Apache 2.0'."
+    },
+    {
+      "sha256": "2647878d5dfa5098f2f8649825738a9345572bae2d4350a2468587ece47dd318",
+      "name": "facebook/sam2.1-hiera-large sam2.1_hiera_large.pt",
+      "origin_url": "https://huggingface.co/facebook/sam2.1-hiera-large",
+      "path": "sam2.1_hiera_large.pt",
+      "revision": "665f8e2ad61cf5f53d65644ff27c8ee525124610",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 665f8e2a gives lfs.oid equal to this sha256 (size 898083611). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Meta is the author and the publisher. The README of github.com/facebookresearch/sam2 says 'The SAM 2 model checkpoints, SAM 2 demo code (front-end and back-end), and SAM 2 training code are licensed under Apache 2.0'."
+    },
+    {
+      "sha256": "892c410e496344e527255ccdcb2cb7244a609acb5389c7c4fdba1288f861c579",
+      "name": "facebook/sam-vit-base model.safetensors",
+      "origin_url": "https://huggingface.co/facebook/sam-vit-base",
+      "path": "model.safetensors",
+      "revision": "70c1a07f894ebb5b307fd9eaaee97b9dfc16068f",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 70c1a07f gives lfs.oid equal to this sha256 (size 374979480). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Meta is the author and the publisher. The README of github.com/facebookresearch/segment-anything says 'The model is licensed under the Apache 2.0 license.'"
+    },
+    {
+      "sha256": "1a1e860feeb895bc46f704d4faad2a0be739b5dfdca0ebdda520ffbcfb73f348",
+      "name": "facebook/sam-vit-base pytorch_model.bin",
+      "origin_url": "https://huggingface.co/facebook/sam-vit-base",
+      "path": "pytorch_model.bin",
+      "revision": "70c1a07f894ebb5b307fd9eaaee97b9dfc16068f",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 70c1a07f gives lfs.oid equal to this sha256 (size 375050165). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Meta is the author and the publisher. The README of github.com/facebookresearch/segment-anything says 'The model is licensed under the Apache 2.0 license.'"
+    },
+    {
+      "sha256": "48b7606461b0646c5a578e686e2fddbb54ae789823ab82ca07f4b898261f6383",
+      "name": "stabilityai/sdxl-vae diffusion_pytorch_model.bin",
+      "origin_url": "https://huggingface.co/stabilityai/sdxl-vae",
+      "path": "diffusion_pytorch_model.bin",
+      "revision": "6f5909a7e596173e25d4e97b07fd19cdf9611c76",
+      "spdx": "mit",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 6f5909a7 gives lfs.oid equal to this sha256 (size 334712113). The publishing organisation carries Hugging Face's verification badge and the repository declares mit. Stability AI is the author and the publisher; the model card declares MIT."
+    },
+    {
+      "sha256": "1598f3d24932bcfe6634e8b618ea1e30ab1d57f5aad13a6d2de446d2199f2341",
+      "name": "stabilityai/sdxl-vae diffusion_pytorch_model.safetensors",
+      "origin_url": "https://huggingface.co/stabilityai/sdxl-vae",
+      "path": "diffusion_pytorch_model.safetensors",
+      "revision": "6f5909a7e596173e25d4e97b07fd19cdf9611c76",
+      "spdx": "mit",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 6f5909a7 gives lfs.oid equal to this sha256 (size 334643268). The publishing organisation carries Hugging Face's verification badge and the repository declares mit. Stability AI is the author and the publisher; the model card declares MIT."
+    },
+    {
+      "sha256": "d8d52ba036475f5fb07c8b435e176d3d97ebfa82f0d1a1c317f9cc1e25bd013b",
+      "name": "black-forest-labs/FLUX.2-small-decoder diffusion_pytorch_model.safetensors",
+      "origin_url": "https://huggingface.co/black-forest-labs/FLUX.2-small-decoder",
+      "path": "diffusion_pytorch_model.safetensors",
+      "revision": "a3efc24f613ef42d9428af62fdbd6f5fd8856c4a",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit a3efc24f gives lfs.oid equal to this sha256 (size 249521340). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Black Forest Labs is the author and the publisher. The README of github.com/black-forest-labs/flux2 says '4B models are Apache 2.0' and lists this model as apache-2.0; the model card says the weights are available under the Apache 2.0 license."
+    },
+    {
+      "sha256": "ad783347747561d974f347f1b7377ebca15330621ace6a2e3f8dfaa83f5c211f",
+      "name": "black-forest-labs/FLUX.2-small-decoder small_decoder.safetensors",
+      "origin_url": "https://huggingface.co/black-forest-labs/FLUX.2-small-decoder",
+      "path": "small_decoder.safetensors",
+      "revision": "a3efc24f613ef42d9428af62fdbd6f5fd8856c4a",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit a3efc24f gives lfs.oid equal to this sha256 (size 111801980). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Black Forest Labs is the author and the publisher. The README of github.com/black-forest-labs/flux2 says '4B models are Apache 2.0' and lists this model as apache-2.0; the model card says the weights are available under the Apache 2.0 license."
+    },
+    {
+      "sha256": "1b4889b6b1d4ce7ae320a02dedaeff1780ad77d415ea0d744b476155c6377ddc",
+      "name": "stabilityai/sd-vae-ft-mse diffusion_pytorch_model.bin",
+      "origin_url": "https://huggingface.co/stabilityai/sd-vae-ft-mse",
+      "path": "diffusion_pytorch_model.bin",
+      "revision": "31f26fdeee1355a5c34592e401dd41e45d25a493",
+      "spdx": "mit",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 31f26fde gives lfs.oid equal to this sha256 (size 334707217). The publishing organisation carries Hugging Face's verification badge and the repository declares mit. Stability AI is the author and the publisher; the model card declares MIT."
+    },
+    {
+      "sha256": "a1d993488569e928462932c8c38a0760b874d166399b14414135bd9c42df5815",
+      "name": "stabilityai/sd-vae-ft-mse diffusion_pytorch_model.safetensors",
+      "origin_url": "https://huggingface.co/stabilityai/sd-vae-ft-mse",
+      "path": "diffusion_pytorch_model.safetensors",
+      "revision": "31f26fdeee1355a5c34592e401dd41e45d25a493",
+      "spdx": "mit",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 31f26fde gives lfs.oid equal to this sha256 (size 334643276). The publishing organisation carries Hugging Face's verification badge and the repository declares mit. Stability AI is the author and the publisher; the model card declares MIT."
+    },
+    {
+      "sha256": "cce38e86bf9fb50a6c7a454776d280b992ea16f763ed0db3f9db9fde4655b3f1",
+      "name": "facebook/sam2-hiera-base-plus model.safetensors",
+      "origin_url": "https://huggingface.co/facebook/sam2-hiera-base-plus",
+      "path": "model.safetensors",
+      "revision": "98efa66555fceff5f74ad281fb8003536dcfb6ff",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 98efa665 gives lfs.oid equal to this sha256 (size 323409896). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Meta is the author and the publisher. The README of github.com/facebookresearch/sam2 says 'The SAM 2 model checkpoints, SAM 2 demo code (front-end and back-end), and SAM 2 training code are licensed under Apache 2.0'."
+    },
+    {
+      "sha256": "d0bb7f236400a49669ffdd1be617959a8b1d1065081789d7bbff88eded3a8071",
+      "name": "facebook/sam2-hiera-base-plus sam2_hiera_base_plus.pt",
+      "origin_url": "https://huggingface.co/facebook/sam2-hiera-base-plus",
+      "path": "sam2_hiera_base_plus.pt",
+      "revision": "98efa66555fceff5f74ad281fb8003536dcfb6ff",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 98efa665 gives lfs.oid equal to this sha256 (size 323493298). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Meta is the author and the publisher. The README of github.com/facebookresearch/sam2 says 'The SAM 2 model checkpoints, SAM 2 demo code (front-end and back-end), and SAM 2 training code are licensed under Apache 2.0'."
+    },
+    {
+      "sha256": "0a4067b11ce1e23d5229203f11c718a823060d15a4b23fa2372a7d4b77cbbc60",
+      "name": "facebook/sam2.1-hiera-small model.safetensors",
+      "origin_url": "https://huggingface.co/facebook/sam2.1-hiera-small",
+      "path": "model.safetensors",
+      "revision": "ee5bba1d82bb8749febdf90f45e84b687142ba03",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit ee5bba1d gives lfs.oid equal to this sha256 (size 184305280). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Meta is the author and the publisher. The README of github.com/facebookresearch/sam2 says 'The SAM 2 model checkpoints, SAM 2 demo code (front-end and back-end), and SAM 2 training code are licensed under Apache 2.0'."
+    },
+    {
+      "sha256": "6d1aa6f30de5c92224f8172114de081d104bbd23dd9dc5c58996f0cad5dc4d38",
+      "name": "facebook/sam2.1-hiera-small sam2.1_hiera_small.pt",
+      "origin_url": "https://huggingface.co/facebook/sam2.1-hiera-small",
+      "path": "sam2.1_hiera_small.pt",
+      "revision": "ee5bba1d82bb8749febdf90f45e84b687142ba03",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit ee5bba1d gives lfs.oid equal to this sha256 (size 184416285). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Meta is the author and the publisher. The README of github.com/facebookresearch/sam2 says 'The SAM 2 model checkpoints, SAM 2 demo code (front-end and back-end), and SAM 2 training code are licensed under Apache 2.0'."
+    },
+    {
+      "sha256": "48c14467e5cf9e51870511feb72c89688e82dd74523142c0538b663e193ac2a7",
+      "name": "facebook/sam2.1-hiera-tiny model.safetensors",
+      "origin_url": "https://huggingface.co/facebook/sam2.1-hiera-tiny",
+      "path": "model.safetensors",
+      "revision": "de431c4043854a71d8101e17995dfe596bf101a5",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit de431c40 gives lfs.oid equal to this sha256 (size 155908064). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Meta is the author and the publisher. The README of github.com/facebookresearch/sam2 says 'The SAM 2 model checkpoints, SAM 2 demo code (front-end and back-end), and SAM 2 training code are licensed under Apache 2.0'."
+    },
+    {
+      "sha256": "7402e0d864fa82708a20fbd15bc84245c2f26dff0eb43a4b5b93452deb34be69",
+      "name": "facebook/sam2.1-hiera-tiny sam2.1_hiera_tiny.pt",
+      "origin_url": "https://huggingface.co/facebook/sam2.1-hiera-tiny",
+      "path": "sam2.1_hiera_tiny.pt",
+      "revision": "de431c4043854a71d8101e17995dfe596bf101a5",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit de431c40 gives lfs.oid equal to this sha256 (size 156008466). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Meta is the author and the publisher. The README of github.com/facebookresearch/sam2 says 'The SAM 2 model checkpoints, SAM 2 demo code (front-end and back-end), and SAM 2 training code are licensed under Apache 2.0'."
+    },
+    {
+      "sha256": "2012733a0de5d03efd1bba550a2847c4551be9ef2e0d497c83074df66189f780",
+      "name": "facebook/sam2.1-hiera-base-plus model.safetensors",
+      "origin_url": "https://huggingface.co/facebook/sam2.1-hiera-base-plus",
+      "path": "model.safetensors",
+      "revision": "b7320756a13354e7530a63935656d35b2f91a290",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit b7320756 gives lfs.oid equal to this sha256 (size 323476296). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Meta is the author and the publisher. The README of github.com/facebookresearch/sam2 says 'The SAM 2 model checkpoints, SAM 2 demo code (front-end and back-end), and SAM 2 training code are licensed under Apache 2.0'."
+    },
+    {
+      "sha256": "a2345aede8715ab1d5d31b4a509fb160c5a4af1970f199d9054ccfb746c004c5",
+      "name": "facebook/sam2.1-hiera-base-plus sam2.1_hiera_base_plus.pt",
+      "origin_url": "https://huggingface.co/facebook/sam2.1-hiera-base-plus",
+      "path": "sam2.1_hiera_base_plus.pt",
+      "revision": "b7320756a13354e7530a63935656d35b2f91a290",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit b7320756 gives lfs.oid equal to this sha256 (size 323606802). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Meta is the author and the publisher. The README of github.com/facebookresearch/sam2 says 'The SAM 2 model checkpoints, SAM 2 demo code (front-end and back-end), and SAM 2 training code are licensed under Apache 2.0'."
+    },
+    {
+      "sha256": "a57e1b13cd1545938dfcbc9fb26df7f60de6650237a9383382a874a623564b81",
+      "name": "facebook/sam-vit-large model.safetensors",
+      "origin_url": "https://huggingface.co/facebook/sam-vit-large",
+      "path": "model.safetensors",
+      "revision": "6851e0441005b0fb96f2cc4dfac472f3d1b14af1",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 6851e044 gives lfs.oid equal to this sha256 (size 1249428136). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Meta is the author and the publisher. The README of github.com/facebookresearch/segment-anything says 'The model is licensed under the Apache 2.0 license.'"
+    },
+    {
+      "sha256": "149bba0bfe0b10f856adb815c37000978ceda04ed3a373c54e565645ae6b7c53",
+      "name": "facebook/sam-vit-large pytorch_model.bin",
+      "origin_url": "https://huggingface.co/facebook/sam-vit-large",
+      "path": "pytorch_model.bin",
+      "revision": "6851e0441005b0fb96f2cc4dfac472f3d1b14af1",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit 6851e044 gives lfs.oid equal to this sha256 (size 1249536149). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Meta is the author and the publisher. The README of github.com/facebookresearch/segment-anything says 'The model is licensed under the Apache 2.0 license.'"
+    },
+    {
+      "sha256": "ca82d5aa03964f3ff14a215b6da8e6689958893cd43682bf631054afed34133c",
+      "name": "facebook/sam2-hiera-large model.safetensors",
+      "origin_url": "https://huggingface.co/facebook/sam2-hiera-large",
+      "path": "model.safetensors",
+      "revision": "e6a8e8809b8f1bfa2238b6d080f3d05cc76bd251",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit e6a8e880 gives lfs.oid equal to this sha256 (size 897831024). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Meta is the author and the publisher. The README of github.com/facebookresearch/sam2 says 'The SAM 2 model checkpoints, SAM 2 demo code (front-end and back-end), and SAM 2 training code are licensed under Apache 2.0'."
+    },
+    {
+      "sha256": "7442e4e9b732a508f80e141e7c2913437a3610ee0c77381a66658c3a445df87b",
+      "name": "facebook/sam2-hiera-large sam2_hiera_large.pt",
+      "origin_url": "https://huggingface.co/facebook/sam2-hiera-large",
+      "path": "sam2_hiera_large.pt",
+      "revision": "e6a8e8809b8f1bfa2238b6d080f3d05cc76bd251",
+      "spdx": "apache-2.0",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit e6a8e880 gives lfs.oid equal to this sha256 (size 897952466). The publishing organisation carries Hugging Face's verification badge and the repository declares apache-2.0. Meta is the author and the publisher. The README of github.com/facebookresearch/sam2 says 'The SAM 2 model checkpoints, SAM 2 demo code (front-end and back-end), and SAM 2 training code are licensed under Apache 2.0'."
+    },
+    {
+      "sha256": "7c98ebcd7ca5cb69d47b2ae287feba0695689fbf2c8fead2fab05fd3e0c28303",
+      "name": "stabilityai/sd-vae-ft-ema diffusion_pytorch_model.bin",
+      "origin_url": "https://huggingface.co/stabilityai/sd-vae-ft-ema",
+      "path": "diffusion_pytorch_model.bin",
+      "revision": "f04b2c4b98319346dad8c65879f680b1997b204a",
+      "spdx": "mit",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit f04b2c4b gives lfs.oid equal to this sha256 (size 334707217). The publishing organisation carries Hugging Face's verification badge and the repository declares mit. Stability AI is the author and the publisher; the model card declares MIT."
+    },
+    {
+      "sha256": "32db726da04f06c1b6b14c0043ce115cc87a501482945c5add89a40d838fcb46",
+      "name": "stabilityai/sd-vae-ft-ema diffusion_pytorch_model.safetensors",
+      "origin_url": "https://huggingface.co/stabilityai/sd-vae-ft-ema",
+      "path": "diffusion_pytorch_model.safetensors",
+      "revision": "f04b2c4b98319346dad8c65879f680b1997b204a",
+      "spdx": "mit",
+      "provenance": "Checked 2026-10-11 against the HF API, anonymous, not gated. paths-info at commit f04b2c4b gives lfs.oid equal to this sha256 (size 334643276). The publishing organisation carries Hugging Face's verification badge and the repository declares mit. Stability AI is the author and the publisher; the model card declares MIT."
     }
   ],
   "components_note": "A row releases a file only when it has sha256, origin_url and spdx, its origin is an authority the reader in licensing.py recognises and its licence is one we already pass on, so adding a releasing row cannot widen either of those; an empty table releases nothing and every file keeps the deny-by-default answer. A row with \"verdict\": \"restricted\" does the opposite: it marks a file we looked into and must not pass on, it wins over every releasing row for the same sha256 and over the licence tag of the repository the file sits in, and its \"reason\" is the sentence shown to the person packing. Such a row still carries origin_url (where a recipient fetches the file) and an spdx that is not on the allow-list. Entries arrive through the signed rules channel, which is the whole point of putting them here rather than in code - a shared part judged wrongly is fixed for everyone without a release."

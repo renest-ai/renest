@@ -60,11 +60,13 @@ __all__ = [
     "load_grant",
     "parse_iso8601",
     "read_json_source",
+    "record_auth_token",
     "resolve_credentials",
     "resolve_token",
     "storage_config_has_secret",
     "storage_secret_exposure_warnings",
     "system_config_path",
+    "token_file_exposure_warnings",
     "user_config_path",
 ]
 
@@ -1080,3 +1082,123 @@ def resolve_token(
             if token:
                 return token
     return None
+
+
+#: What a token written by :func:`record_auth_token` may look like. Narrow on
+#: purpose: the value goes into hand-patched TOML between double quotes, so a quote,
+#: a backslash or a newline must never get that far.
+_TOKEN_SHAPE = re.compile(r"^[A-Za-z0-9_.\-]{16,512}$")
+
+
+def _patched_auth_toml(original: str | None, token: str) -> str:
+    """Set ``token`` inside ``[auth]`` and touch nothing else in the file.
+
+    Same discipline as the telemetry and rules switches: this file may also hold the
+    user's own bucket key, so only the one line changes, and the caller reads the
+    result back before trusting it.
+    """
+    line = f'token = "{token}"'
+    if original is None:
+        return f"[auth]\n{line}\n"
+    lines = original.splitlines()
+    out: list[str] = []
+    in_auth = False
+    wrote = False
+    for raw in lines:
+        stripped = raw.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if in_auth and not wrote:
+                out.append(line)
+                wrote = True
+            in_auth = stripped == "[auth]"
+            out.append(raw)
+            continue
+        if in_auth and re.match(r"^\s*token\s*=", raw):
+            if not wrote:
+                out.append(line)
+                wrote = True
+            continue  # the old value is dropped; the new one is written above
+        out.append(raw)
+    if in_auth and not wrote:
+        out.append(line)
+        wrote = True
+    if not wrote:
+        if out and out[-1].strip():
+            out.append("")
+        out += ["[auth]", line]
+    return "\n".join(out) + "\n"
+
+
+def record_auth_token(token: str, *, path: str | os.PathLike[str] | None = None) -> Path:
+    """Write the machine's sign-in token into ``[auth] token`` of the user config file.
+
+    [SECURITY-REVIEW] This is the one whitelisted home for it (the CLI's 0600 config).
+    The file is written to a temporary name created 0600 and moved into place, so it is
+    0600 afterwards even if it was looser before, and there is never a moment when the
+    token sits in a file others can read. The result is read back; on any mismatch the
+    original file is put back and :class:`ConfigError` is raised. The token itself never
+    appears in an error message.
+    """
+    if not _TOKEN_SHAPE.match(token or ""):
+        raise ConfigError("The sign-in token the server sent has an unexpected shape; nothing was saved.")
+    target = Path(path) if path is not None else user_config_path()
+    original: str | None = None
+    try:
+        original = target.read_text(encoding="utf-8") if target.exists() else None
+    except OSError as exc:
+        raise ConfigError(f"Cannot read config file {target}: {type(exc).__name__}") from None
+    patched = _patched_auth_toml(original, token)
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(patched)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+        got = tomllib.loads(target.read_text(encoding="utf-8")).get("auth", {})
+        if not isinstance(got, Mapping) or got.get("token") != token:
+            raise ValueError("token did not read back")
+    except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
+        try:
+            tmp.unlink(missing_ok=True)
+            if original is None:
+                target.unlink(missing_ok=True)
+            else:
+                target.write_text(original, encoding="utf-8")
+        except OSError:
+            pass
+        raise ConfigError(
+            f"Could not save the sign-in token to {target} ({type(exc).__name__}); "
+            "your config file was left as it was."
+        ) from None
+    return target
+
+
+def token_file_exposure_warnings(path: Path) -> list[str]:
+    """Could the file holding the sign-in token be committed by git, or synced away?
+
+    The same two checks as for a bucket key, worded for this token. Reads only the
+    shape of the file system.
+    """
+    out: list[str] = []
+    try:
+        resolved = path.resolve()
+    except OSError:  # pragma: no cover
+        resolved = path
+    for parent in [resolved, *resolved.parents]:
+        if (parent / ".git").exists():
+            out.append(
+                f"This file sits inside the git repository at {parent}. One "
+                f"“git add -A” would commit your sign-in token. Add {path.name} to .gitignore."
+            )
+            break
+    low = str(resolved).lower()
+    for marker in _SYNC_DIR_MARKERS:
+        if marker in low:
+            out.append(
+                f"This file looks like it sits in a folder that syncs to the cloud "
+                f"(matched “{marker}”), so your sign-in token would be uploaded in plain text."
+            )
+            break
+    return out
