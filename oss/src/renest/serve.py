@@ -312,6 +312,44 @@ NOT_SIGNED_IN = "This machine is not signed in to Renest. In its terminal, run: 
 #: Bounds on how often serve asks whether an upload was approved.
 APPROVAL_MIN_INTERVAL_S = 1.0
 APPROVAL_MAX_INTERVAL_S = 30.0
+#: How long past the approval's own expiry the poll keeps asking (clock skew, one slow
+#: last poll).
+APPROVAL_DEADLINE_GRACE_S = 5.0
+#: Said once per wait, the first time a poll fails for a reason worth retrying.
+_SLOW_NETWORK_NOTE = ("The network to the Renest service is slow or dropping; still waiting "
+                      "for your approval and trying again.")
+
+
+def _poll_until_answered(job: Any, poll: Any, *, interval: float, deadline: float,
+                         on_slow: Any) -> dict:
+    """One approval wait: ``poll()`` until it returns a body or the deadline passes.
+
+    A **transient** failure (timeout, connection error, 429/502/503/504) never ends the
+    wait: the gap doubles up to :data:`APPROVAL_MAX_INTERVAL_S`, ``on_slow`` is told
+    once, and the next try goes out -- the person is on the approval page, and the
+    approval they give must not be lost to one dropped packet (production,
+    2026-10-20). A definite refusal is raised as it came. Past the deadline the last
+    transient failure is raised, and the caller reads it as a network failure.
+    """
+    from .approval import ApprovalError
+
+    gap = interval
+    said = False
+    while True:
+        if job.cancel_requested.wait(gap):
+            raise _JobCancelled()
+        try:
+            got = poll()
+        except ApprovalError as e:
+            if not e.transient or time.monotonic() > deadline:
+                raise
+            if not said:
+                said = True
+                on_slow()
+            gap = min(gap * 2, APPROVAL_MAX_INTERVAL_S)
+            continue
+        gap = interval
+        return got
 
 
 def _failure(stage: str, error_class: str, human: str,
@@ -333,6 +371,10 @@ def _approval_refusal(stage: str, e: Any) -> dict:
     """
     if e.status == 401:
         return _failure(stage, "NOT_SIGNED_IN", e.human)
+    if getattr(e, "transient", False):
+        # Not an answer at all: the service was never reached. Said as a network
+        # failure (production 2026-10-20: it read as "the upload was not approved").
+        return _failure(stage, "NETWORK_INTERRUPTED", e.human)
     return _failure(stage, e.code or "UPLOAD_NOT_APPROVED", e.human, e.actions)
 
 
@@ -563,6 +605,14 @@ class ServeApp:
             tmp = self.jobs_dir / f"{job.id}.json.tmp"
             tmp.write_text(json.dumps(job.to_dict(), ensure_ascii=False, indent=1), encoding="utf-8")
             os.replace(tmp, self.jobs_dir / f"{job.id}.json")
+
+    @staticmethod
+    def _cancellable_sleep(job: Any) -> Any:
+        """A sleep for retries that a cancel cuts short."""
+        def sleep(seconds: float) -> None:
+            if job.cancel_requested.wait(seconds):
+                raise _JobCancelled()
+        return sleep
 
     # -- queue / submission -------------------------------------------------
     def _active_count(self) -> int:
@@ -1102,14 +1152,16 @@ class ServeApp:
         def fail(human: str, error_class: str = "UPLOAD_NOT_APPROVED") -> _JobFailed:
             return _JobFailed(_failure("approval", error_class, human))
 
-        deadline = time.monotonic() + approval.expires_in + 5
+        deadline = time.monotonic() + approval.expires_in + APPROVAL_DEADLINE_GRACE_S
         gap = min(max(approval.interval, self._approval_min_interval), APPROVAL_MAX_INTERVAL_S)
         while True:
-            if job.cancel_requested.wait(gap):
-                # The caller withdraws the approval on the way out (see its finally).
-                raise _JobCancelled()
+            # The caller withdraws the approval on the way out (see its finally).
             try:
-                got = poll_upload_approval(client, origin, signin, approval.approval_id)
+                got = _poll_until_answered(
+                    job, lambda: poll_upload_approval(client, origin, signin, approval.approval_id),
+                    interval=gap, deadline=deadline,
+                    on_slow=lambda: self._on_event(job, {"type": "warning", "stage": "approval",
+                                                         "human": _SLOW_NETWORK_NOTE}))
             except ApprovalError as e:
                 raise _JobFailed(_approval_refusal("approval", e)) from None
             status = str(got.get("status") or "")
@@ -1219,6 +1271,7 @@ class ServeApp:
             cancel_takeback_approval,
             list_takeback_nests,
             poll_takeback_approval,
+            retry_transient,
             request_takeback_approval,
         )
         from .login import machine_label
@@ -1248,13 +1301,15 @@ class ServeApp:
                                  "desc": "Waiting for you to approve this take-back in your browser"})
             self._persist(job)
 
-            deadline = time.monotonic() + approval.expires_in + 5
+            deadline = time.monotonic() + approval.expires_in + APPROVAL_DEADLINE_GRACE_S
             gap = min(max(approval.interval, self._approval_min_interval), APPROVAL_MAX_INTERVAL_S)
             while True:
-                if job.cancel_requested.wait(gap):
-                    raise _JobCancelled()
                 try:
-                    got = poll_takeback_approval(client, origin, signin, approval_id)
+                    got = _poll_until_answered(
+                        job, lambda: poll_takeback_approval(client, origin, signin, approval_id),
+                        interval=gap, deadline=deadline,
+                        on_slow=lambda: self._on_event(job, {"type": "warning", "stage": "approval",
+                                                             "human": _SLOW_NETWORK_NOTE}))
                 except ApprovalError as e:
                     raise _JobFailed(_approval_refusal("approval", e)) from None
                 status = str(got.get("status") or "")
@@ -1283,14 +1338,13 @@ class ServeApp:
             self._on_event(job, {"type": "stage_end", "stage": "approval",
                                  "desc": "Take-back approved in your browser"})
             try:
-                nests = list_takeback_nests(client, origin, token)
+                # A dropped packet here used to burn the approval the person just gave:
+                # a few tries first, and only a failure that outlasts them revokes.
+                nests = retry_transient(lambda: list_takeback_nests(client, origin, token),
+                                        sleep=self._cancellable_sleep(job))
             except ApprovalError as e:
-                # The token was handed over and will not be used: switch it off now
-                # rather than leaving it alive until its hard cap.
-                from .approval import finish_takeback
-
-                finish_takeback(client, origin, token, approval_id, "failed")
-                token = None
+                # The token was handed over and will not be used: the finally below
+                # switches it off (it is still held, so ``token`` is not None there).
                 raise _JobFailed(_approval_refusal("list", e)) from None
             self._sweep_pending_staging(job, nests)
             session_id = "tb_" + secrets.token_hex(12)
@@ -1304,9 +1358,19 @@ class ServeApp:
             return {"session_id": session_id, "nests": nests}
         finally:
             if client is not None:
-                if approval_id is not None and token is None and signin:
-                    # Cancelled or failed before the token was collected (or already
-                    # switched off above): withdraw it; a no-op on a finished one.
+                if token is not None:
+                    # Collected but never handed to a session -- listing failed for good,
+                    # or the job was cancelled during a retry wait: switch the one-time
+                    # token off now rather than leaving it alive until its hard cap
+                    # ([SECURITY-REVIEW] every exit path that still holds it ends here).
+                    from .approval import finish_takeback
+
+                    with contextlib.suppress(Exception):
+                        finish_takeback(client, origin, token, approval_id, "failed")
+                    token = None
+                elif approval_id is not None and signin:
+                    # Cancelled or failed before the token was collected: withdraw the
+                    # approval; a no-op on a finished one.
                     cancel_takeback_approval(client, origin, signin, approval_id)
                 with contextlib.suppress(Exception):
                     client.close()
@@ -1345,7 +1409,7 @@ class ServeApp:
     def _run_takeback(self, job: Job) -> dict:
         """Compare one saved nest with this machine, and (mode ``fetch``) bring the
         missing files back. Facts only, never overwrites, never installs."""
-        from .approval import ApprovalError, takeback_links
+        from .approval import ApprovalError, retry_transient, takeback_links
         from .restore import _parse_grant, _resolve_grant
         from .takeback import compare, fetch, live_environment, write_report
 
@@ -1361,8 +1425,10 @@ class ServeApp:
         comfyui_dir = Path(str(body.get("comfyui_dir") or target)).resolve()
         mode = "fetch" if body.get("mode") == "fetch" else "compare"
         try:
-            payload = takeback_links(sess["client"], sess["origin"], sess["token"],
-                                     str(body.get("nest_version_id") or ""))
+            payload = retry_transient(
+                lambda: takeback_links(sess["client"], sess["origin"], sess["token"],
+                                       str(body.get("nest_version_id") or "")),
+                sleep=self._cancellable_sleep(job))
         except ApprovalError as e:
             raise _JobFailed(_approval_refusal("P1", e)) from None
         try:

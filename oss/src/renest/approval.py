@@ -21,10 +21,15 @@ or a log line. Errors here carry an HTTP status and a plain sentence, nothing el
 from __future__ import annotations
 
 import re
+import time
 import urllib.parse
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from typing import TypeVar
 
 import httpx
+
+T = TypeVar("T")
 
 __all__ = [
     "ApprovalError",
@@ -40,6 +45,7 @@ __all__ = [
     "poll_upload_approval",
     "request_takeback_approval",
     "request_upload_approval",
+    "retry_transient",
     "server_refusal",
     "start_device_login",
     "takeback_links",
@@ -58,15 +64,47 @@ class ApprovalError(Exception):
     ``code`` is the service's own machine code for the refusal (``PLAN_CANNOT_PACK``,
     ``QUOTA_EXCEEDED``, ...) when it named one, and ``actions`` the ways forward it
     offered (``[{"label", "url"}]``, web pages only) -- both passed on to the panel.
+
+    ``transient`` marks a failure that says nothing about the request itself -- the
+    service could not be reached, a timeout, a 429 / 502 / 503 / 504 on the way --
+    and so is worth trying again. A real answer (approved, denied, 4xx) never is.
+    Production, 2026-10-20: a take-back the founder had approved still failed, because
+    one ReadTimeout during the poll ended the job; the route to Cloudflare from here
+    drops like that routinely, and users in China will see the same.
     """
 
     def __init__(self, human: str, *, status: int = 0, code: str = "",
-                 actions: list[dict] | None = None) -> None:
+                 actions: list[dict] | None = None, transient: bool = False) -> None:
         super().__init__(human)
         self.human = human
         self.status = status
         self.code = code
         self.actions = list(actions or [])
+        self.transient = transient
+
+
+#: Service answers that mean "not now", never "no": worth another try.
+TRANSIENT_STATUSES = frozenset({429, 502, 503, 504})
+#: Waits between tries for a one-shot call (list the nests, fetch the links): three
+#: more tries over ~14 s before the failure is final.
+TRANSIENT_RETRY_WAITS: tuple[float, ...] = (2.0, 4.0, 8.0)
+
+
+def retry_transient(fn: Callable[[], T], *, waits: Sequence[float] | None = None,
+                    sleep: Callable[[float], None] = time.sleep) -> T:
+    """Call ``fn``; on a transient :class:`ApprovalError` wait and call again, once per
+    entry in ``waits``; the last failure is raised as it came. A definite refusal is
+    raised at once."""
+    if waits is None:
+        waits = TRANSIENT_RETRY_WAITS
+    for wait in waits:
+        try:
+            return fn()
+        except ApprovalError as e:
+            if not e.transient:
+                raise
+            sleep(wait)
+    return fn()
 
 
 @dataclass
@@ -181,7 +219,8 @@ def _refused(resp: httpx.Response, prefix: str) -> ApprovalError:
     person word for word, with its code and ways forward; otherwise ours, with its reason."""
     code, message, actions = server_refusal(resp)
     human = message if (code and message) else f"{prefix}: {_server_error(resp)}"
-    return ApprovalError(human, status=resp.status_code, code=code, actions=actions)
+    return ApprovalError(human, status=resp.status_code, code=code, actions=actions,
+                         transient=resp.status_code in TRANSIENT_STATUSES)
 
 
 def _call(client: httpx.Client, method: str, url: str, *, json: dict | None = None,
@@ -194,7 +233,7 @@ def _call(client: httpx.Client, method: str, url: str, *, json: dict | None = No
         # the class name is all a person needs here.
         raise ApprovalError(
             f"Cannot reach the Renest service ({type(exc).__name__}). Check this machine's "
-            "network and try again."
+            "network and try again.", transient=True,
         ) from None
 
 

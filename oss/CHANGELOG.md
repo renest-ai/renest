@@ -2,6 +2,17 @@
 
 What changed for the person using `renest`. Dates are the release date.
 
+## 0.1.27 — 2026-10-20
+
+### A slow network no longer cancels a save or take-back you already approved
+While the ComfyUI panel waits for you to approve a save or a take-back in your browser, it
+keeps checking with your Renest drive. Until now, one dropped or slow reply ended the whole
+thing, even after you had approved, and you had to start again and approve again. Now a
+timeout or a busy reply just means it tries again a little later, until the approval itself
+runs out; the panel says the network is slow and that it is still waiting. Listing your nests
+and getting a nest's files for a take-back also try again a few times before giving up. When
+it does give up, it says the network was the problem, not that nobody approved.
+
 ## 0.1.26 — 2026-10-20
 
 ### Take a nest back into the ComfyUI you are using
