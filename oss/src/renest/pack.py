@@ -2372,6 +2372,7 @@ def _build_manifest(
     program_dir: Path | None = None,
     download_urls: dict[str, str] | None = None,
     lfs: dict | None = None,
+    environment_id: str | None = None,
 ) -> tuple[dict, list[dict]]:
     """P1 + P2: scan/hash + assemble the v1 manifest. Returns (manifest, inventory).
 
@@ -2385,7 +2386,7 @@ def _build_manifest(
     # from "hung".
     tracker = _ProgressTracker(emitter, root, spec) if (emitter and not dry_run) else None
     manifest: dict = {
-        "format_version": "2.14",
+        "format_version": "2.15",
         "id": nest_id,
         "created_at": _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "runtime": spec["runtime"],
@@ -3874,6 +3875,11 @@ def _build_manifest(
         if name == "comfyui":
             continue
         manifest.setdefault("adapters", {})[name] = block
+    # Format 2.15: which ComfyUI installation this nest was saved from. Only the
+    # panel's local service knows (it keeps the id beside the app); the command line
+    # never writes it. Carried only when there is a comfyui adapter to hang it on.
+    if environment_id and isinstance((manifest.get("adapters") or {}).get("comfyui"), dict):
+        manifest["adapters"]["comfyui"]["environment_id"] = environment_id
 
     # -- evidence: was this nest ever seen to work? (format 2.11) --------------
     # **Written only when somebody actually looked.** The two inference routes look --
@@ -4949,6 +4955,7 @@ def pack(
     say: Callable[[str], None] | None = None,
     rerun_command: str = "",
     machine: object | None = None,
+    environment_id: str | None = None,
 ) -> PackReport:
     """Pack a working environment into a nest. Never raises for a pack failure —
     the report's ``exit_code`` carries the verdict.
@@ -5245,6 +5252,7 @@ def pack(
                     pin_wheels=pin_wheels, client=client, no_licence_lookup=no_licence_lookup,
                     mine=mine, cache=hash_cache, program_dir=_program_dir,
                     download_urls=download_urls, lfs=_lfs_opts,
+                    environment_id=environment_id,
                 )
                 # The same last gate as a real pack. A dry run that waves an
                 # unresolved placeholder through lets "the dry run was green"
@@ -5308,6 +5316,7 @@ def pack(
                 mine=mine, emitter=emitter, cache=hash_cache, program_dir=_program_dir,
                 download_urls=download_urls,
                 lfs=_lfs_opts,
+                environment_id=environment_id,
             )
             # Saved as soon as the reading is done: what was read stays true even
             # if a later stage fails, and a retry should not pay for it twice.

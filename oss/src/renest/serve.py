@@ -75,6 +75,9 @@ MAX_QUEUE = 8  # a POST over this cap gets 429
 _TERMINAL = frozenset({"succeeded", "failed", "interrupted", "cancelled"})
 
 _JOB_RE = re.compile(rf"^{re.escape(API_PREFIX)}/jobs/([^/]+)$")
+_TAKEBACK_SESSION_RE = re.compile(rf"^{re.escape(API_PREFIX)}/takeback/sessions/([A-Za-z0-9_-]{{1,64}})$")
+#: How long a take-back session (the approval's token, held in memory) is kept around.
+TAKEBACK_SESSION_TTL_S = 3600.0
 
 # CORS allow-list: loopback origins only (the ComfyUI front-end JS and other local
 # plugins). Never a wildcard — these requests carry an Authorization header.
@@ -97,6 +100,40 @@ def _env_hints(body: dict) -> dict:
         if isinstance(value, str) and value:
             hints[key] = value
     return hints
+
+
+#: Where the local service keeps the installation's id, beside the app (format 2.15).
+ENVIRONMENT_ID_REL = Path(".renest") / "environment-id"
+
+
+def environment_id_for(comfyui_dir: str | os.PathLike[str], *, create: bool) -> str | None:
+    """The stable id of the ComfyUI installation at ``comfyui_dir``.
+
+    Minted once (a ULID) and kept in ``<ComfyUI>/.renest/environment-id`` so every nest
+    saved from this installation carries the same value and the drive can group them.
+    ``create=False`` (a preview) only reads: a preview writes nothing. Any trouble
+    reading or writing answers ``None`` -- a nest without the label is still a nest.
+    """
+    path = Path(comfyui_dir) / ENVIRONMENT_ID_REL
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        text = ""
+    if re.fullmatch(r"[0-9A-HJKMNP-TV-Z]{26}", text):
+        return text
+    if not create:
+        return None
+    from .pack import ulid  # local import: keeps serve import light
+
+    fresh = ulid()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(fresh, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        return None
+    return fresh
 
 
 def _workflow_ui(body: dict) -> dict | None:
@@ -380,6 +417,9 @@ class Job:
         self.approval: dict | None = None
         #: Where the upload landed on the Renest drive; folded into ``result``.
         self.drive: dict | None = None
+        #: What became of the local staging after the drive checked the nest
+        #: (format-independent; see :mod:`renest.staging`). Folded into ``result``.
+        self.local_copy: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -445,6 +485,11 @@ class ServeApp:
         #: What the last preview already read, kept for the pack behind the
         #: button. One slot, keyed by target -- see :meth:`_read_record_for`.
         self._read_record: tuple[str, Any] | None = None
+        #: [SECURITY-REVIEW] Take-back sessions (the panel's "Take back", 2026-10-19):
+        #: session id -> the take-back-once token the person approved in their browser,
+        #: plus what it may be used for. **Memory only**: never persisted, never in a job's
+        #: params, logs or result. Dropped when the session is closed or expires.
+        self._takeback: dict[str, dict] = {}
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self._recover_jobs()
 
@@ -505,6 +550,12 @@ class ServeApp:
                 job.logs.append(line)
             state = data.get("state", "interrupted")
             job.state = "interrupted" if state in ("queued", "running") else state
+            if job.state == "interrupted" and not job.error:
+                # Said here, once, so the panel never has to show "did not say why".
+                job.error = {"stage": job.stage or "?", "error_class": "INTERRUPTED",
+                             "detail": "renest serve stopped while this job was running",
+                             "human": "The Renest engine stopped while this was running. "
+                                      "Nothing was finished by half; start it again."}
             self.jobs[job.id] = job
 
     def _persist(self, job: Job) -> None:
@@ -590,7 +641,8 @@ class ServeApp:
         Populated by pack/restore jobs that ran through this serve process."""
         return self._load_registry()
 
-    def _record_nest(self, kind: str, report: Any, name: str | None) -> None:
+    def _record_nest(self, kind: str, report: Any, name: str | None,
+                     extra: dict | None = None) -> None:
         nest_id = getattr(report, "nest_id", "") or ""
         if not nest_id:
             return
@@ -605,6 +657,7 @@ class ServeApp:
             "created_at": _iso_now(),
             "storage_kind": storage_kind,
             "path": str(Path(manifest_path).parent) if manifest_path else "",
+            **(extra or {}),
         }
         with self._lock:
             rows = [b for b in self._load_registry() if b.get("id") != nest_id]
@@ -726,7 +779,14 @@ class ServeApp:
             job.stage = "P1"
         self._persist(job)
         try:
-            report = self._run_pack(job) if job.kind == "pack" else self._run_restore(job)
+            if job.kind == "pack":
+                report = self._run_pack(job)
+            elif job.kind == "takeback_session":
+                report = self._run_takeback_session(job)
+            elif job.kind == "takeback":
+                report = self._run_takeback(job)
+            else:
+                report = self._run_restore(job)
         except _JobCancelled:
             self._settle_cancelled(job)
             return
@@ -734,6 +794,8 @@ class ServeApp:
             job.state = "failed"
             job.approval = None
             job.error = e.error
+            if job.local_copy:
+                job.error = {**job.error, "local_copy": job.local_copy}
             job.finished_at = _iso_now()
             self._persist(job)
             return
@@ -762,6 +824,14 @@ class ServeApp:
         self._persist(job)
 
     def _settle_report(self, job: Job, report: Any) -> None:
+        if job.kind in ("takeback_session", "takeback"):
+            # These two hand back a plain dict and never a PackReport; a failure is
+            # raised as _JobFailed before this point.
+            job.state = "succeeded"
+            job.result = dict(report)
+            job.finished_at = _iso_now()
+            self._persist(job)
+            return
         ok = getattr(report, "ok", False) and int(getattr(report, "exit_code", 1)) == 0
         job.finished_at = _iso_now()
         if ok:
@@ -769,10 +839,23 @@ class ServeApp:
             job.result = report.to_dict()
             if job.drive:
                 job.result["drive"] = job.drive
+            if job.local_copy:
+                job.result["local_copy"] = job.local_copy
+                if job.local_copy.get("released"):
+                    # The path pack reported no longer exists; a success page that shows
+                    # it would send the person to an empty folder.
+                    job.result.pop("manifest_path", None)
             if job.kind == "pack" and job.params.get("shutdown_after"):
                 # advisory only: serve records intent, never kills the host itself
                 job.result["shutdown_at"] = _iso_now()
-            self._record_nest(job.kind, report, job.params.get("name"))
+            if not (job.local_copy or {}).get("released"):
+                pending = (job.drive or {}).get("verdict") == "pending"
+                # A save the drive has not finished checking keeps its staging; the row
+                # remembers that, so the next take-back session (whose token can see which
+                # versions are checked) can let it go -- see _sweep_pending_staging.
+                self._record_nest(job.kind, report, job.params.get("name"), extra=(
+                    {"verdict": "pending", "nest_version_id": (job.drive or {}).get("nest_version_id")}
+                    if pending else None))
         else:
             job.state = "failed"
             job.error = _job_error(getattr(report, "failure", None),
@@ -869,8 +952,26 @@ class ServeApp:
             else:
                 from .hosted import HostedUploader as uploader_cls
 
+            checking = {"said": False}
+
             def say(message: str) -> None:
-                self._on_event(job, {"type": "info", "stage": "P3", "human": str(message)})
+                text = str(message)
+                # The drive's own check runs after the bytes are up; on screen that read
+                # as "Uploading" for minutes (real-stack acceptance, 2026-10-19). The first
+                # word from that phase moves the stage on.
+                if not checking["said"] and (text.startswith("Still being checked")
+                                             or text.startswith("Hosted storage has it")):
+                    checking["said"] = True
+                    self._on_event(job, {"type": "stage_start", "stage": "P4",
+                                         "desc": "Checking with the drive"})
+                    # The upload is over: its last speed must not ride along under
+                    # "Checking with the drive".
+                    self._on_event(job, {"type": "progress", "stage": "P4", "percent": 100.0,
+                                         "bytes_done": job.progress.get("bytes_total", 0),
+                                         "bytes_total": job.progress.get("bytes_total", 0),
+                                         "speed_mbps": 0.0})
+                self._on_event(job, {"type": "info", "stage": "P4" if checking["said"] else "P3",
+                                     "human": text})
 
             uploader = uploader_cls(
                 origin, upload_token, nest_name=name, client=client, log=say, notice=say,
@@ -894,6 +995,32 @@ class ServeApp:
                     "console_url": (f"{base}/nests/{urllib.parse.quote(nest_id, safe='')}"
                                     if base else None),
                 }
+                # Ruled 2026-10-19: once the drive has **checked** this nest, let go of the
+                # staging it left here (its manifest folder and the blobs no other nest in
+                # that folder references). The model files are hard links, so until this
+                # happens deleting an original frees nothing. Only on "committed": a nest
+                # the drive has not finished checking keeps its local copy.
+                if getattr(landed, "status", None) == "committed":
+                    from .staging import release_local_staging
+
+                    mp = getattr(report, "manifest_path", "") or ""
+                    if mp:
+                        # What the person may now clear themselves: read before the
+                        # staging goes, from the manifest the drive just checked.
+                        cleanable = _cleanable_files(mp, job.params.get("comfyui_dir")
+                                                     or job.params.get("target"))
+                        job.local_copy = release_local_staging(mp)
+                        job.local_copy["cleanable_files"] = cleanable
+                        # Earlier saves still pending keep their copies: say how many.
+                        with self._lock:
+                            job.local_copy["pending_earlier"] = sum(
+                                1 for r in self._load_registry() if r.get("verdict") == "pending")
+                        self._on_event(job, {"type": "info", "stage": "P4", "human": (
+                            "The drive has checked this nest; the copy kept beside ComfyUI "
+                            "was removed so your disk is yours again."
+                            if job.local_copy.get("released") else
+                            "The drive has checked this nest; the copy beside ComfyUI "
+                            "was left as it is.")})
             elif ok:
                 # A pack that says ok without the drive naming where it landed is not
                 # a nest anyone can find; never call it saved.
@@ -901,6 +1028,54 @@ class ServeApp:
                     "P3", "UNKNOWN",
                     "The nest was packed, but your Renest drive did not confirm where it "
                     "landed. Check the drive before packing again."))
+            elif (int(getattr(report, "exit_code", 1)) == int(ExitCode.S2_UNKNOWN)
+                  and landed is not None and getattr(landed, "nest_id", None)
+                  and getattr(landed, "status", None) == "verifying"):
+                # Every byte is up; the drive just did not finish checking within the
+                # engine's wait. The job did what it could, so it ends ``succeeded`` with
+                # ``verdict: pending`` on the result (a reader of ``state`` must not call
+                # it a failure), the staging stays until a later save sees it checked, and
+                # the panel says so in its own words -- never the command-line sentence
+                # with exit codes and `renest list` (real-stack acceptance, 2026-10-19).
+                outcome = "succeeded"
+                nest_id = str(landed.nest_id)
+                base = _console_base(approval.verify_url)
+                job.drive = {
+                    "nest_id": nest_id,
+                    "nest_version_id": getattr(landed, "nest_version_id", None),
+                    "version_no": getattr(landed, "version_no", None),
+                    "nest_name": getattr(landed, "nest_name", None) or name,
+                    "console_url": (f"{base}/nests/{urllib.parse.quote(nest_id, safe='')}"
+                                    if base else None),
+                    "verdict": "pending",
+                }
+                report.ok = True
+                report.exit_code = int(ExitCode.OK)
+                report.findings = [f for f in (getattr(report, "findings", None) or [])
+                                   if "not confirmed yet" not in str(f)]
+                self._on_event(job, {"type": "info", "stage": "P4", "human": (
+                    "Uploaded — your Renest drive is still checking it. It shows as "
+                    "verified in your drive once the check finishes. Do not upload it "
+                    "again.")})
+            elif (landed is not None and getattr(landed, "status", None) in ("failed", "blocked")
+                  and not ok):
+                # The drive checked it and said no. Its own reason, in the panel's words;
+                # the command-line sentence (`renest list …`, "pack and send again") stays
+                # off the screen. Nothing usable was kept on the drive, so the staging
+                # here is worth nothing either: let it go now (ruled 2026-10-19: release after the drive confirms).
+                status = str(landed.status)
+                mp = getattr(report, "manifest_path", "") or ""
+                if mp:
+                    from .staging import release_local_staging
+
+                    job.local_copy = release_local_staging(mp)
+                raise _JobFailed(_failure(
+                    "P4", "DRIVE_REJECTED",
+                    "Your Renest drive checked this nest and did not accept it"
+                    + (" (a file failed its check)." if status == "failed"
+                       else " (stopped by a safety rule).")
+                    + " Nothing usable was kept there. Press \"Nest this run\" again to "
+                      "pack and save it afresh; if it happens twice, write to support."))
             return report
         except _JobCancelled:
             outcome = "cancelled"
@@ -985,6 +1160,10 @@ class ServeApp:
             # Whatever the confirm page's preview already read, so this pack does
             # not read the same weights all over again.
             hash_cache=self._read_record_for(body["target"]),
+            # Format 2.15: every nest saved through this service carries the id of the
+            # installation it came from, minted here on first use.
+            environment_id=environment_id_for(body.get("comfyui_dir") or body["target"],
+                                              create=True),
             # The plugin runs inside the application process and reports the real
             # shape of the environment; the engine never guesses. comfyui_dir = the
             # folder holding the nodes and models; program_dir = ComfyUI's own program
@@ -997,6 +1176,293 @@ class ServeApp:
     def _run_restore(self, job: Job) -> Any:
         body = job.params
         return self._restore_fn(body, self._make_sink(job))
+
+    # -- take back into the running ComfyUI (the panel's "Take back", 2026-10-19) ------
+    def _takeback_session_get(self, session_id: str) -> dict | None:
+        with self._lock:
+            sess = self._takeback.get(session_id)
+            if sess is None:
+                return None
+            if time.monotonic() > sess["expires_at"]:
+                self._takeback.pop(session_id, None)
+                return None
+            return sess
+
+    def close_takeback_session(self, session_id: str, outcome: str = "succeeded") -> bool:
+        """Revoke the session's token at the service and forget it. Idempotent."""
+        with self._lock:
+            sess = self._takeback.pop(session_id, None)
+        if sess is None:
+            return False
+        from .approval import finish_takeback
+
+        try:
+            finish_takeback(sess["client"], sess["origin"], sess["token"], sess["approval_id"],
+                            outcome)
+        finally:
+            sess["token"] = None
+            with contextlib.suppress(Exception):
+                sess["client"].close()
+        return True
+
+    def _run_takeback_session(self, job: Job) -> dict:
+        """Ask for a take-back approval, wait for it in the browser, then list this
+        account's nests. The token the service hands over stays in this process's
+        memory, keyed by a session id the panel uses for the take-back itself.
+
+        [SECURITY-REVIEW] Same order as an upload: (1) no sign-in, stop; (2) ask for
+        the approval; (3) wait; (4) only then hold the take-back-once token, in the
+        session table, and never in the job.
+        """
+        from .approval import (
+            ApprovalError,
+            cancel_takeback_approval,
+            list_takeback_nests,
+            poll_takeback_approval,
+            request_takeback_approval,
+        )
+        from .login import machine_label
+
+        signin = self._signin_token()
+        if not signin:
+            raise _JobFailed(_failure("approval", "NOT_SIGNED_IN", NOT_SIGNED_IN))
+        origin = self._api_origin()
+        client = self._http_client_fn()
+        approval_id: str | None = None
+        token: str | None = None
+        try:
+            try:
+                approval = request_takeback_approval(client, origin, signin,
+                                                     machine_label=machine_label())
+            except ApprovalError as e:
+                raise _JobFailed(_approval_refusal("approval", e)) from None
+            approval_id = approval.approval_id
+            job.stage = "approval"
+            job.approval = {
+                "user_code": approval.user_code,
+                "verify_url": approval.verify_url,
+                "expires_at": datetime.fromtimestamp(
+                    time.time() + approval.expires_in, UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            self._on_event(job, {"type": "stage_start", "stage": "approval",
+                                 "desc": "Waiting for you to approve this take-back in your browser"})
+            self._persist(job)
+
+            deadline = time.monotonic() + approval.expires_in + 5
+            gap = min(max(approval.interval, self._approval_min_interval), APPROVAL_MAX_INTERVAL_S)
+            while True:
+                if job.cancel_requested.wait(gap):
+                    raise _JobCancelled()
+                try:
+                    got = poll_takeback_approval(client, origin, signin, approval_id)
+                except ApprovalError as e:
+                    raise _JobFailed(_approval_refusal("approval", e)) from None
+                status = str(got.get("status") or "")
+                if status == "approved":
+                    tok = got.get("takeback_token")
+                    if isinstance(tok, str) and tok:
+                        token = tok
+                        break
+                    raise _JobFailed(_failure("approval", "UPLOAD_NOT_APPROVED",
+                                              "The take-back was approved, but the approval could "
+                                              "not be collected. Press \"Take back\" again."))
+                if status == "denied":
+                    raise _JobFailed(_failure("approval", "UPLOAD_NOT_APPROVED",
+                                              "The take-back was denied in the browser. Nothing "
+                                              "was listed or fetched."))
+                if status == "expired" or time.monotonic() > deadline:
+                    raise _JobFailed(_failure("approval", "UPLOAD_NOT_APPROVED",
+                                              "Nobody approved the take-back in time. Press "
+                                              "\"Take back\" again to ask once more."))
+                if status not in ("", "pending"):
+                    raise _JobFailed(_failure("approval", "UPLOAD_NOT_APPROVED",
+                                              f"The approval ended in a state this version does "
+                                              f"not know ({status[:40]})."))
+            job.approval = None
+            job.stage = "list"
+            self._on_event(job, {"type": "stage_end", "stage": "approval",
+                                 "desc": "Take-back approved in your browser"})
+            try:
+                nests = list_takeback_nests(client, origin, token)
+            except ApprovalError as e:
+                # The token was handed over and will not be used: switch it off now
+                # rather than leaving it alive until its hard cap.
+                from .approval import finish_takeback
+
+                finish_takeback(client, origin, token, approval_id, "failed")
+                token = None
+                raise _JobFailed(_approval_refusal("list", e)) from None
+            self._sweep_pending_staging(job, nests)
+            session_id = "tb_" + secrets.token_hex(12)
+            with self._lock:
+                self._takeback[session_id] = {
+                    "token": token, "approval_id": approval_id, "origin": origin,
+                    "client": client, "expires_at": time.monotonic() + TAKEBACK_SESSION_TTL_S,
+                }
+            client = None  # now owned by the session
+            token = None
+            return {"session_id": session_id, "nests": nests}
+        finally:
+            if client is not None:
+                if approval_id is not None and token is None and signin:
+                    # Cancelled or failed before the token was collected (or already
+                    # switched off above): withdraw it; a no-op on a finished one.
+                    cancel_takeback_approval(client, origin, signin, approval_id)
+                with contextlib.suppress(Exception):
+                    client.close()
+            signin = None
+
+    def _sweep_pending_staging(self, job: Job, nests: list[dict]) -> None:
+        """Let go of the staging of saves whose check outran the wait, now that the drive
+        lists their version as checked. The take-back listing shows only checked head
+        versions, so a pending row whose version appears there is confirmed. The machine
+        sign-in token has no route to ask a version's status, which is why this waits for
+        the next take-back rather than happening at once."""
+        checked = {str(n.get("head_version_id")) for n in nests if n.get("head_version_id")}
+        if not checked:
+            return
+        from .staging import release_local_staging
+
+        with self._lock:
+            rows = self._load_registry()
+        freed = 0
+        keep: list[dict] = []
+        for row in rows:
+            vid = str(row.get("nest_version_id") or "")
+            if row.get("verdict") == "pending" and vid in checked and row.get("path"):
+                done = release_local_staging(Path(row["path"]) / "manifest.json")
+                if done.get("released"):
+                    freed += 1
+                    continue  # its row goes with it: nothing is left on this machine
+            keep.append(row)
+        if freed:
+            with self._lock:
+                self._save_registry(keep)
+            self._on_event(job, {"type": "info", "stage": "list", "human": (
+                f"The drive has checked {freed} earlier save(s); their copies kept beside "
+                f"ComfyUI were removed so your disk is yours again.")})
+
+    def _run_takeback(self, job: Job) -> dict:
+        """Compare one saved nest with this machine, and (mode ``fetch``) bring the
+        missing files back. Facts only, never overwrites, never installs."""
+        from .approval import ApprovalError, takeback_links
+        from .restore import _parse_grant, _resolve_grant
+        from .takeback import compare, fetch, live_environment, write_report
+
+        body = job.params
+        sess = self._takeback_session_get(str(body.get("session_id") or ""))
+        if sess is None:
+            raise _JobFailed(_failure("P1", "TAKEBACK_SESSION_GONE",
+                                      "This take-back session has ended. Press \"Take back\" "
+                                      "again to approve a new one."))
+        target = body.get("target")
+        if not target:
+            raise _JobFailed(_failure("P1", "UNKNOWN", "Missing target"))
+        comfyui_dir = Path(str(body.get("comfyui_dir") or target)).resolve()
+        mode = "fetch" if body.get("mode") == "fetch" else "compare"
+        try:
+            payload = takeback_links(sess["client"], sess["origin"], sess["token"],
+                                     str(body.get("nest_version_id") or ""))
+        except ApprovalError as e:
+            raise _JobFailed(_approval_refusal("P1", e)) from None
+        try:
+            grant = _parse_grant(payload)
+            manifest, blobmap = _resolve_grant(grant, sess["client"])
+        except Exception as e:  # a NestFailure carries its own sentence
+            raise _JobFailed(_failure("P1", "UNKNOWN", str(getattr(e, "human", "") or e)
+                                      or "Could not read the saved nest.")) from None
+        # [SECURITY-REVIEW] The restore's own landing gate, before a byte is read: a nest
+        # may have come from a hand-off, and a files[] entry pointing into site-packages,
+        # venv, bin or a custom node's own code would be run, not read, once placed.
+        from .takeback import refusal_for
+
+        refused = [(str(f.get("path")), refusal_for(f)) for f in manifest.get("files") or []
+                   if isinstance(f, dict) and refusal_for(f) is not None]
+        if refused:
+            shown = "; ".join(why for _p, why in refused[:3])
+            raise _JobFailed(_failure(
+                "P1", "NEST_REFUSED",
+                f"This nest lists {len(refused)} file(s) that would be placed where files get "
+                f"run as code, not read as data, so nothing was fetched: {shown}"))
+        self._on_event(job, {"type": "stage_start", "stage": "P1",
+                             "desc": "Comparing the saved workflow with this machine"})
+        lock_text = _small_blob_text(sess["client"], blobmap,
+                                     ((manifest.get("python_lock") or {}).get("lockfile") or {}))
+        live = live_environment(comfyui_dir, body.get("env_python"), body.get("node_owners"))
+        report = compare(manifest, comfyui_dir, live, hash_cache=self._read_record_for(target),
+                         lock_text=lock_text, blobmap=blobmap)
+        outcome: dict | None = None
+        if mode == "fetch":
+            self._on_event(job, {"type": "stage_start", "stage": "P2",
+                                 "desc": "Bringing the missing files back and checking them"})
+
+            def say(message: str) -> None:
+                self._on_event(job, {"type": "info", "stage": "P2", "human": str(message)})
+
+            outcome = fetch(manifest, blobmap, comfyui_dir, report, client=sess["client"],
+                            say=say, emitter=EventEmitter(json_mode=False,
+                                                          sink=self._make_sink(job)))
+        where = write_report(comfyui_dir, report, outcome)
+        return {"mode": mode, "nest_id": manifest.get("id"), "report": report.to_dict(),
+                "outcome": outcome, "report_path": str(where)}
+
+
+def _cleanable_files(manifest_path: str, comfyui_dir: str | None) -> list[dict]:
+    """The model files a checked nest carried, as absolute paths on this machine, for the
+    success page to list. Only files under the ComfyUI folder; never the nest's own
+    recipe, licence texts or escape hatch. Says nothing about other workflows (that needs
+    the drive, which a finished upload token can no longer ask)."""
+    import json as _json
+    from pathlib import PurePosixPath
+
+    try:
+        manifest = _json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    app = Path(comfyui_dir).resolve() if comfyui_dir else None
+    root = app.parent if app else None
+    out: list[dict] = []
+    for f in manifest.get("files") or []:
+        if not isinstance(f, dict) or str(f.get("root") or "env") != "env":
+            continue
+        if f.get("kind") in ("workflow", "license_text", "input_asset") or not root:
+            continue
+        rel = str(f.get("path") or "")
+        if not rel or rel.startswith("/") or ".." in PurePosixPath(rel).parts:
+            continue
+        dest = (root / PurePosixPath(rel)).resolve()
+        try:
+            dest.relative_to(app)
+        except ValueError:
+            continue
+        if not dest.is_file():
+            continue
+        blob = f.get("blob") or {}
+        out.append({"path": str(dest), "size_bytes": int(blob.get("size_bytes") or 0),
+                    "sha256": blob.get("sha256")})
+    return out
+
+
+def _small_blob_text(client: Any, blobmap: dict[str, list[str]], blob: dict,
+                     limit: int = 4 * 1024 * 1024) -> str | None:
+    """The text of one small blob (the lock), fetched through its signed link and
+    checked against its sha256. ``None`` when it is not handed out or does not match."""
+    import hashlib
+
+    sha = str(blob.get("sha256") or "")
+    urls = blobmap.get(sha) or []
+    if not sha or not urls or int(blob.get("size_bytes") or 0) > limit:
+        return None
+    try:
+        r = client.get(urls[0])
+    except Exception:
+        return None
+    if r.status_code != 200 or hashlib.sha256(r.content).hexdigest() != sha:
+        return None
+    try:
+        return r.content.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -1136,7 +1602,8 @@ def make_handler(app: ServeApp) -> type[BaseHTTPRequestHandler]:
             path = urllib.parse.urlparse(self.path).path
             if not self._require_auth():
                 return
-            if path not in (f"{API_PREFIX}/pack", f"{API_PREFIX}/restore"):
+            if path not in (f"{API_PREFIX}/pack", f"{API_PREFIX}/restore",
+                            f"{API_PREFIX}/takeback/sessions", f"{API_PREFIX}/takeback"):
                 self._send(404, {"error": "Unknown path"})
                 return
             body = self._read_json()
@@ -1145,12 +1612,28 @@ def make_handler(app: ServeApp) -> type[BaseHTTPRequestHandler]:
                 return
             if path == f"{API_PREFIX}/pack":
                 self._handle_pack(body)
+            elif path == f"{API_PREFIX}/takeback/sessions":
+                if not self.app.signed_in():
+                    self._send(409, {"error": NOT_SIGNED_IN, "error_class": "NOT_SIGNED_IN"})
+                    return
+                self._enqueue("takeback_session", {})
+            elif path == f"{API_PREFIX}/takeback":
+                if not body.get("target") or not body.get("session_id") \
+                        or not body.get("nest_version_id"):
+                    self._send(400, {"error": "Missing target, session_id or nest_version_id"})
+                    return
+                self._enqueue("takeback", body)
             else:
                 self._handle_restore(body)
 
         def do_DELETE(self) -> None:
             path = urllib.parse.urlparse(self.path).path
             if not self._require_auth():
+                return
+            ts = _TAKEBACK_SESSION_RE.match(path)
+            if ts:
+                closed = self.app.close_takeback_session(ts.group(1))
+                self._send(200, {"closed": closed})
                 return
             m = _JOB_RE.match(path)
             if not m:

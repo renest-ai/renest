@@ -130,7 +130,65 @@ def unsafe_relpath(p: object) -> bool:
 #:   one ``.pth`` file into site-packages and **the interpreter executes it on
 #:   every start** -- nobody has to import it.
 #: - ``bin``: executables on PATH.
-_CODE_DIRS = frozenset({".venv", "venv", "site-packages", "bin", "Scripts"})
+#: Compared in lower case: a case-insensitive disk (Windows, the default on macOS)
+#: lands ``.VENV/.../Site-Packages/evil.pth`` in the real site-packages (independent
+#: security review, 2026-10-19). ``dist-packages`` is Debian's site folder;
+#: ``__pycache__`` holds compiled code; ``startup-scripts`` is where ComfyUI-Manager
+#: keeps scripts it runs at start-up.
+_CODE_DIRS = frozenset({".venv", "venv", "site-packages", "dist-packages", "__pycache__",
+                        "startup-scripts"})
+#: Folders that hold executables on PATH: refused for anything that is not plainly a
+#: data file. Weights under a folder that happens to be called ``bin``
+#: (``models/clip_vision/bin/model.safetensors``) are data and pass.
+_EXEC_DIRS = frozenset({"bin", "scripts"})
+#: Files ComfyUI or its node manager read at start-up and that can add a code path or
+#: redirect where things are fetched from: never carried as an asset, whatever the
+#: suffix (independent security review, fourth round, 2026-10-19:
+#: ``extra_model_paths.yaml`` has a ``custom_nodes:`` key that ComfyUI loads from its
+#: own folder on every start). Compared in lower case.
+_STARTUP_CONFIG_NAMES = frozenset({
+    "extra_model_paths.yaml", "extra_model_paths.yml", "comfy.settings.json",
+    "config.ini", "channels.list", "custom-node-list.json", "model-list.json",
+    "alter-list.json", "extension-node-map.json", "github-stats.json",
+})
+#: A folder whose contents the node manager reads as its own data (lists, snapshots,
+#: settings, ``pip_overrides.json``, cached catalogues under hashed names): nothing a
+#: nest carries belongs in it. Judged by **prefix**, in lower case: the manager's
+#: current version keeps its data in ``user/__manager/`` (fifth review round,
+#: 2026-10-19, read off the source on the house machine), and a manual install lands
+#: the code folder as ``ComfyUI-Manager-main``.
+_MANAGER_DIR_PREFIXES = ("comfyui-manager", "__manager")
+#: Files an installer reads as instructions wherever they sit: one line in a
+#: ``requirements.txt`` is a pip install or a git clone the moment the node manager (or
+#: "Update ComfyUI") runs; a ``pyproject.toml`` / ``uv.toml`` redirects uv's package
+#: index and, under ``[tool.comfy]``, can point the app at a browser-script folder
+#: anywhere on disk. These names are refused under the whole env root because the
+#: trainer frameworks keep their own run configs (``sft.yaml``, ``train/dataset.toml``)
+#: at the root, so a location rule alone cannot tell the two apart. Lower case; the
+#: ``requirements*`` / ``constraints*`` families are matched by prefix.
+_INSTALLER_INPUT_NAMES = frozenset({
+    "pyproject.toml", "uv.toml", "uv.lock", "setup.cfg", "pip.conf", "pip.ini",
+    "pipfile", "pipfile.lock", "poetry.lock", "package.json", "package-lock.json",
+})
+_INSTALLER_INPUT_PREFIXES = ("requirements", "constraints")
+#: Text and config suffixes: fine as assets under the model folders and at the root,
+#: but inside a node's folder they are the node's own code configuration (its
+#: ``requirements.txt``, its ``pyproject.toml``, the lists it reads), and under the
+#: app's ``user/`` folder they are app and manager settings -- except a workflow in a
+#: ``workflows`` folder, which is what a nest exists to carry. Weights and media stay
+#: allowed everywhere, and so does a file with no suffix (nodes keep extensionless
+#: weights under their own folder; the suffix-less installer files, ``Pipfile``, are
+#: refused by name above).
+_TEXT_SUFFIXES = frozenset({
+    ".json", ".jsonl", ".txt", ".yaml", ".yml", ".toml", ".lock", ".md", ".csv", ".tsv",
+    ".xml", ".vocab", ".merges",
+})
+_NODE_DIRS = frozenset({"custom_nodes"})
+_USER_DIRS = frozenset({"user"})
+_WORKFLOW_DIRS = frozenset({"workflows"})
+#: Windows reserved device names: a file by that name cannot be created there.
+_WINDOWS_DEVICES = frozenset({"con", "prn", "aux", "nul"} | {f"com{i}" for i in range(1, 10)}
+                             | {f"lpt{i}" for i in range(1, 10)})
 #: Suffixes: the file is code in itself -- a ``.py`` landing in the host app's
 #: or an extension's directory runs as soon as the app imports it at startup.
 #: ``.pth`` is **not** here: Python only executes ``.pth`` files that sit in a
@@ -139,10 +197,48 @@ _CODE_DIRS = frozenset({".venv", "venv", "site-packages", "bin", "Scripts"})
 #: suffix left those models out of every nest (measured 2026-10-07: a SAM
 #: model a workflow loaded was dropped as "program code", and the restore could
 #: not run the workflow).
-_CODE_SUFFIXES = (".py", ".pyc", ".pyd")
+#: Also code in itself (independent security review, 2026-10-19): a native extension
+#: (``.so`` / ``.dylib`` / ``.dll``, and the ``.cpython-*`` / ``.abi3`` spellings) is
+#: imported like a ``.py``; a browser script under the app's ``web/`` runs in the
+#: owner's browser, where it can call the panel's own routes; shell and batch files run
+#: when something calls them. Model formats (``.pth`` outside a site folder,
+#: ``.safetensors``, ``.ckpt``, ``.bin``, ``.onnx``, ``.gguf``, ``.pt``) are not here and
+#: must never be -- see the 2026-10-07 note above.
+_CODE_SUFFIXES = (".py", ".pyc", ".pyd", ".pyo", ".pyw", ".so", ".dylib", ".dll",
+                  ".js", ".mjs", ".cjs", ".sh", ".bat", ".cmd", ".ps1", ".exe")
+#: Marks anywhere in a file name that mean a compiled Python extension whatever the
+#: final suffix (``x.cpython-311-x86_64-linux-gnu.so``, ``x.abi3.so``).
+_CODE_NAME_MARKS = (".cpython-", ".abi3.")
+#: The reserved in-nest path of the escape hatch (manifest spec §5.4), the only shell
+#: script a nest may carry under files[].
+ESCAPE_HATCH_REL = ".renest/escape/restore.sh"
+#: What a files[] entry under the env root may be, by suffix: the data a nest carries
+#: (weights, tokenizers, configs, media, fonts, archives). **An allowlist, not a
+#: blocklist** (independent security review 2026-10-19, third round): every blocklist
+#: was one case behind -- trailing dots and spaces a Windows disk strips, ``::$DATA``,
+#: git hooks, a manager's config.ini. Built from the 130 real manifests on hand (every
+#: suffix they carry is here) plus the obvious neighbours of each family. A file with
+#: no suffix at all passes (``put_blueprints_here``, ``LICENSE``); a suffix outside this
+#: set is refused as "not something a nest carries as an asset".
+ENV_DATA_SUFFIXES = frozenset({
+    # weights and tensors
+    ".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".onnx", ".gguf", ".pkl", ".npy", ".npz",
+    ".h5", ".msgpack", ".tflite", ".pb", ".params", ".model", ".task", ".vae", ".embedding",
+    ".sft", ".engine",
+    # text, configs, tokenizers
+    ".json", ".jsonl", ".txt", ".yaml", ".yml", ".toml", ".lock", ".md", ".csv", ".tsv",
+    ".xml", ".vocab", ".merges",
+    # images, video, audio
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".svg",
+    ".mp4", ".mov", ".webm", ".mkv", ".avi", ".wav", ".mp3", ".flac", ".ogg", ".m4a",
+    # fonts, LUTs, archives (data until somebody unpacks them)
+    ".ttf", ".otf", ".woff", ".woff2", ".cube", ".zip", ".tar", ".gz", ".tgz", ".7z",
+})
+#: Hidden folders that are data, not a place tools keep hooks or settings they run.
+_HIDDEN_DIRS_THAT_ARE_DATA = frozenset({".cache"})
 
 
-def code_position(p: str) -> str | None:
+def code_position(p: str, *, env_root: bool = True) -> str | None:
     """Is this path a position that **gets executed as code**? If so, return
     the one plain-language reason.
 
@@ -162,11 +258,62 @@ def code_position(p: str) -> str | None:
     right answer there is **disclosure through ``files[].serialization``, not blocking**.
     """
     pp = PurePosixPath(p.replace("\\", "/"))
-    hit = _CODE_DIRS.intersection(pp.parts[:-1])
-    if hit:
-        return f"a path inside {sorted(hit)[0]!r}, where files get run as code, not read as data: {p!r}"
-    if pp.name.endswith(_CODE_SUFFIXES):
+    if str(pp) == ESCAPE_HATCH_REL:
+        # The one script every nest carries on purpose (format 2.3): the escape hatch
+        # itself, at its reserved path. It is never run by a restore, only placed.
+        return None
+    # The three rules below are for the env root only: the home root's paths are
+    # pinned by their own allowlist (``.rembg/…``, ``.insightface/…`` are hidden
+    # folders by design), and the two model-cache roots sit on no execution path.
+    if env_root:
+        for part in pp.parts:
+            # A Windows disk strips a trailing dot or space and reads ``::$DATA`` as the
+            # file itself, so ``__init__.py.`` lands as ``__init__.py``. Judged on every
+            # platform: a nest is the same bytes wherever it is restored.
+            if part.endswith((".", " ")) or ":" in part:
+                return f"a path with a name a Windows disk would rewrite: {p!r}"
+    name = pp.name.lower()
+    suffix = PurePosixPath(name).suffix
+    plain_data = bool(suffix) and suffix in ENV_DATA_SUFFIXES and suffix != ".pth"
+    for part in pp.parts[:-1]:
+        low = part.lower()
+        if low in _CODE_DIRS or (low in _EXEC_DIRS and not plain_data):
+            return f"a path inside {part!r}, where files get run as code, not read as data: {p!r}"
+        if env_root and low.startswith(_MANAGER_DIR_PREFIXES):
+            return f"a path inside the node manager folder {part!r}, which it reads as its own data: {p!r}"
+        if env_root and low.startswith(".") and low not in _HIDDEN_DIRS_THAT_ARE_DATA:
+            # .git keeps hooks and a config that run commands whenever git runs (a node
+            # manager runs git in these folders on update); other hidden folders are
+            # where tools keep what they execute. Nothing a nest carries belongs there.
+            return f"a path inside the hidden folder {part!r}, where tools keep what they run: {p!r}"
+    if name.endswith(_CODE_SUFFIXES) or any(mark in name for mark in _CODE_NAME_MARKS):
         return f"a path that is program code, not an asset: {p!r}"
+    if not env_root:
+        return None
+    if name.startswith("."):
+        return f"a hidden file, which tools read as settings rather than data: {p!r}"
+    if name in _STARTUP_CONFIG_NAMES:
+        return f"a settings file the app reads at start-up, which can point it at code: {p!r}"
+    if name.split(".", 1)[0] in _WINDOWS_DEVICES:
+        return f"a Windows device name, which no disk there can hold: {p!r}"
+    if name in _INSTALLER_INPUT_NAMES or (
+        name.startswith(_INSTALLER_INPUT_PREFIXES) and suffix == ".txt"
+    ):
+        return f"a file an installer reads as instructions, which can install code: {p!r}"
+    textual = suffix in _TEXT_SUFFIXES
+    if textual:
+        dirs = {part.lower() for part in pp.parts[:-1]}
+        if dirs & _HIDDEN_DIRS_THAT_ARE_DATA:
+            # A Hugging Face download cache a node keeps under its own folder carries
+            # ``.lock`` and metadata files beside the weights; a cache is read back as
+            # data, never as instructions.
+            dirs = set()
+        if dirs & _NODE_DIRS:
+            return f"a text file inside a node folder, which the node or its manager reads as its own configuration: {p!r}"
+        if dirs & _USER_DIRS and not dirs & _WORKFLOW_DIRS:
+            return f"a text file inside the app's user folder, where it keeps its settings: {p!r}"
+    if suffix and suffix not in ENV_DATA_SUFFIXES:
+        return f"a file type a nest does not carry as an asset ({suffix}): {p!r}"
     return None
 
 
@@ -199,7 +346,7 @@ def bad_root_entry(f: object) -> str | None:
         if PurePosixPath(str(p)).name in HOME_NEVER_CARRY:
             return f"a credential file, which never travels: {p!r}"
         if not str(p).startswith(".cache/huggingface/hub/"):
-            return code_position(str(p))
+            return code_position(str(p), env_root=False)
         return None
     # Check four covers the env root only -- the two model cache roots are not
     # on any execution path, and the allowlist above already pins their shape

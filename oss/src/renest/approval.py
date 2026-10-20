@@ -8,7 +8,11 @@ anywhere but its one home:
   ask for an upload to be approved and read that request back;
 * the **upload-once token** comes back once, after the person approved one upload in
   their own browser. It lives in the caller's memory for the length of that one
-  upload and is revoked with :func:`finish_upload`.
+  upload and is revoked with :func:`finish_upload`;
+* the **take-back-once token** (2026-10-19, the panel's "Take back") comes back once,
+  after the person approved one take-back in their browser. It can list this
+  account's nests and fetch the download links of **one** version, lives in the
+  caller's memory, and is revoked with :func:`finish_takeback`.
 
 Neither token ever goes into an exception message, a return value meant for display,
 or a log line. Errors here carry an HTTP status and a plain sentence, nothing else.
@@ -26,13 +30,19 @@ __all__ = [
     "ApprovalError",
     "DeviceLogin",
     "UploadApproval",
+    "cancel_takeback_approval",
     "cancel_upload_approval",
+    "finish_takeback",
     "finish_upload",
+    "list_takeback_nests",
     "poll_device_login",
+    "poll_takeback_approval",
     "poll_upload_approval",
+    "request_takeback_approval",
     "request_upload_approval",
     "server_refusal",
     "start_device_login",
+    "takeback_links",
 ]
 
 #: What an approval id may look like before it is put into a request path.
@@ -308,3 +318,104 @@ def finish_upload(client: httpx.Client, origin: str, upload_token: str, approval
     except ApprovalError:
         return False
     return resp.status_code in (200, 204)
+
+
+# -- one take-back, approved in the browser (the panel's "Take back", 2026-10-19) ---------
+def request_takeback_approval(client: httpx.Client, origin: str, signin_token: str, *,
+                              machine_label: str) -> UploadApproval:
+    """Ask the service for permission to list this account's nests and take one back
+    here. Same shape as an upload approval: a short code the person checks in their
+    browser, and an id the machine polls."""
+    resp = _call(client, "POST", f"{_api(origin)}/takeback-approvals", token=signin_token,
+                 json={"machine_label": machine_label})
+    if resp.status_code == 401:
+        raise ApprovalError(
+            "This machine's Renest sign-in has expired or was revoked. In its terminal, run: "
+            "renest login", status=401)
+    if resp.status_code not in (200, 201):
+        raise _refused(resp, "The Renest service refused to ask for a take-back approval")
+    body = resp.json()
+    try:
+        approval_id = str(body["approval_id"])
+        if not _ID_SHAPE.match(approval_id):
+            raise TypeError
+        return UploadApproval(
+            approval_id=approval_id,
+            user_code=str(body["user_code"]),
+            verify_url=str(body["verify_url"]),
+            expires_in=_expires_in(body),
+            interval=_interval(body),
+        )
+    except (KeyError, TypeError):
+        raise ApprovalError("The Renest service answered the take-back request in a shape this "
+                            "version does not understand.") from None
+
+
+def poll_takeback_approval(client: httpx.Client, origin: str, signin_token: str,
+                           approval_id: str) -> dict:
+    """One poll. Returns the body: ``status`` plus, once, ``takeback_token``."""
+    resp = _call(client, "GET", f"{_api(origin)}/takeback-approvals/{approval_id}",
+                 token=signin_token)
+    if resp.status_code == 401:
+        raise ApprovalError(
+            "This machine's Renest sign-in has expired or was revoked. In its terminal, run: "
+            "renest login", status=401)
+    if resp.status_code != 200:
+        raise _refused(resp, "The Renest service refused the take-back approval check")
+    body = resp.json()
+    return body if isinstance(body, dict) else {}
+
+
+def cancel_takeback_approval(client: httpx.Client, origin: str, signin_token: str,
+                             approval_id: str) -> bool:
+    """Withdraw a take-back request this machine no longer needs. Never raises."""
+    try:
+        resp = _call(client, "POST", f"{_api(origin)}/takeback-approvals/{approval_id}/cancel",
+                     token=signin_token)
+    except ApprovalError:
+        return False
+    return resp.status_code in (200, 204)
+
+
+def finish_takeback(client: httpx.Client, origin: str, takeback_token: str, approval_id: str,
+                    outcome: str) -> bool:
+    """Tell the service this take-back is over, which revokes the take-back-once token.
+    Never raises."""
+    if outcome not in ("succeeded", "failed", "cancelled"):
+        outcome = "failed"
+    try:
+        resp = _call(client, "POST", f"{_api(origin)}/takeback-approvals/{approval_id}/finish",
+                     token=takeback_token, json={"outcome": outcome})
+    except ApprovalError:
+        return False
+    return resp.status_code in (200, 204)
+
+
+def list_takeback_nests(client: httpx.Client, origin: str, takeback_token: str) -> list[dict]:
+    """This account's nests that can be taken back, as the service lists them."""
+    resp = _call(client, "GET", f"{_api(origin)}/takeback/nests", token=takeback_token)
+    if resp.status_code == 401:
+        raise ApprovalError("This take-back approval is no longer valid. Press \"Take back\" "
+                            "again to ask once more.", status=401)
+    if resp.status_code != 200:
+        raise _refused(resp, "The Renest service refused to list your nests")
+    body = resp.json()
+    return [row for row in body if isinstance(row, dict)] if isinstance(body, list) else []
+
+
+def takeback_links(client: httpx.Client, origin: str, takeback_token: str,
+                   nest_version_id: str) -> dict:
+    """The short-lived download links for one version (the same payload a restore
+    code redeems to). The service binds the approval to this one version."""
+    if not _ID_SHAPE.match(nest_version_id or ""):
+        raise ApprovalError("That nest version id is not one this version understands.")
+    resp = _call(client, "POST",
+                 f"{_api(origin)}/takeback/nest-versions/{nest_version_id}/links",
+                 token=takeback_token)
+    if resp.status_code == 401:
+        raise ApprovalError("This take-back approval is no longer valid. Press \"Take back\" "
+                            "again to ask once more.", status=401)
+    if resp.status_code != 200:
+        raise _refused(resp, "The Renest service refused to hand out the download links")
+    body = resp.json()
+    return body if isinstance(body, dict) else {}

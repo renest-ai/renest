@@ -2,6 +2,42 @@
 
 What changed for the person using `renest`. Dates are the release date.
 
+## 0.1.26 — 2026-10-20
+
+### Take a nest back into the ComfyUI you are using
+From the ComfyUI panel (comfyui-renest 0.1.13 or later) you can now browse the nests on your
+Renest drive and take one back into the ComfyUI that is running. Each file is checked byte
+for byte against the nest. Files that are already here and the same are skipped. When a file
+of yours has the same name but different contents, yours stays where it is and the one from
+the nest is put beside it in `.renest/kept/`. Nothing is installed: the panel lists what the
+nest recorded about its environment (custom nodes, packages, GPU) next to what this machine
+has now, and says plainly which ones are the same, changed, or missing. A file your drive
+cannot hand out is listed with the address it originally came from. You approve each take-back
+once, in your browser, signed in to the account that signed this machine in.
+
+### Saving from the panel cleans up after itself
+After your drive has checked a nest you saved from the panel, the copy Renest made beside
+ComfyUI while packing is removed, so deleting the originals from your ComfyUI folder really
+frees the space. Renest never deletes anything inside your ComfyUI folder; the panel lists the
+files you could remove and leaves the choice to you. If the drive does not take the nest, the
+copy is removed straight away; if the drive is still checking when the panel stops waiting,
+the copy stays until a later take-back sees the check finished.
+
+### Restoring a nest someone handed to you refuses files that would run as code
+`renest restore` (and the escape hatch) now refuses any file in a nest that would land where
+it gets run rather than read: program code and native libraries, browser scripts, files that
+tell pip, uv or ComfyUI-Manager what to install, ComfyUI and ComfyUI-Manager settings, hidden
+folders such as `.git`, and names Windows would quietly rewrite. Models, LoRAs, images,
+workflows and training configs are not affected. This matters most for nests handed to you by
+someone else; earlier versions let some of these files through, so update before restoring
+one.
+
+### Nest format 2.15
+Nests saved from the panel record which ComfyUI environment they came from, so your drive can
+group the workflows saved from one environment together. Earlier versions of `renest` still
+restore a 2.15 nest: they say it carries a field they don't know and go ahead without it.
+
+
 ## 0.1.25 — 2026-10-17
 
 ### When your drive can't take a nest, the panel says why and what to do next

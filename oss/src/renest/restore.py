@@ -148,13 +148,13 @@ __all__ = [
     "restore",
 ]
 
-FORMAT_VERSION = "2.14"
+FORMAT_VERSION = "2.15"
 # 2.0 made `code_deps[].role` mandatory and dropped 1.3, so that the consumer
 # side need not sniff /custom_nodes/ paths forever. 2.1 through 2.11 only added
 # fields or relaxed required ones, so **every 2.x package still reads** —
 # nothing here may tighten without a version bump.
 SUPPORTED_FORMAT_VERSIONS = ("2.0", "2.1", "2.2", "2.3", "2.4", "2.5", "2.6", "2.7", "2.8",
-                             "2.9", "2.10", "2.11", "2.12", "2.13", "2.14")
+                             "2.9", "2.10", "2.11", "2.12", "2.13", "2.14", "2.15")
 
 
 def _highest_version(versions: tuple[str, ...]) -> str:
@@ -3866,7 +3866,13 @@ def _validate_manifest(manifest: dict, *, narrate: Callable[..., None] | None = 
             "S1",
             ErrorClass.MANIFEST_UNSUPPORTED,
             "This nest asks for something we will not do — it names "
-            + "; ".join(x[:100] for x in bad[:5])
+            # Every refused entry, each in full: a message that stops at five and cuts
+            # each at 100 characters hid the very names the reader needed
+            # (``requirements.txt``, ``pip_overrides.json``) behind an "…" (real-stack
+            # acceptance, 2026-10-20). One line per entry, numbered, so a long list
+            # still reads.
+            + ("\n" + "\n".join(f"  {i}. {x}" for i, x in enumerate(bad, 1)) + "\n"
+               if len(bad) > 1 else bad[0])
             + ". Files may only land inside the folder you are rebuilding into, or in the "
             "two known model-cache folders. Refusing to restore it.",
         )
@@ -4881,7 +4887,11 @@ def restore(
             return None
         if unvetted_lock_sources(lock_text, trust_hosts=opts.trust_hosts, env_root=target):
             return None
-        probe_env: dict[str, str] = {}
+        # uv reads uv.toml / pyproject.toml [tool.uv] upward from its working directory,
+        # which may be the target itself: the index is decided here, never by a file on
+        # disk (fifth review round, 2026-10-19). User-level uv config is skipped too; a
+        # mirror goes through --package-source.
+        probe_env: dict[str, str] = {"UV_NO_CONFIG": "1"}
         if opts.package_source:
             if unvetted_lock_sources(
                 f"--index-url {opts.package_source}", trust_hosts=opts.trust_hosts
@@ -5708,7 +5718,7 @@ def restore(
         # addresses in the manifest. It is not waved through just because "the
         # user supplied it themselves": they may be typing it off instructions
         # somebody else handed them.
-        _deps_env = {"VIRTUAL_ENV": str(venv)}
+        _deps_env = {"VIRTUAL_ENV": str(venv), "UV_NO_CONFIG": "1"}  # see the S0 probe note
         if opts.package_source:
             bad_src = unvetted_lock_sources(
                 f"--index-url {opts.package_source}", trust_hosts=opts.trust_hosts

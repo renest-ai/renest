@@ -1,4 +1,4 @@
-# manifest v2.14 · Nest manifest specification
+# manifest v2.15 · Nest manifest specification
 
 <!-- Version tripwire: the line "current version **x.y**" below is parsed by
      oss/tests/consistency/test_format_version_pinned.py and must agree with
@@ -6,11 +6,11 @@
      top line of the change log. This is the fifth place the version appears --
      the prose is not allowed to drift from the other four. -->
 
-> Status: **current version 2.14** (2026-10-11). Any field change is a format
+> Status: **current version 2.15** (2026-10-19). Any field change is a format
 > change: bump the version and update `manifest.schema.json`, `restore.sh` and
 > `renest lint` in the same change.
 >
-> **Readable versions**: `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` / `2.10` / `2.11` / `2.12` / `2.13` / `2.14`, plus **any future minor
+> **Readable versions**: `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` / `2.10` / `2.11` / `2.12` / `2.13` / `2.14` / `2.15`, plus **any future minor
 > version of the same major** (a reader meeting a newer minor number warns and
 > continues; it does not reject the nest -- see §2).
 > **1.x is refused outright** (a one-time clean break taken while there were no
@@ -31,7 +31,8 @@
 > the packing machine's CPU had, and the wheels of packages installed from a git
 > repository or a direct download address travelling inside the nest), 2.14 in §21
 > (what the packing machine knew a nest does not carry, and model caches some nodes
-> keep under the home folder).
+> keep under the home folder), 2.15 in §22 (which ComfyUI installation a nest was
+> saved from).
 > **Every 2.x nest still reads**: no version after 2.0 tightened anything.
 >
 > This document is the **frozen description** of the format: written field by
@@ -77,7 +78,7 @@ have restored perfectly into a brick.
 
 | Field | Required | Type | One line |
 |---|---|---|---|
-| `format_version` | ✔ | enum `2.0` … `2.14` | Format version (the schema enum is the only source of truth) |
+| `format_version` | ✔ | enum `2.0` … `2.15` | Format version (the schema enum is the only source of truth) |
 | `id` | ✔ | string (ULID) | Nest identifier, 26-character Crockford base32 |
 | `created_at` | ✔ | date-time | When it was packed |
 | `name` | | string ≤120 | Human-chosen name |
@@ -122,7 +123,7 @@ of truth.
 
 ## 2. Identity and metadata
 
-### `format_version` — enum `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` / `2.10` / `2.11` / `2.12` / `2.13` / `2.14` `[schema]`
+### `format_version` — enum `2.0` / `2.1` / `2.2` / `2.3` / `2.4` / `2.5` / `2.6` / `2.7` / `2.8` / `2.9` / `2.10` / `2.11` / `2.12` / `2.13` / `2.14` / `2.15` `[schema]`
 
 **The `enum` in the schema is the only source of truth.** Everywhere else,
 including this document, is a restatement. Changing the version means changing
@@ -1005,6 +1006,13 @@ still cannot reach the core fields.
 - `workflow_path` (**added in 2.6**): where that file sat, relative to the
   environment root. See below.
 - `workflow_name`: string.
+- `environment_id` (**added in 2.15**): which ComfyUI installation this nest was saved
+  from -- a ULID the panel's local service mints once per installation and keeps in
+  `<ComfyUI>/.renest/environment-id`, so every nest saved from that ComfyUI carries the
+  same value. **Written only on the panel path; the command line never writes it.** A
+  reader that does not know it changes nothing: its one use is grouping, and the Renest
+  drive shows nests under the installation they came from. Absent = not saved from the
+  panel (or older than 2.15), never "unknown installation".
 - `verified_run`: evidence for the "it worked" judgement -- `queue_completed_at`
   (date-time), `duration_seconds` (number), `output_samples` (array of blobs),
   `evidence_source` (**added in 2.11**: which rung of the evidence ladder this
@@ -1948,3 +1956,19 @@ nest reads unchanged.
 | No `home` root for arbitrary home-folder paths | A nest is someone else's bytes; an allowlist that grows by measurement is the only safe shape |
 | No `required: "yes"` written by any packer | Nothing measured today can say "the run needs this" with certainty; the reader plumbing exists so the day it can, the closing words are already honest |
 | `capture_gaps` never changes an exit code | It is disclosure, like `evidence`; a restore that got every listed byte back succeeded at what it promised |
+
+## 22. What 2.15 changed (2026-10-19)
+
+One optional field, purely additive. Every 2.0–2.14 nest reads unchanged.
+
+| What | Breaking? | Why |
+|---|---|---|
+| `adapters.comfyui.environment_id` -- which ComfyUI installation this nest was saved from (§6.1) | No (additive, optional) | The panel inside ComfyUI now saves individual workflows, with their models, from a ComfyUI the person already runs on their own computer, to free local disk and take them back later. Those nests are ordinary nests -- same format, same promise -- and the only thing the drive needs in order to show them as "this installation → its workflows" is a stable id for the installation. Measured 2026-10-19 on the house machine: three packs of one installation share every code archive byte for byte, so grouping costs nothing extra on the drive |
+
+### Explicitly not done (2.15)
+
+| Not done | Why |
+|---|---|
+| No second kind of nest ("files only") | Ruled 2026-10-19: a workflow saved from the panel is a full nest. What differs is the action taken on it (rebuild elsewhere with the command line, or take the files back into the running ComfyUI from the panel), not the nest |
+| No environment snapshot block | Everything a take-back compares against is already in the nest: `code_deps` (repository and commit of each node pack), `python_lock`, `runtime`, `gpu` |
+| No `environment_id` from the command line | The tree is a panel concept; a nest packed by hand belongs to no installation's tree |

@@ -2,10 +2,10 @@
 # =============================================================================
 # Renest restore.sh — the escape hatch
 #
-# Nest formats this copy reads: 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 2.14  (and, with a warning,
+# Nest formats this copy reads: 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 2.14, 2.15  (and, with a warning,
 #   any later 2.x — a higher minor version only ever adds optional fields, and
 #   refusing one would turn a nest whose bytes restore perfectly into a brick).
-#   Written for format 2.14, 2026-10-11. Keep this line: from format 2.3 on a
+#   Written for format 2.15, 2026-10-19. Keep this line: from format 2.3 on a
 #   copy of this script travels inside every nest at .renest/escape/restore.sh,
 #   and this comment is how you tell which copy you are holding — there is no
 #   version field anywhere else.
@@ -371,10 +371,14 @@ FV=$(jq -r '.format_version' "$MANIFEST")
 # setting -- are copied into your home folder, on an explicit yes. A `home` path outside
 # those four caches is named loudly and goes ahead only on an explicit yes. Every
 # 2.0-2.13 nest restores unchanged: neither is present there.
+# 2.15 (2026-10-19) adds one optional label, adapters.comfyui.environment_id: which
+# ComfyUI installation the nest was saved from, written only by the panel's local
+# service so the drive can group nests by installation. This script does not read
+# it; every 2.0–2.14 nest restores unchanged.
 case "$FV" in
-  2.0|2.1|2.2|2.3|2.4|2.5|2.6|2.7|2.8|2.9|2.10|2.11|2.12|2.13|2.14) ;;
+  2.0|2.1|2.2|2.3|2.4|2.5|2.6|2.7|2.8|2.9|2.10|2.11|2.12|2.13|2.14|2.15) ;;
   2.*)
-    warn "This nest says format $FV; this script knows up to 2.14. Same major version, so it only adds optional fields this script does not use — carrying on. A newer Renest will make full use of them." ;;
+    warn "This nest says format $FV; this script knows up to 2.15. Same major version, so it only adds optional fields this script does not use — carrying on. A newer Renest will make full use of them." ;;
   *)
     # Same three facts the agent side gives, in the same order: how old this nest is,
     # that there is no upgrade path and why, and that the files themselves are fine.
@@ -382,7 +386,7 @@ case "$FV" in
     # is not (the manifest still lists every one of them, with fingerprints).
     _WHEN=$(jq -r '.created_at // empty' "$MANIFEST" 2>/dev/null | cut -c1-10)
     _NFILES=$(jq -r '(.files // []) | length' "$MANIFEST" 2>/dev/null)
-    die FORMAT-VERSION "Unrecognised nest format version: $FV — this script reads format 2.x (knows 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13 and 2.14).${_WHEN:+ This nest was packed on ${_WHEN}.} Nests in the older 1.x format cannot be read here, and **there is no upgrade path**: format 2.0 made it compulsory to say which parts of a nest are the application and which are your own code, and nobody can work that out after the fact.${_NFILES:+ **Your files are not lost** — this nest still lists all ${_NFILES} of them with their fingerprints, so they can be fetched one by one even though the environment cannot be rebuilt automatically.} If you still have the environment, pack it again with a current Renest." ;;
+    die FORMAT-VERSION "Unrecognised nest format version: $FV — this script reads format 2.x (knows 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 2.14 and 2.15).${_WHEN:+ This nest was packed on ${_WHEN}.} Nests in the older 1.x format cannot be read here, and **there is no upgrade path**: format 2.0 made it compulsory to say which parts of a nest are the application and which are your own code, and nobody can work that out after the fact.${_NFILES:+ **Your files are not lost** — this nest still lists all ${_NFILES} of them with their fingerprints, so they can be fetched one by one even though the environment cannot be rebuilt automatically.} If you still have the environment, pack it again with a current Renest." ;;
 esac
 
 # ---- Where the files may land ------------------------------------------------
@@ -432,7 +436,11 @@ root_dir() {
 #   4. no file may land somewhere it would be RUN rather than read. Staying
 #      inside $TARGET is not enough: a ".pth" dropped into site-packages runs
 #      on every interpreter start (the folder rule catches that), and a ".py"
-#      dropped into the app's folder gets imported at launch. A ".pth" anywhere
+#      dropped into the app's folder gets imported at launch; so does a native
+#      extension (".so"/".dll"/".dylib"), a browser script (".js") under web/, a
+#      shell or batch file, or anything in ComfyUI-Manager's startup-scripts
+#      folder -- all judged in lower case, because a case-insensitive disk lands
+#      ".VENV/.../Site-Packages" in the real one. A ".pth" anywhere
 #      else is a PyTorch weights file (SAM, upscalers, face models) and is data:
 #      Python only runs ".pth" files that sit in a site folder. files[] holds assets — models, LoRAs, inputs —
 #      never program code, which travels in code_deps instead. This check is
@@ -449,10 +457,32 @@ BADPATH=$(jq -r '
           then "a path that is not allowed in the model cache: \($p)"
         elif ($r == "hf_home") and (($p | test("^accelerate/[^/]+\\.yaml$")) | not)
           then "a path that is not allowed in the model cache: \($p)"
-        elif ($r == "env") and ($p | test("(^|/)(\\.venv|venv|site-packages|bin|Scripts)/"))
+        elif ($r == "env") and ($p == ".renest/escape/restore.sh")
+          then empty
+        elif ($r == "env") and ($p | gsub("\\\\"; "/") | test("(^|/)[^/]*[. ](/|$)|:"))
+          then "a path with a name a Windows disk would rewrite: \($p)"
+        elif ($r == "env") and ($p | gsub("\\\\"; "/") | test("(^|/)\\.(?!cache/)[^/]*/"))
+          then "a path inside a hidden folder, where tools keep what they run: \($p)"
+        elif ($r == "env") and ($p | gsub("\\\\"; "/") | test("(^|/)\\.[^/]*$"))
+          then "a hidden file, which tools read as settings rather than data: \($p)"
+        elif ($r == "env") and ($p | gsub("\\\\"; "/") | test("(^|/)(comfyui-manager[^/]*|__manager[^/]*)/"; "i"))
+          then "a path inside the node manager folder, which it reads as its own data: \($p)"
+        elif ($r == "env") and ($p | gsub("\\\\"; "/") | test("(^|/)(extra_model_paths\\.ya?ml|comfy\\.settings\\.json|config\\.ini|channels\\.list|custom-node-list\\.json|model-list\\.json|alter-list\\.json|extension-node-map\\.json|github-stats\\.json)$"; "i"))
+          then "a settings file the app reads at start-up, which can point it at code: \($p)"
+        elif ($r == "env") and ($p | gsub("\\\\"; "/") | test("(^|/)(con|prn|aux|nul|com[1-9]|lpt[1-9])(\\.[^/]*)?$"; "i"))
+          then "a Windows device name, which no disk there can hold: \($p)"
+        elif ($r == "env") and ($p | gsub("\\\\"; "/") | test("(^|/)(requirements[^/]*\\.txt|constraints[^/]*\\.txt|pyproject\\.toml|uv\\.toml|uv\\.lock|setup\\.cfg|pip\\.conf|pip\\.ini|pipfile|pipfile\\.lock|poetry\\.lock|package\\.json|package-lock\\.json)$"; "i"))
+          then "a file an installer reads as instructions, which can install code: \($p)"
+        elif ($r == "env") and ($p | gsub("\\\\"; "/") | (test("(^|/)custom_nodes/"; "i") and (test("(^|/)\\.cache/"; "i") | not) and test("\\.(json|jsonl|txt|yaml|yml|toml|lock|md|csv|tsv|xml|vocab|merges)$"; "i")))
+          then "a text file inside a node folder, which the node or its manager reads as its own configuration: \($p)"
+        elif ($r == "env") and ($p | gsub("\\\\"; "/") | (test("(^|/)user/"; "i") and (test("(^|/)\\.cache/"; "i") | not) and (test("(^|/)workflows/"; "i") | not) and test("\\.(json|jsonl|txt|yaml|yml|toml|lock|md|csv|tsv|xml|vocab|merges)$"; "i")))
+          then "a text file inside the app user folder, where it keeps its settings: \($p)"
+        elif ($r == "env") and ($p | gsub("\\\\"; "/") | (test("(^|/)(\\.venv|venv|site-packages|dist-packages|__pycache__|startup-scripts)/"; "i") or (test("(^|/)(bin|scripts)/"; "i") and (test("\\.(safetensors|ckpt|pt|bin|onnx|gguf|pkl|npy|npz|h5|msgpack|tflite|pb|params|model|task|vae|embedding|sft|engine|json|jsonl|txt|yaml|yml|toml|lock|md|csv|tsv|xml|vocab|merges|png|jpg|jpeg|webp|gif|bmp|tif|tiff|svg|mp4|mov|webm|mkv|avi|wav|mp3|flac|ogg|m4a|ttf|otf|woff|woff2|cube|zip|tar|gz|tgz|7z)$"; "i") | not))))
           then "a path where files get run as code, not read as data: \($p)"
-        elif ($r == "env") and ($p | test("\\.(py|pyc|pyd)$"))
+        elif ($r == "env") and ($p | gsub("\\\\"; "/") | test("\\.(py|pyc|pyd|pyo|pyw|so|dylib|dll|js|mjs|cjs|sh|bat|cmd|ps1|exe)$|\\.cpython-|\\.abi3\\."; "i"))
           then "a path that is program code, not an asset: \($p)"
+        elif ($r == "env") and ($p | gsub("\\\\"; "/") | (test("\\.[^/.]+$") and (test("\\.(safetensors|ckpt|pt|pth|bin|onnx|gguf|pkl|npy|npz|h5|msgpack|tflite|pb|params|model|task|vae|embedding|sft|engine|json|jsonl|txt|yaml|yml|toml|lock|md|csv|tsv|xml|vocab|merges|png|jpg|jpeg|webp|gif|bmp|tif|tiff|svg|mp4|mov|webm|mkv|avi|wav|mp3|flac|ogg|m4a|ttf|otf|woff|woff2|cube|zip|tar|gz|tgz|7z)$"; "i") | not)))
+          then "a file type a nest does not carry as an asset: \($p)"
         else empty end),
     (.code_deps[]? | (.install_path // "") as $p
       | if ($p == "") or ($p | test("^(/|~)")) or ($p | test("(^|/)\\.\\.(/|$)"))
@@ -508,7 +538,7 @@ _HOME_ODD=$(jq -r '(.files // [])[] | select(type == "object") | select((.root /
   | select((test("^(\\.cache/huggingface/hub/models--[^/]+/(refs/[^/]+|snapshots/[0-9a-f]{40}/.+|\\.no_exist/[0-9a-f]{40}/.+)|\\.rembg/.+|\\.transparent-background/.+|\\.insightface/.+)$") | not)
            or test("(^|/)(token|stored_tokens)$")
            or ((startswith(".cache/huggingface/hub/") | not)
-               and (test("(^|/)(\\.venv|venv|site-packages|bin|Scripts)/") or test("\\.(py|pyc|pyd)$"))))' "$MANIFEST")
+               and ((test("(^|/)(\\.venv|venv|site-packages|dist-packages|__pycache__|startup-scripts)/"; "i") or (test("(^|/)(bin|scripts)/"; "i") and (test("\\.(safetensors|ckpt|pt|bin|onnx|gguf|pkl|npy|npz|h5|msgpack|tflite|pb|params|model|task|vae|embedding|sft|engine|json|jsonl|txt|yaml|yml|toml|lock|md|csv|tsv|xml|vocab|merges|png|jpg|jpeg|webp|gif|bmp|tif|tiff|svg|mp4|mov|webm|mkv|avi|wav|mp3|flac|ogg|m4a|ttf|otf|woff|woff2|cube|zip|tar|gz|tgz|7z)$"; "i") | not))) or test("\\.(py|pyc|pyd|pyo|pyw|so|dylib|dll|js|mjs|cjs|sh|bat|cmd|ps1|exe)$|\\.cpython-|\\.abi3\\."; "i"))))' "$MANIFEST")
 while IFS= read -r _hp; do
   [ -n "$_hp" ] || continue
   warn "!! RISK: this nest lists a file for your home folder at ~/$_hp"
@@ -1882,6 +1912,11 @@ if [ -n "${PACKAGE_SOURCE:-}" ]; then
     log "Installing dependencies from $PACKAGE_SOURCE instead of the default. Every package in this nest carries a recorded fingerprint, and each one is checked on arrival."
   fi
   export UV_DEFAULT_INDEX="$PACKAGE_SOURCE"
+# uv reads uv.toml / pyproject.toml [tool.uv] upward from its working directory; this
+# script may well be launched from inside the target. The index the nest gets is the one
+# above, never a file on this disk (fifth review round, 2026-10-19). This also skips the
+# user-level uv config; a mirror goes through --package-source instead.
+export UV_NO_CONFIG=1
 fi
 # Where the vendor-only pins came from (format 2.11), for the lines that were never
 # pinned to a direct download address. Printed **only if the install fails**, because
@@ -2183,7 +2218,7 @@ _HOME_WRITES=$(jq -r '(.files // [])[] | select(type == "object") | select((.roo
   | (.path // "") | select(type == "string") | select(startswith(".insightface/"))
   | select(test("^(\\.cache/huggingface/hub/models--[^/]+/(refs/[^/]+|snapshots/[0-9a-f]{40}/.+|\\.no_exist/[0-9a-f]{40}/.+)|\\.rembg/.+|\\.transparent-background/.+|\\.insightface/.+)$")) | select(test("(^|/)\\.\\.(/|$)") | not)
   | select(test("(^|/)(token|stored_tokens)$") | not)
-  | select((test("(^|/)(\\.venv|venv|site-packages|bin|Scripts)/") or test("\\.(py|pyc|pyd)$")) | not)' "$MANIFEST")
+  | select(((test("(^|/)(\\.venv|venv|site-packages|dist-packages|__pycache__|startup-scripts)/"; "i") or (test("(^|/)(bin|scripts)/"; "i") and (test("\\.(safetensors|ckpt|pt|bin|onnx|gguf|pkl|npy|npz|h5|msgpack|tflite|pb|params|model|task|vae|embedding|sft|engine|json|jsonl|txt|yaml|yml|toml|lock|md|csv|tsv|xml|vocab|merges|png|jpg|jpeg|webp|gif|bmp|tif|tiff|svg|mp4|mov|webm|mkv|avi|wav|mp3|flac|ogg|m4a|ttf|otf|woff|woff2|cube|zip|tar|gz|tgz|7z)$"; "i") | not))) or test("\\.(py|pyc|pyd|pyo|pyw|so|dylib|dll|js|mjs|cjs|sh|bat|cmd|ps1|exe)$|\\.cpython-|\\.abi3\\."; "i")) | not)' "$MANIFEST")
 if [ -n "$_HOME_WRITES" ] && [ -z "${HOME:-}" ]; then
   warn "This nest carries files insightface reads from the home folder, but this machine has no HOME set, so they stay in $TARGET/.renest/home/.insightface."
   _HOME_WRITES=""
