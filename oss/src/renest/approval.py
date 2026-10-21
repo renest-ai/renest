@@ -257,7 +257,8 @@ def start_device_login(client: httpx.Client, origin: str, machine_label: str) ->
                  json={"machine_label": machine_label})
     if resp.status_code not in (200, 201):
         raise ApprovalError(f"The Renest service refused to start a sign-in: {_server_error(resp)}",
-                            status=resp.status_code)
+                            status=resp.status_code,
+                            transient=resp.status_code in TRANSIENT_STATUSES)
     body = resp.json()
     try:
         return DeviceLogin(
@@ -278,7 +279,8 @@ def poll_device_login(client: httpx.Client, origin: str, device_code: str) -> di
                  json={"device_code": device_code})
     if resp.status_code != 200:
         raise ApprovalError(f"The Renest service refused the sign-in check: {_server_error(resp)}",
-                            status=resp.status_code)
+                            status=resp.status_code,
+                            transient=resp.status_code in TRANSIENT_STATUSES)
     body = resp.json()
     return body if isinstance(body, dict) else {}
 

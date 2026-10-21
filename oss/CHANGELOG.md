@@ -2,6 +2,17 @@
 
 What changed for the person using `renest`. Dates are the release date.
 
+## 0.1.28 — 2026-10-22
+
+### `renest login` keeps waiting through a slow network
+While `renest login` waits for you to approve the sign-in in your browser, it keeps checking
+with Renest. Until now one dropped or slow reply ended it, often while you were approving, and
+you had to start again with a new code. Now a timeout or a busy reply means it tries again a
+little later, until the code itself runs out, and it tells you the network is slow. If it does
+run out while the network is still down, it says the network was the problem. In the rare case
+where you approved but the reply carrying the key was lost on the way, it says so and names the
+key to revoke in Settings > Access before you sign in again.
+
 ## 0.1.27 — 2026-10-20
 
 ### A slow network no longer cancels a save or take-back you already approved

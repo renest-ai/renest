@@ -24,7 +24,7 @@ from pathlib import Path
 
 import httpx
 
-from .approval import ApprovalError, poll_device_login, start_device_login
+from .approval import ApprovalError, poll_device_login, retry_transient, start_device_login
 from .config import (
     TOKEN_ENV,
     ConfigError,
@@ -70,18 +70,49 @@ def device_sign_in(
     sleep = sleep or time.sleep
     clock = clock or time.monotonic
     min_interval = _MIN_INTERVAL_S if min_interval is None else min_interval
-    start = start_device_login(client, origin, machine_label())
+    start = retry_transient(lambda: start_device_login(client, origin, machine_label()), sleep=sleep)
     say("To sign this machine in to Renest, open this page in a browser where you are signed in:")
     say(f"  {start.verify_url}")
     say("Check that the page shows this code, then approve it:")
     say(f"  {start.user_code}")
     say("Waiting for you to approve...")
     deadline = clock() + start.expires_in + 5
-    gap = min(max(start.interval, min_interval), _MAX_INTERVAL_S)
+    base_gap = min(max(start.interval, min_interval), _MAX_INTERVAL_S)
+    gap = base_gap
+    # A transient failure (timeout, connection error, 429/502/503/504) is no answer at
+    # all, so it never ends the wait: the person may be approving right now. Production,
+    # 2026-10-21: three sign-ins in a row died on one ReadTimeout each while the founder
+    # was on the approval page, on a route that drops replies routinely.
+    lost_reply = False
+    said_slow = False
+    last_failure: ApprovalError | None = None
     while clock() < deadline:
         sleep(gap)
-        got = poll_device_login(client, origin, start.device_code)
+        try:
+            got = poll_device_login(client, origin, start.device_code)
+        except ApprovalError as e:
+            if not e.transient or clock() >= deadline:
+                raise
+            lost_reply = True
+            last_failure = e
+            if not said_slow:
+                said_slow = True
+                say("The network to the Renest service is slow or dropping; still waiting "
+                    "for your approval and trying again.")
+            gap = min(max(gap * 2, 1.0), _MAX_INTERVAL_S)
+            continue
+        gap = base_gap
+        last_failure = None
         status = str(got.get("status") or "")
+        if status == "consumed" and lost_reply:
+            # The approval went through and the service handed the key out, but the reply
+            # carrying it never arrived. The key is not on this machine, and it still works
+            # until it is revoked: say where to switch it off.
+            raise ApprovalError(
+                f"The sign-in was approved, but the reply carrying the key was lost on the "
+                f"network. Nothing was saved on this machine. In the Renest console, open "
+                f"Settings > Access and revoke the key named 'Machine sign-in: {machine_label()}', "
+                f"then run renest login again.")
         if status == "approved":
             token = got.get("token")
             if not isinstance(token, str) or not token:
@@ -96,6 +127,10 @@ def device_sign_in(
         if status not in ("", "pending"):
             raise ApprovalError(f"The sign-in ended in a state this version does not know ({status[:40]}). "
                                 "Run renest login again.")
+    if last_failure is not None:
+        # The wait ran out while the service could not be reached: that is the honest
+        # reason, not "nobody approved".
+        raise last_failure
     raise ApprovalError("The sign-in code expired before it was approved. Run renest login again.")
 
 
