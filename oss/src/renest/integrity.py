@@ -313,7 +313,7 @@ def run_git(cwd: Path, *args: str) -> str | None:
     Returns None on failure or empty output; never raises."""
     try:
         r = subprocess.run(["git", "-C", str(cwd), *args],
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         return None
     return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None

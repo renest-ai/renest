@@ -355,7 +355,7 @@ def _rendering_image_verifier(*, assume_yes: bool = False):
                 detail="This nest records no workflow to run (or it is missing from the "
                        "rebuilt folder), so there is nothing to render.",
             )
-        workflow = json.loads(wf_files[0].read_text())
+        workflow = json.loads(wf_files[0].read_text(encoding="utf-8"))
 
         # The working directory follows the same rule as S4: honour entrypoint.cwd
         # first (the format decides), and otherwise find the host through the
@@ -460,7 +460,7 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
         print(problem, file=sys.stderr)
         return int(ExitCode.USAGE)
     try:
-        manifest = json.loads(Path(args.manifest).read_text())
+        manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
         print(f"✗ Cannot read the manifest: {e}", file=sys.stderr)
         return int(ExitCode.USAGE)
@@ -482,7 +482,7 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
         # check already ran, and its answer is the thing the user came for.
         try:
             Path(args.report).write_text(
-                json.dumps(report.to_dict(), ensure_ascii=False, indent=2)
+                json.dumps(report.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8", newline="\n"
             )
         except OSError as e:
             print(f"⚠ Could not write the report to {args.report}: {e}", file=sys.stderr)

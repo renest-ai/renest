@@ -1165,7 +1165,7 @@ def record_auth_token(token: str, *, path: str | os.PathLike[str] | None = None)
             if original is None:
                 target.unlink(missing_ok=True)
             else:
-                target.write_text(original, encoding="utf-8")
+                target.write_text(original, encoding="utf-8", newline="\n")
         except OSError:
             pass
         raise ConfigError(

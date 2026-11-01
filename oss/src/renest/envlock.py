@@ -18,8 +18,10 @@ from __future__ import annotations
 
 
 import json
+import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from .roots import ENV_ROOT_TOKEN
 from .uvbin import uv_executable
@@ -583,7 +585,7 @@ def is_system_interpreter(python_exe: str | Path) -> bool | None:
     try:
         out = subprocess.run(
             [str(python_exe), "-c", "import sys;print(sys.prefix==sys.base_prefix)"],
-            capture_output=True, text=True, timeout=60, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -591,6 +593,16 @@ def is_system_interpreter(python_exe: str | Path) -> bool | None:
         return None
     answer = out.stdout.strip()
     return answer == "True" if answer in ("True", "False") else None
+
+
+def _utf8_child_env() -> dict[str, str]:
+    """The environment for a Python we start and read text back from.
+
+    We decode its output as UTF-8, so it has to write UTF-8: on Windows a piped
+    Python otherwise writes in the console code page, and a package path under a
+    non-ASCII user folder comes back garbled in the lock.
+    """
+    return {**os.environ, "PYTHONIOENCODING": "utf-8"}
 
 
 def find_env_python(candidates: list[Path]) -> Path | None:
@@ -608,13 +620,24 @@ def find_env_python(candidates: list[Path]) -> Path | None:
         try:
             out = subprocess.run(
                 [str(c), "-c", "import sys; print(sys.version_info[0])"],
-                capture_output=True, text=True, timeout=30, check=False,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, check=False,
             )
         except (OSError, subprocess.SubprocessError):
             continue
         if out.returncode == 0 and out.stdout.strip() == "3":
             return c
     return None
+
+
+def venv_python(env_dir: Path, *, windows: bool | None = None) -> Path:
+    """The interpreter inside a virtual environment: ``Scripts/python.exe`` on Windows,
+    ``bin/python`` everywhere else.
+
+    ``windows`` defaults to the machine we run on, which is right for an environment
+    built here; tests pass it to check both layouts on any machine.
+    """
+    win = sys.platform == "win32" if windows is None else windows
+    return env_dir / "Scripts" / "python.exe" if win else env_dir / "bin" / "python"
 
 
 def venv_python_candidates(*roots: Path) -> list[Path]:
@@ -652,7 +675,7 @@ def _uv_freeze(python_exe: str | Path) -> str | None:
     try:
         out = subprocess.run(  # noqa: S603
             [uv_executable(), "pip", "freeze", "--python", str(python_exe)],
-            capture_output=True, text=True, timeout=300, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -670,7 +693,8 @@ def _pip_freeze(python_exe: str | Path) -> str | None:
     try:
         out = subprocess.run(
             [str(python_exe), "-m", "pip", "freeze", "--disable-pip-version-check"],
-            capture_output=True, text=True, timeout=180, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180, check=False,
+            env=_utf8_child_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -724,7 +748,8 @@ def freeze_environment(python_exe: str | Path) -> str | None:
     try:
         out = subprocess.run(
             [str(python_exe), "-c", _FREEZE_SNIPPET],
-            capture_output=True, text=True, timeout=180, check=False,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180, check=False,
+            env=_utf8_child_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -1044,7 +1069,9 @@ def _expand(raw: str, values: dict[str, str], here: Path) -> Path | None:
     # else in a .bat, so it needs its own pass inside the loop.
     text = raw
     for _ in range(8):
-        nxt = _VAR_REF.sub(sub, _SCRIPT_DIR_REF.sub(str(here) + "/", text))
+        # A function, not a string: a replacement string is itself parsed for escapes,
+        # and a Windows folder (``C:\Users\...``) reads as the bad escape ``\U``.
+        nxt = _VAR_REF.sub(sub, _SCRIPT_DIR_REF.sub(lambda _m: str(here) + "/", text))
         if nxt == text:
             break
         text = nxt
@@ -1069,7 +1096,10 @@ def interpreter_kernel(env_dir: Path) -> str | None:
     """
     if not env_dir.is_dir():
         return None
-    if (env_dir / "python.exe").is_file() or any(env_dir.glob("python*.dll")):
+    if ((env_dir / "python.exe").is_file() or any(env_dir.glob("python*.dll"))
+            or (env_dir / "Scripts" / "python.exe").is_file()):
+        # The last one is a virtual environment made on Windows (``python -m venv`` /
+        # ``uv venv``): its interpreter sits under Scripts, with no DLL at the top.
         return "windows"
     if (env_dir / "bin" / "python").exists() or any(env_dir.glob("bin/python3*")):
         return "posix"

@@ -192,7 +192,7 @@ def ask_pack(python: str | Path | None, program_dir: Path, data_dir: Path, node_
            "extra_model_paths": [str(p) for p in extra_model_paths]}
     try:
         out = subprocess.run([str(python), "-c", _CHILD], input=json.dumps(req),
-                             capture_output=True, text=True, timeout=TIMEOUT_S, check=False,
+                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=TIMEOUT_S, check=False,
                              cwd=str(program_dir))
     except (OSError, subprocess.SubprocessError) as e:
         return fail(f"could not start {python}: {e}")

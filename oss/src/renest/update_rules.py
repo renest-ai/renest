@@ -461,7 +461,7 @@ def install_bundle(body: dict, *, keys: dict[str, bytes] | None = None) -> list[
         if not one.get("issued_at"):
             one["issued_at"] = payload.get("issued_at")
         tmp = dest / f".{name}.tmp"
-        tmp.write_text(json.dumps(one, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(one, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
         os.replace(tmp, dest / name)
         out.append({"name": name, "ok": True, "detail": "updated"})
     _rules.clear_cache()
@@ -709,14 +709,14 @@ def record_refresh_answer(enabled: bool, *, path=None):
             with _os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(patched)
         else:
-            target.write_text(patched, encoding="utf-8")
+            target.write_text(patched, encoding="utf-8", newline="\n")
         return target
     except OSError:
         try:
             if original is None:
                 target.unlink(missing_ok=True)
             else:
-                target.write_text(original, encoding="utf-8")
+                target.write_text(original, encoding="utf-8", newline="\n")
         except OSError:
             pass
         return None

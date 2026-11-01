@@ -210,7 +210,7 @@ def _leave_pointer(chosen: Path, default: Path) -> None:
             pointer.unlink(missing_ok=True)
             return
         pointer.parent.mkdir(parents=True, exist_ok=True)
-        pointer.write_text(str(chosen), encoding="utf-8")
+        pointer.write_text(str(chosen), encoding="utf-8", newline="\n")
         pointer.chmod(0o600)
     except OSError:
         # Never fail serving because the hint could not be written.
@@ -603,7 +603,7 @@ class ServeApp:
     def _persist(self, job: Job) -> None:
         with self._lock:
             tmp = self.jobs_dir / f"{job.id}.json.tmp"
-            tmp.write_text(json.dumps(job.to_dict(), ensure_ascii=False, indent=1), encoding="utf-8")
+            tmp.write_text(json.dumps(job.to_dict(), ensure_ascii=False, indent=1), encoding="utf-8", newline="\n")
             os.replace(tmp, self.jobs_dir / f"{job.id}.json")
 
     @staticmethod
@@ -682,7 +682,7 @@ class ServeApp:
     def _save_registry(self, rows: list[dict]) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.registry_path.with_name(self.registry_path.name + ".tmp")
-        tmp.write_text(json.dumps(rows, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.write_text(json.dumps(rows, ensure_ascii=False, indent=1), encoding="utf-8", newline="\n")
         os.replace(tmp, self.registry_path)
 
     def list_nests(self) -> list[dict]:
@@ -1320,7 +1320,7 @@ class ServeApp:
                         break
                     raise _JobFailed(_failure("approval", "UPLOAD_NOT_APPROVED",
                                               "The take-back was approved, but the approval could "
-                                              "not be collected. Press \"Take back\" again."))
+                                              "not be collected. Press \"Show my saved workflows\" again."))
                 if status == "denied":
                     raise _JobFailed(_failure("approval", "UPLOAD_NOT_APPROVED",
                                               "The take-back was denied in the browser. Nothing "
@@ -1328,7 +1328,7 @@ class ServeApp:
                 if status == "expired" or time.monotonic() > deadline:
                     raise _JobFailed(_failure("approval", "UPLOAD_NOT_APPROVED",
                                               "Nobody approved the take-back in time. Press "
-                                              "\"Take back\" again to ask once more."))
+                                              "\"Show my saved workflows\" again to ask once more."))
                 if status not in ("", "pending"):
                     raise _JobFailed(_failure("approval", "UPLOAD_NOT_APPROVED",
                                               f"The approval ended in a state this version does "
@@ -1417,7 +1417,7 @@ class ServeApp:
         sess = self._takeback_session_get(str(body.get("session_id") or ""))
         if sess is None:
             raise _JobFailed(_failure("P1", "TAKEBACK_SESSION_GONE",
-                                      "This take-back session has ended. Press \"Take back\" "
+                                      "This take-back session has ended. Press \"Show my saved workflows\" "
                                       "again to approve a new one."))
         target = body.get("target")
         if not target:

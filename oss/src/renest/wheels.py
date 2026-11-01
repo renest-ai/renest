@@ -665,6 +665,27 @@ def _python_tag_matches(tag: str, abi_tags: list[str], want: str) -> bool:
     return "abi3" in abi_tags and built <= target
 
 
+def _os_arch_tails(platform_tags: tuple[str, ...], os_family: str) -> tuple[str, ...]:
+    """Expand canonical CPU tags (``x86_64`` / ``aarch64``) to the wheel platform suffixes
+    used by macOS (``arm64`` / ``universal2``) and Windows (``amd64`` / ``win_amd64``).
+    """
+    if os_family == "macos":
+        tails = list(platform_tags)
+        if any(p in ("aarch64", "arm64") for p in platform_tags):
+            tails.extend(("arm64", "universal2", "universal"))
+        elif "x86_64" in platform_tags:
+            tails.extend(("universal2", "universal"))
+        return tuple(dict.fromkeys(tails))
+    if os_family == "windows":
+        tails = list(platform_tags)
+        if any(p in ("x86_64", "amd64") for p in platform_tags):
+            tails.extend(("amd64", "win_amd64"))
+        elif any(p in ("aarch64", "arm64") for p in platform_tags):
+            tails.extend(("arm64", "win_arm64"))
+        return tuple(dict.fromkeys(tails))
+    return platform_tags
+
+
 def _platform_matches(
     plat_tags: list[str], platform_tags: tuple[str, ...], os_family: str
 ) -> bool:
@@ -678,12 +699,13 @@ def _platform_matches(
     S3 (RC=30) with the model files already paid for. The wrong answer was **worse than
     no answer**: without it the lock simply had no fingerprints and installed fine.
     """
+    tails = _os_arch_tails(platform_tags, os_family)
     for q in plat_tags:
         if q == "any":
             return True
         if platform_tag_os(q) != os_family:
             continue
-        if any(q == p or q.endswith(f"_{p}") for p in platform_tags):
+        if any(q == p or q.endswith(f"_{p}") for p in tails):
             return True
     return False
 

@@ -349,7 +349,7 @@ def _vram_gb_from_torch(timeout: float = 10) -> float | None:
         proc = subprocess.run(  # noqa: S603 - fixed program, this interpreter
             [sys.executable, "-c", _VRAM_PROBE_SRC],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError):

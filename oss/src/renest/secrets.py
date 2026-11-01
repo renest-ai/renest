@@ -145,7 +145,7 @@ def scan_tree(src_dir: Path, *, exclude: frozenset[str] = frozenset()) -> tuple[
         if not p.is_file() or p.is_symlink():
             continue
         if p.name in SUSPICIOUS_NAMES:
-            suspicious.append(str(rel))
+            suspicious.append(rel.as_posix())
         text = _read_text_to_scan(p)
         if text is None:
             continue
@@ -153,7 +153,7 @@ def scan_tree(src_dir: Path, *, exclude: frozenset[str] = frozenset()) -> tuple[
             for what, pat in _PATTERNS:
                 m = pat.search(line)
                 if m:
-                    hits.append(SecretHit(str(rel), lineno, what, _mask(m.group(0))))
+                    hits.append(SecretHit(rel.as_posix(), lineno, what, _mask(m.group(0))))
                     break
     return hits, suspicious
 
@@ -219,7 +219,7 @@ def scan_recipe_json(path: Path, *, label: str = "") -> list[SecretHit]:
             return []
         import json
 
-        data = json.loads(path.read_text(errors="replace"))
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except (OSError, ValueError):
         return []
     name = label or path.name

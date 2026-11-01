@@ -2,6 +2,19 @@
 
 What changed for the person using `renest`. Dates are the release date.
 
+## 0.1.29 — 2026-11-01
+
+### Windows and macOS ComfyUI panel workflows
+`renest start` and the ComfyUI panel now run cleanly on Windows and macOS. The background
+engine recognizes the Windows Python environment layout (`Scripts/python.exe`), matches
+prebuilt platform wheels (`win_amd64`, macOS `arm64` and `universal2`), and generates POSIX
+canonical paths in nest manifests so workflows packed on Windows or macOS carry cleanly to
+cloud GPU instances.
+
+### 1-free-slot lifecycle support
+Users on the free plan can keep 1 self-packed nest workflow for 7 days with automated
+lifecycle warnings and upgrade guidance to preserve it permanently.
+
 ## 0.1.28 — 2026-10-22
 
 ### `renest login` keeps waiting through a slow network

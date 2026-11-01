@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "renest"
-version = "0.1.28"
+version = "0.1.29"
 readme = "README.md"
 description = "Save a ComfyUI or fine-tuning setup that already worked on a rented GPU - models, custom nodes, exact package versions, workflow - and bring it back on another Linux GPU machine, every file checked against its SHA-256."
 requires-python = ">=3.11"
@@ -179,6 +179,12 @@ path = "hatch_build.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    # The tests the ComfyUI panel's save / take-back line must pass on Windows.
+    # The windows-latest CI job runs them as a hard gate (`pytest -m panel_line`);
+    # the full suite there stays allow-fail. Design doc 10, section 9.2 step 1.
+    "panel_line: must pass on Windows; run as a hard gate by the panel-line CI job",
+]
 
 [tool.ruff]
 line-length = 100

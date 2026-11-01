@@ -465,7 +465,7 @@ def _parse_extra_model_paths(comfyui_dir: Path) -> dict[str, list[Path]]:
     except ImportError:
         return {}
     try:
-        data = yaml.safe_load(p.read_text()) or {}
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
     except Exception:
         return {}
     out: dict[str, list[Path]] = {}
@@ -582,7 +582,7 @@ def _file_defines_class(py: Path, cls: str) -> bool:
     try:
         if py.stat().st_size > (2 << 20):
             return False
-        text = py.read_text(errors="ignore")
+        text = py.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return False
     return any(q in text for q in (f'"{cls}"', f"'{cls}'")) or bool(
@@ -758,7 +758,7 @@ def _api_node_names(py: Path, *, package_root: bool) -> set[str]:
     try:
         if py.stat().st_size > (2 << 20):
             return set()
-        text = py.read_text(errors="ignore")
+        text = py.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return set()
     try:
@@ -1102,7 +1102,7 @@ def _files_under(comfyui_dir: Path, prefix: str, rel_dirs: Iterable[str],
 def _standard_model_folders(program_root: Path) -> set[str]:
     """The model folders ComfyUI registers itself, read off its folder_paths.py as text."""
     try:
-        text = (program_root / "folder_paths.py").read_text(errors="ignore")
+        text = (program_root / "folder_paths.py").read_text(errors="ignore", encoding="utf-8")
     except OSError:
         return set()
     return set(re.findall(r"""os\.path\.join\(models_dir,\s*["']([^"']+)["']\)""", text))

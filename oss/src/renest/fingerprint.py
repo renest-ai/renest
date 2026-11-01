@@ -312,7 +312,7 @@ def collect_wheel_env(python_path: str | None = None) -> dict[str, str]:
     try:
         result = subprocess.run(  # noqa: S603 - fixed program, caller-chosen interpreter
             [python_path, "-c", _WHEEL_ENV_PROBE_SRC],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
         )
         parsed = json.loads(result.stdout.strip().splitlines()[-1])
     except Exception:
@@ -416,7 +416,7 @@ def _probe_subprocess(python_path: str) -> dict[str, Any]:
         result = subprocess.run(  # noqa: S603 - fixed program, caller-chosen interpreter
             [python_path, "-c", _PROBE_SRC % (_critical_packages(),)],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=120,
         )
     except (OSError, subprocess.SubprocessError):
@@ -443,7 +443,7 @@ def _query_nvidia_smi() -> str | None:
         result = subprocess.run(  # noqa: S603 - fixed program and args
             ["nvidia-smi", "--query-gpu=name,compute_cap", "--format=csv,noheader"],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=30,
         )
     except (OSError, subprocess.SubprocessError):
@@ -493,7 +493,7 @@ def _query_gpu_topology() -> str | None:
     try:
         result = subprocess.run(  # noqa: S603 - fixed program and args
             ["nvidia-smi", "topo", "-m"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -553,7 +553,7 @@ def _probe_torch_gpu(python_path: str | None) -> dict:
         result = subprocess.run(  # noqa: S603 - fixed program, caller-chosen interpreter
             [python_path, "-c", _GPU_PROBE_SRC],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=120,
         )
     except (OSError, subprocess.SubprocessError):

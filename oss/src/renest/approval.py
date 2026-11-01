@@ -436,7 +436,7 @@ def list_takeback_nests(client: httpx.Client, origin: str, takeback_token: str) 
     """This account's nests that can be taken back, as the service lists them."""
     resp = _call(client, "GET", f"{_api(origin)}/takeback/nests", token=takeback_token)
     if resp.status_code == 401:
-        raise ApprovalError("This take-back approval is no longer valid. Press \"Take back\" "
+        raise ApprovalError("This take-back approval is no longer valid. Press \"Show my saved workflows\" "
                             "again to ask once more.", status=401)
     if resp.status_code != 200:
         raise _refused(resp, "The Renest service refused to list your nests")
@@ -454,7 +454,7 @@ def takeback_links(client: httpx.Client, origin: str, takeback_token: str,
                  f"{_api(origin)}/takeback/nest-versions/{nest_version_id}/links",
                  token=takeback_token)
     if resp.status_code == 401:
-        raise ApprovalError("This take-back approval is no longer valid. Press \"Take back\" "
+        raise ApprovalError("This take-back approval is no longer valid. Press \"Show my saved workflows\" "
                             "again to ask once more.", status=401)
     if resp.status_code != 200:
         raise _refused(resp, "The Renest service refused to hand out the download links")

@@ -226,7 +226,7 @@ def record_answer(enabled: bool, *, path: Path | None = None) -> Path | None:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(patched)
         else:
-            target.write_text(patched, encoding="utf-8")
+            target.write_text(patched, encoding="utf-8", newline="\n")
         if _readback(target) != enabled:
             raise ConfigError("telemetry answer did not read back")
         return target
@@ -235,7 +235,7 @@ def record_answer(enabled: bool, *, path: Path | None = None) -> Path | None:
             if original is None:
                 target.unlink(missing_ok=True)
             else:
-                target.write_text(original, encoding="utf-8")
+                target.write_text(original, encoding="utf-8", newline="\n")
         except OSError:
             pass
         return None

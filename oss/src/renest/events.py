@@ -24,6 +24,21 @@ from .errors import NestFailure
 
 __all__ = ["EVENT_TYPES", "PROGRESS_FIELDS", "EventEmitter", "sanitise_terminal"]
 
+def _write(stream: IO[str], text: str) -> None:
+    """Write without ever dying on the console's encoding.
+
+    ``renest`` turns its own stdout/stderr to UTF-8 at start (``cli.main``), but an
+    emitter can be handed any stream, and a Windows console left on its default code
+    page (``charmap``) cannot encode the progress bar or a non-ASCII file name. A
+    progress line is never worth a crash: what the stream cannot encode is replaced.
+    """
+    try:
+        stream.write(text)
+    except UnicodeEncodeError:
+        enc = getattr(stream, "encoding", None) or "ascii"
+        stream.write(text.encode(enc, errors="replace").decode(enc, errors="replace"))
+
+
 #: Terminal control sequences that start with ESC (CSI colour/cursor moves, OSC
 #: window-title changes, and single-character escapes).
 _ANSI = re.compile(r"\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
@@ -110,7 +125,7 @@ class EventEmitter:
         line lands on top of half a progress bar and both become unreadable."""
         if self._live_len and not self.json_mode:
             err = sys.stderr
-            err.write("\r" + " " * self._live_len + "\r")
+            _write(err, "\r" + " " * self._live_len + "\r")
             err.flush()
             self._live_len = 0
 
@@ -135,7 +150,7 @@ class EventEmitter:
         line = (f"  {bar} {pct:5.1f}%  {done / 2**30:.2f}/{total / 2**30:.2f} GiB"
                 f"  {mbps:.0f} Mbps{left}")
         err = sys.stderr
-        err.write("\r" + line.ljust(self._live_len))
+        _write(err, "\r" + line.ljust(self._live_len))
         err.flush()
         self._live_len = len(line)
 
@@ -164,7 +179,7 @@ class EventEmitter:
             self._sink(event)
         if self.json_mode:
             stream = self._stream if self._stream is not None else sys.stdout
-            stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+            _write(stream, json.dumps(event, ensure_ascii=False) + "\n")
             stream.flush()
         return event
 

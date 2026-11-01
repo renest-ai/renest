@@ -35,7 +35,7 @@ import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePath, PurePosixPath
 from typing import Any, Callable
 from urllib.parse import unquote, urlparse
 
@@ -81,6 +81,7 @@ from .envlock import (
     launcher_interpreter_dir,
     local_path_evidence,
     local_version_sources,
+    venv_python,
     venv_python_candidates,
 )
 from .errors import NestFailure, ErrorClass, ExitCode
@@ -375,7 +376,7 @@ class HashCache:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_name(self.path.name + ".tmp")
-            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            tmp.write_text(json.dumps(payload), encoding="utf-8", newline="\n")
             os.replace(tmp, self.path)
         except OSError:
             return
@@ -644,6 +645,39 @@ def _run_record_roots(root: Path, spec: dict, program_dir: Path | None = None) -
     # holds no record at all, and anything it does hold is left over from an
     # earlier single-tree layout.
     return record_search_roots(root, [*extra, _locate_comfyui_dir(root, None)])
+
+
+def manifest_path(p: str | os.PathLike[str], *, sep: str = os.sep) -> str:
+    """A path the way a manifest writes it: relative paths are always '/'-separated.
+
+    A nest packed on Windows is restored on Linux, and the restore side joins these
+    with '/' and compares them as strings. ``Path`` objects say themselves with '/'
+    (``as_posix``); a plain string is only rewritten where '\\' is this machine's
+    separator -- on POSIX a backslash is an ordinary file-name character and stays.
+    """
+    if isinstance(p, PurePath):
+        return p.as_posix()
+    text = os.fspath(p)
+    return text.replace("\\", "/") if sep == "\\" else text
+
+
+def posix_spec_paths(spec: dict, *, sep: str = os.sep) -> None:
+    """Put every path a pack-spec hands to the manifest into '/' form, in place:
+    ``files[].path``, ``code_deps[].install_path``, ``python_lock.lockfile_path`` and
+    ``adapters.comfyui.workflow_path``. Our own capture already writes them that way;
+    this covers a spec typed by hand on Windows, and anything that slips through."""
+    for f in spec.get("files") or []:
+        if isinstance(f, dict) and isinstance(f.get("path"), str):
+            f["path"] = manifest_path(f["path"], sep=sep)
+    for d in spec.get("code_deps") or []:
+        if isinstance(d, dict) and isinstance(d.get("install_path"), str):
+            d["install_path"] = manifest_path(d["install_path"], sep=sep)
+    lock = spec.get("python_lock")
+    if isinstance(lock, dict) and isinstance(lock.get("lockfile_path"), str):
+        lock["lockfile_path"] = manifest_path(lock["lockfile_path"], sep=sep)
+    cui = (spec.get("adapters") or {}).get("comfyui")
+    if isinstance(cui, dict) and isinstance(cui.get("workflow_path"), str):
+        cui["workflow_path"] = manifest_path(cui["workflow_path"], sep=sep)
 
 
 def _tar_code_dep(root: Path, install_path: str, work: Path, extra_excludes=(), raw_excludes=(),
@@ -1142,7 +1176,7 @@ def _probe_so_arch(so_path: Path) -> list[str] | None:
         result = subprocess.run(  # noqa: S603
             [tool, "--list-elf", str(so_path)],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=30,
         )
     except (OSError, subprocess.SubprocessError):
@@ -1647,7 +1681,7 @@ def _attach_recipes(manifest: dict, place, dry_run: bool, work: Path, recipes: l
             continue
         seen.add(h)
         tmp = work / f"recipe-{h[:16]}.json"
-        tmp.write_text(text, encoding="utf-8")
+        tmp.write_text(text, encoding="utf-8", newline="\n")
         if dry_run:
             hh, size = _sha256_stream(tmp)
             blob = {"sha256": hh, "size_bytes": size}
@@ -1682,7 +1716,7 @@ def _attach_workflow_ui(manifest: dict, place, dry_run: bool, work: Path, ui: di
     (see restore.place_sidebar_workflow). A few KB of the user's own graph, no images.
     """
     tmp = work / "workflow-ui.json"
-    tmp.write_text(json.dumps(ui, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(ui, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
     if dry_run:
         h, size = _sha256_stream(tmp)
         blob = {"sha256": h, "size_bytes": size}
@@ -1773,7 +1807,7 @@ def _scan_spec_for_secrets(root: Path, spec: dict) -> tuple[list, list[str]]:
                                  spec.get("_workflow_ui_twin"))):
                 if isinstance(data, dict):
                     p = Path(td) / "w.json"
-                    p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+                    p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8", newline="\n")
                     cfg_hits += scan_recipe_json(p, label=label)
 
     # [SECURITY-REVIEW] Files carried out of the home-folder model caches (format 2.14).
@@ -2177,7 +2211,7 @@ def _site_packages_for(
     ``program_dir`` covers the split program/data layout: when the program tree
     lives apart from the data root, its environment lives with the program, and
     a scan of the root alone reads empty there."""
-    cand = root / ".venv" / "bin" / "python"
+    cand = venv_python(root / ".venv")
     py = env_python or (str(cand) if cand.exists() else None)
     sp = interpreter_site_packages(py) if py else None
     return sp if sp is not None else find_site_packages(root, program_dir)
@@ -2203,7 +2237,8 @@ def _env_python_for(root: Path, env_python: str | None) -> str | None:
         # hangs directly off it — feeding it back through ``venv_python_candidates``
         # would ask for ``.venv/.venv/bin/python``.
         env = env_dir_of(sp)
-        cands += [env / "bin" / "python", env / "bin" / "python3", env / "Scripts" / "python.exe"]
+        cands += [venv_python(env, windows=False), env / "bin" / "python3",
+                  venv_python(env, windows=True)]
     found = find_env_python(cands)
     return str(found) if found else None
 
@@ -3045,7 +3080,7 @@ def _build_manifest(
                     exit_code=int(ExitCode.USAGE),
                 )
             lock_src = work / "requirements.lock"
-            lock_src.write_text(frozen, encoding="utf-8")
+            lock_src.write_text(frozen, encoding="utf-8", newline="\n")
             lock_rel_hint = "requirements.lock (read from the running environment)"
             # No original path exists on this branch: the list was read out of the
             # interpreter, not copied from a file. Leave lockfile_path out rather than
@@ -3076,7 +3111,7 @@ def _build_manifest(
                     exit_code=int(ExitCode.USAGE),
                 )
             lock_src = work / "requirements.lock"
-            lock_src.write_text(frozen, encoding="utf-8")
+            lock_src.write_text(frozen, encoding="utf-8", newline="\n")
             lock_rel_hint = "requirements.lock (worked out from the installed packages)"
             lock_orig_rel = None
             n_pkgs = len(frozen.splitlines()) - LOCK_FROM_INSTALLED_HEADER.count("\n")
@@ -3099,7 +3134,7 @@ def _build_manifest(
             lock_rel_hint = lock_orig_rel = str(pl["lockfile_path"])
             if not lock_src.is_file():
                 raise PackError(f"Lock file is missing: {lock_src}", exit_code=int(ExitCode.USAGE))
-        lock_text = lock_src.read_text()
+        lock_text = lock_src.read_text(encoding="utf-8")
         self_line = lock_carries_renest(lock_text)
         if self_line:
             warnings.append(
@@ -3176,7 +3211,7 @@ def _build_manifest(
             lock_text, _dropped = split_out_package_manager(lock_text, _owned)
             if _dropped:
                 lock_src = work / "requirements.lock"
-                lock_src.write_text(lock_text)
+                lock_src.write_text(lock_text, encoding="utf-8", newline="\n")
                 _names = ", ".join(ln.split("==")[0].strip() for ln in _dropped[:6])
                 _more = f" and {len(_dropped) - 6} more" if len(_dropped) > 6 else ""
                 warnings.append(
@@ -3385,7 +3420,7 @@ def _build_manifest(
                     ) from e
                 if pinned:
                     lock_src = work / "requirements.lock"
-                    lock_src.write_text(new_text)
+                    lock_src.write_text(new_text, encoding="utf-8", newline="\n")
                     warnings.append(
                         f"{len(pinned)} package(s) carry a vendor-only version PyPI doesn't "
                         f"have; they now point at direct wheel URLs: "
@@ -3402,7 +3437,7 @@ def _build_manifest(
                 # that verifies green and can never be rebuilt, which is how the
                 # July fix (tools/lock_rewrite.py) degraded into an optional flag
                 # with no gate and shipped bare pins for two months.
-                still_bare = vendor_only_locals(lock_src.read_text())
+                still_bare = vendor_only_locals(lock_src.read_text(encoding="utf-8"))
                 if still_bare or len(pinned) != len(local_ver):
                     raise PackError(
                         "--pin-wheels ran, and the lock that would ship still carries "
@@ -3436,12 +3471,12 @@ def _build_manifest(
                 # lock installs, with a wrong one the rebuild stops after paying for the
                 # model files (2026-09-09, RC=30 on `pyyaml`'s macOS build).
                 hashed_text, n_hashed, unhashable = add_hashes(
-                    lock_src.read_text(), py_tag, wheel_platform_tags(), client=client,
+                    lock_src.read_text(encoding="utf-8"), py_tag, wheel_platform_tags(), client=client,
                     os_family=wheel_os_family(),
                 )
             if n_hashed:
                 lock_src = work / "requirements.lock"
-                lock_src.write_text(hashed_text)
+                lock_src.write_text(hashed_text, encoding="utf-8", newline="\n")
                 warnings.append(
                     f"Recorded a content fingerprint for {n_hashed} package(s), so a rebuild "
                     f"checks every one of them on arrival. That is also what makes it safe to "
@@ -3492,7 +3527,7 @@ def _build_manifest(
         # machine is usually gone. Nothing is blocked here — packing preserves
         # the scene, it does not police it — we only say up front that a later
         # restore will need one extra flag, while the user can still act on it.
-        lock_text_for_audit = lock_src.read_text()
+        lock_text_for_audit = lock_src.read_text(encoding="utf-8")
         # The absolute paths an editable install leaves behind do not exist on
         # another machine, while that directory itself travels with the nest, so
         # they become a marker the restore side swaps for its own rebuild root.
@@ -3506,11 +3541,11 @@ def _build_manifest(
             if _n_re:
                 lock_text_for_audit = _re
                 lock_src = work / "requirements.lock"
-                lock_src.write_text(_re)
+                lock_src.write_text(_re, encoding="utf-8", newline="\n")
         tokenised, n_tok = tokenise_env_root(lock_text_for_audit, root)
         if n_tok:
             lock_src = work / "requirements.lock"
-            lock_src.write_text(tokenised)
+            lock_src.write_text(tokenised, encoding="utf-8", newline="\n")
             lock_text_for_audit = tokenised
             warnings.append(
                 f"{n_tok} place(s) in the lockfile pointed at this machine's own folders "
@@ -3839,7 +3874,7 @@ def _build_manifest(
             # hash, so write the bytes we already have and hash those instead.
             wf_src = work / "recipe-verified.json"
             wf_src.write_text(
-                json.dumps(cui["workflow_inline"], ensure_ascii=False, indent=2), encoding="utf-8"
+                json.dumps(cui["workflow_inline"], ensure_ascii=False, indent=2), encoding="utf-8", newline="\n"
             )
         if dry_run:
             h, size = _sha256_stream(wf_src)
@@ -4904,7 +4939,7 @@ def _python_version_of(exe) -> str | None:
     try:
         r = _sp.run([str(exe), "-c",
                      "import sys;print('.'.join(map(str,sys.version_info[:3])))"],
-                    capture_output=True, text=True, timeout=30, check=False)
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, check=False)
         v = (r.stdout or "").strip().splitlines()
         return v[-1] if r.returncode == 0 and v else None
     except (OSError, _sp.SubprocessError):
@@ -5134,6 +5169,9 @@ def pack(
         # Before the credential scan on purpose: a folder carried this way is code
         # handed to whoever restores the nest, so it goes through the same scan.
         _carry_outside_editables(root, spec, env_python, warnings)
+        # Last spec edit before anything is read or written: every path the manifest
+        # will carry, said with '/' whatever machine wrote the spec.
+        posix_spec_paths(spec)
     if isinstance(spec, dict) and spec.get("_workflow_ui") is not None:
         # The API form of the same graph, for the credential scan below only.
         twin = workflow
@@ -5337,7 +5375,7 @@ def pack(
             out_nest = out / "nests" / nest_id
             out_nest.mkdir(parents=True, exist_ok=True)
             manifest_path = out_nest / "manifest.json"
-            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
             report.nest_id = nest_id
             report.manifest = manifest
             report.manifest_path = str(manifest_path)
@@ -5511,7 +5549,7 @@ def hosted_memory_write(
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
         os.replace(tmp, path)
     except OSError:
         return
@@ -5697,7 +5735,7 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
         return int(ExitCode.USAGE)
     if args.spec:
         try:
-            spec = json.loads(Path(args.spec).read_text())
+            spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as e:
             print(f"✗ Can't read the pack-spec: {e}", file=sys.stderr)
             return int(ExitCode.USAGE)

@@ -1362,7 +1362,7 @@ def _read_memory_ceiling() -> tuple[int, str] | None:
     for p in ("/sys/fs/cgroup/memory.max",                    # cgroup v2
               "/sys/fs/cgroup/memory/memory.limit_in_bytes"):  # cgroup v1
         try:
-            raw = Path(p).read_text().strip()
+            raw = Path(p).read_text(encoding="utf-8").strip()
         except OSError:
             continue
         if raw.isdigit():
@@ -1372,7 +1372,7 @@ def _read_memory_ceiling() -> tuple[int, str] | None:
             if 0 < v < (1 << 50):
                 return v, "cgroup"
     try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
             if line.startswith("MemTotal:"):
                 return int(line.split()[1]) * 1024, "meminfo"
     except (OSError, ValueError, IndexError):
@@ -1906,7 +1906,7 @@ def check_writable(
 # -- collectors (thin shells that run real commands) --
 def _run_cmd(cmd: list[str], timeout: float = 30) -> str:
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)  # noqa: S603
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)  # noqa: S603
         return r.stdout if r.returncode == 0 else ""
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -1967,7 +1967,7 @@ def collect_egress_mbps(
                 url,
             ],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=max_time + 15,
         )
         out = r.stdout.strip()
@@ -2003,7 +2003,7 @@ def index_reachable(url: str = PYPI_REACH_URL, max_time: int = 8) -> bool | None
         r = subprocess.run(  # noqa: S603
             ["curl", "-fsS", "-o", os.devnull, "-w", "%{http_code}",
              "--max-time", str(max_time), url],
-            capture_output=True, text=True, timeout=max_time + 5,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=max_time + 5,
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -2246,7 +2246,7 @@ def collect_gpu_alloc(
     src = _GPU_ALLOC_PROBE_SRC.replace("__SIZE_MIB__", str(int(size_mib)))
     try:
         proc = subprocess.run(  # noqa: S603 - fixed program, caller-chosen interpreter
-            [exe, "-c", src], capture_output=True, text=True, timeout=timeout
+            [exe, "-c", src], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout
         )
     except subprocess.TimeoutExpired:
         return reading | {"outcome": "timeout", "why": "timeout", "timeout_s": timeout}
@@ -2396,7 +2396,7 @@ def collect_nvidia_smi_full(timeout: float = 30.0) -> dict:
     """
     try:
         proc = subprocess.run(  # noqa: S603 - fixed program, no shell
-            ["nvidia-smi"], capture_output=True, text=True, timeout=timeout
+            ["nvidia-smi"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout
         )
     except subprocess.TimeoutExpired:
         return {"rc": None, "outcome": "timeout", "timeout_s": timeout}
@@ -2546,7 +2546,7 @@ def collect_cuda_init(timeout: float = CUDA_INIT_PROBE_TIMEOUT_S) -> dict:
     try:
         proc = subprocess.run(  # noqa: S603 - fixed program, our own interpreter
             [sys.executable, "-c", _CUDA_INIT_PROBE_SRC],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
         )
     except subprocess.TimeoutExpired:
         return {"outcome": "timeout", "timeout_s": timeout}
@@ -4079,7 +4079,7 @@ def run_from_args(args, emitter: EventEmitter) -> int:
     manifest = None
     if args.nest_ref:
         try:
-            manifest = json.loads(Path(args.nest_ref).read_text())
+            manifest = json.loads(Path(args.nest_ref).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as e:
             print(f"✗ Can't read that nest: {e}", file=sys.stderr)
             return int(ExitCode.USAGE)

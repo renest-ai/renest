@@ -416,7 +416,7 @@ def _is_builtin_dataset(ds: object, root: Path, rec: dict) -> bool:
         if info.is_file():
             try:
                 import json as _json
-                if name in _json.loads(info.read_text(errors="replace")):
+                if name in _json.loads(info.read_text(errors="replace", encoding="utf-8")):
                     return True
             except (OSError, ValueError):
                 pass
@@ -570,7 +570,7 @@ def _git_identity(d: Path) -> tuple[str | None, str | None]:
     def _run(*args: str) -> str | None:
         try:
             r = subprocess.run(["git", "-C", str(d), *args],  # noqa: S603, S607
-                               capture_output=True, text=True, timeout=20, check=False)
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20, check=False)
         except (OSError, subprocess.SubprocessError):
             return None
         out = (r.stdout or "").strip()
@@ -632,7 +632,7 @@ def _venv_python_version(rec: dict, root: Path) -> str | None:
         try:
             out = subprocess.run(  # noqa: S603
                 [str(py), "-c", "import sys;print('%d.%d.%d' % sys.version_info[:3])"],
-                capture_output=True, text=True, timeout=20,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
             )
         except (OSError, subprocess.SubprocessError):
             continue
@@ -908,7 +908,7 @@ def capture_training(
             hit = next((n for n in LOCK_CANDIDATES if (d / n).is_file()), None)
             if not hit:
                 continue
-            bad = lock_is_untrustworthy((d / hit).read_text(errors="replace"))
+            bad = lock_is_untrustworthy((d / hit).read_text(errors="replace", encoding="utf-8"))
             if bad:
                 # **Never force it through**: a requirements.txt taken as a lock kills the
                 # rebuild during dependency install, and when it does install it is not the
@@ -1166,7 +1166,7 @@ def reanchor_recorded_paths(manifest: dict, new_root: Path) -> list[str]:
         if new_text == text:
             continue
         try:
-            path.write_text(new_text, encoding="utf-8")
+            path.write_text(new_text, encoding="utf-8", newline="\n")
         except OSError:
             continue
         said.append(

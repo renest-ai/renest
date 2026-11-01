@@ -1668,7 +1668,21 @@ wheel_fits() {
       win32*|win_*|win-*) tos=windows ;;
     esac
     [ -n "$tos" ] && [ "$tos" = "$osf" ] || continue
-    case "$q" in "$arch"|*"_$arch") ok_plat=1; break ;; esac
+    case "$q" in
+      "$arch"|*"_$arch") ok_plat=1; break ;;
+      arm64|*_arm64)
+        case "$tos" in macos|windows) case "$arch" in aarch64|arm64) ok_plat=1; break ;; esac ;; esac
+        ;;
+      universal2|*_universal2|universal|*_universal)
+        [ "$tos" = "macos" ] && { ok_plat=1; break; }
+        ;;
+      amd64|*_amd64|win_amd64|*_win_amd64)
+        [ "$tos" = "windows" ] && case "$arch" in x86_64|amd64) ok_plat=1; break ;; esac
+        ;;
+      win_arm64|*_win_arm64)
+        [ "$tos" = "windows" ] && case "$arch" in aarch64|arm64) ok_plat=1; break ;; esac
+        ;;
+    esac
   done
   if [ "$ok_plat" = 1 ]; then
     for t in $(printf '%s' "$py" | tr '.' ' '); do

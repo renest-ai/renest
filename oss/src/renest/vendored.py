@@ -383,7 +383,7 @@ def _installer_cache_dirs() -> list[Path]:
     if not uv_dir:
         try:
             r = subprocess.run([uv_executable(), "cache", "dir"], capture_output=True,
-                               text=True, timeout=20)
+                               text=True, encoding="utf-8", errors="replace", timeout=20)
             uv_dir = r.stdout.strip() if r.returncode == 0 else ""
         except (OSError, subprocess.TimeoutExpired):
             uv_dir = ""
@@ -416,7 +416,7 @@ def _cached_wheels(name: str, version: str, dirs: list[Path]) -> list[Path]:
 
 
 def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True,
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
                           timeout=GIT_TIMEOUT_S, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
 
 
@@ -444,7 +444,7 @@ def _build_from_commit(
         r = subprocess.run(
             [uv_executable(), "build", "--wheel", "--no-build-isolation",
              "--python", env_python, "--out-dir", str(out), str(build_dir)],
-            capture_output=True, text=True, timeout=BUILD_TIMEOUT_S,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=BUILD_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired:
         return None, "the build did not finish in time"

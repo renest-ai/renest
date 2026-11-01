@@ -253,12 +253,12 @@ def lint(
     def warn(code: str, msg: str) -> None:
         result.findings.append(Finding("warn", code, msg))
 
-    m = json.loads(manifest_path.read_text())
+    m = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     # ---- 1. schema validation (hard fail) ----
     import jsonschema  # hard dependency; ImportError surfaces as a tool error
 
-    schema = json.loads(find_schema().read_text())
+    schema = json.loads(find_schema().read_text(encoding="utf-8"))
     validator = jsonschema.Draft202012Validator(schema)
     for e in validator.iter_errors(m):
         err("schema", f"{e.json_path}: {e.message}")
@@ -726,7 +726,7 @@ def lint(
         lock_blob = (m.get("python_lock") or {}).get("lockfile") or {}
         lock_path = base / str(lock_blob.get("sha256", ""))[:2] / str(lock_blob.get("sha256", ""))
         if lock_blob.get("sha256") and lock_path.exists():
-            _lock_text = lock_path.read_text(errors="replace")
+            _lock_text = lock_path.read_text(errors="replace", encoding="utf-8")
             # Format 2.8: every candidate of a contested module must be a package
             # this lock installs -- the field describes a contest between packages
             # in the lock, and a name outside it describes nothing.

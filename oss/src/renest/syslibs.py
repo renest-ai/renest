@@ -404,7 +404,7 @@ def _packages_for(paths: dict[str, str]) -> dict[str, str]:
         for argv, cut in [(["dpkg", "-S", t], ":") for t in tries] + \
                          [(["rpm", "-qf", t], None) for t in tries]:
             try:
-                r = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+                r = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
             except (OSError, subprocess.SubprocessError):
                 continue
             line = (r.stdout or "").strip().splitlines()
@@ -505,7 +505,7 @@ def _interpreter_prefixes(python: str | os.PathLike[str]) -> tuple[Path | None, 
     try:
         done = subprocess.run(  # noqa: S603
             [str(python), "-c", "import sys;print(sys.prefix);print(sys.base_prefix)"],
-            capture_output=True, text=True, timeout=30, check=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, check=True,
         )
     except (OSError, subprocess.SubprocessError):
         return None, None

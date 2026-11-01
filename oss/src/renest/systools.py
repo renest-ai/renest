@@ -261,7 +261,7 @@ def _default_stream(argv: Sequence[str], env: dict[str, str] | None) -> tuple[in
     tail: list[str] = []
     try:
         proc = subprocess.Popen(  # noqa: S603 - argv is built from fixed package names
-            list(argv), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            list(argv), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
             env={**os.environ, **(env or {})}, bufsize=1,
         )
     except OSError as e:

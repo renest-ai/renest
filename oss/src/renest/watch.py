@@ -152,7 +152,7 @@ def write_run_record(env_root: Path, paths: set[str]) -> Path | None:
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_suffix(".json.part")
-        tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+        tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8", newline="\n")
         tmp.replace(dest)
     except OSError:
         return None

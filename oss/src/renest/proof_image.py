@@ -125,7 +125,7 @@ def compare_images(
             },
             indent=2,
         ),
-        encoding="utf-8",
+        encoding="utf-8", newline="\n"
     )
     return ProofResult(ok=ok, ssim=score, threshold=threshold, side_by_side=side, detail=detail)
 

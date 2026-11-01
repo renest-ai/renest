@@ -1079,7 +1079,7 @@ def write_start_facts(
     p = target / START_REL
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(facts, ensure_ascii=False, indent=2), encoding="utf-8")
+        p.write_text(json.dumps(facts, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
     except OSError:
         return None  # the closing lines still carry the command in plain sight
     return p
@@ -1323,7 +1323,7 @@ def _lfs_pointers_in_tree(root: Path, limit: int = _LFS_REPORT_LIMIT) -> tuple[l
 
 def _tail(path: Path, n_chars: int = 600) -> str:
     try:
-        text = path.read_text(errors="replace")
+        text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return "<could not read the log>"
     return text[-n_chars:].replace("\n", " ⏎ ")
@@ -1368,7 +1368,7 @@ class Journal:
 
     def load_if_matching(self) -> None:
         try:
-            d = json.loads(self.path.read_text())
+            d = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return
         if d.get("journal_version") == 1 and d.get("nest_id") == self.data["nest_id"]:
@@ -1377,7 +1377,7 @@ class Journal:
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=1))
+        tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=1), encoding="utf-8", newline="\n")
         os.replace(tmp, self.path)  # atomic cross-platform rename
 
     def blob(self, sha256: str) -> dict:
@@ -2156,7 +2156,7 @@ def _default_runner(
     merged = {**os.environ, **(env or {})}
     try:
         return subprocess.run(  # noqa: S603
-            cmd, env=merged, cwd=cwd, capture_output=True, text=True, timeout=timeout
+            cmd, env=merged, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout
         )
     except FileNotFoundError as e:
         return subprocess.CompletedProcess(cmd, 127, "", str(e))
@@ -2738,7 +2738,7 @@ def _swap_in_vendored_wheels(
         return lock_text, lock_path
     out = target / STAGING_REL / "requirements.vendored.lock"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(new_text, encoding="utf-8")
+    out.write_text(new_text, encoding="utf-8", newline="\n")
     names = [str(vw["name"]) for vw in vendored if canonical_name(str(vw["name"])) in done]
     narrate(
         f"Installing {len(names)} package(s) from the wheels this nest carries "
@@ -2780,7 +2780,7 @@ def _wheel_fallback(
     if new_text == lock_text:
         return None
     fallback = lock_path.with_name("requirements.fallback.lock")
-    fallback.write_text(new_text, encoding="utf-8")
+    fallback.write_text(new_text, encoding="utf-8", newline="\n")
     narrate(
         f"Trying again with the generic versions instead (your original lockfile is untouched; using {fallback.name})",
         stage="S3",
@@ -4873,7 +4873,7 @@ def restore(
             lock_text = resolve_env_root_token(lock_text, target)
             probe_path = target / STAGING_REL / "requirements.probe.lock"
             probe_path.parent.mkdir(parents=True, exist_ok=True)
-            probe_path.write_text(lock_text, encoding="utf-8")
+            probe_path.write_text(lock_text, encoding="utf-8", newline="\n")
         # [SECURITY-REVIEW] The probe hands this lock to uv, which connects to
         # every index the text names — and the S3 gate that vets those hosts
         # (and makes the receiver name the sender) has not run yet. A lock that
@@ -5586,7 +5586,7 @@ def restore(
         if ENV_ROOT_TOKEN in lock_text:
             lock_text = resolve_env_root_token(lock_text, target)
             lock_path = target / f"{STAGING_REL}/requirements.resolved.lock"
-            lock_path.write_text(lock_text, encoding="utf-8")
+            lock_path.write_text(lock_text, encoding="utf-8", newline="\n")
             narrate(
                 "This nest was packed from a setup installed in place, so part of its "
                 f"dependency list pointed at the folder it lived in. Pointed at {target} instead.",
@@ -5815,7 +5815,7 @@ def restore(
             got = (probe.stdout or "").strip().splitlines()
             verdict = check_torch_runtime_cuda(
                 got[-1].strip() if got else None,
-                declared_cuda_tag(lock_path.read_text(errors="replace")))
+                declared_cuda_tag(lock_path.read_text(errors="replace", encoding="utf-8")))
             report.checks_after_deps = verdict.reading | {"level": verdict.level,
                                                           "reason": verdict.reason}
             if verdict.level == "reject" and not opts.force:
@@ -6123,7 +6123,7 @@ def restore(
         if _alog.exists():
             try:
                 _degraded = import_failed_plugins(
-                    _alog.read_text(errors="replace")[:_SYSLIB_SCAN_CHARS])
+                    _alog.read_text(errors="replace", encoding="utf-8")[:_SYSLIB_SCAN_CHARS])
             except OSError:
                 _degraded = []
             if _degraded:
@@ -6438,11 +6438,11 @@ def restore(
     with contextlib.suppress(OSError):
         evidence.mkdir(parents=True, exist_ok=True)
         (evidence / "restore-metrics.json").write_text(
-            json.dumps(report.metrics, ensure_ascii=False, indent=2)
+            json.dumps(report.metrics, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n"
         )
         if failure:
             (evidence / "error.json").write_text(
-                json.dumps(report.failure, ensure_ascii=False, indent=2)
+                json.dumps(report.failure, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n"
             )
 
     if report.ok and report.programs_missing:
@@ -6822,7 +6822,7 @@ def run_from_args(args: argparse.Namespace, emitter: EventEmitter) -> int:
             if str(_ev) not in ("", ".") and _ev.is_dir():
                 (_ev / "restore-report.json").write_text(
                     json.dumps(report.to_dict(), ensure_ascii=False, indent=2),
-                    encoding="utf-8",
+                    encoding="utf-8", newline="\n"
                 )
     # The closing words print last: printed
     # inside restore() they scrolled away under the report and a finished rebuild
