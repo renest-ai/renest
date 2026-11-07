@@ -2,6 +2,15 @@
 
 What changed for the person using `renest`. Dates are the release date.
 
+## 0.1.31 — Unreleased
+
+### Packing recognizes generic Python wheels from the vendor index
+A working environment with a vendor wheel tagged `py3` or `py2.py3` no longer
+fails packing because the index lookup only accepted an exact CPython tag.
+This fixes `torchaudio==2.11.1+cu132` on Python 3.11. The original version and
+wheel checksum are kept; incompatible Python versions and architectures are
+still rejected.
+
 ## 0.1.30 — 2026-11-07
 
 ### Directory models, workflow-scoped custom nodes, and panel device sign-in

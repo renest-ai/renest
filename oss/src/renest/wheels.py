@@ -362,7 +362,13 @@ def find_wheel_url(
         filename = unquote(href.split("#", 1)[0].rsplit("/", 1)[-1])
         if not filename.startswith(want_prefix) or not filename.endswith(".whl"):
             continue
-        if f"-{python_tag}-" not in filename:
+        # Read the compatibility fields, just as the fingerprint lookup does:
+        # vendor wheels can use generic py3 tags even with native platform files.
+        fields = filename[:-len(".whl")].split("-")
+        if len(fields) < 5:
+            continue
+        py_tags, abi_tags = (field.split(".") for field in fields[-3:-1])
+        if not any(_python_tag_matches(tag, abi_tags, python_tag) for tag in py_tags):
             continue
         if not any(p in filename for p in platform_tags):
             continue
