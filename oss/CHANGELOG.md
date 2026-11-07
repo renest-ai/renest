@@ -2,6 +2,16 @@
 
 What changed for the person using `renest`. Dates are the release date.
 
+## 0.1.30 — 2026-11-07
+
+### Directory models, workflow-scoped custom nodes, and panel device sign-in
+Packing a ComfyUI workflow now captures multi-file directory models (such as Diffusers or
+Hugging Face folder layouts under `models/`), matches local absolute model paths by exact
+file identity, and excludes unreferenced custom node folders from workflow-targeted packs
+while preserving all custom nodes in whole-environment packs. Device sign-in started from
+the ComfyUI panel is handled by the local `renest serve` engine with terminal status
+reporting for denied or expired requests.
+
 ## 0.1.29 — 2026-11-01
 
 ### Windows and macOS ComfyUI panel workflows

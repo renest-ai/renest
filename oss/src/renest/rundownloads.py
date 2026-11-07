@@ -258,6 +258,89 @@ def held_open(pid: int) -> set[str] | None:
     return got if readable else None
 
 
+_COMPANION_MARKERS = frozenset({
+    "model_index.json",
+    "config.json",
+    "tokenizer_config.json",
+    "preprocessor_config.json",
+    "scheduler_config.json",
+    "generation_config.json",
+    "adapter_config.json",
+})
+
+
+def files_held_in(
+    held: set[str] | None,
+    dirs: Iterable[Path],
+    skip: Iterable[Path] = (),
+) -> list[Path]:
+    """Files under ``dirs`` that the running process currently holds open or mapped
+    (``held``), even when their modification time predates the run window.
+
+    When a held weight file sits inside a multi-file model directory (such as a
+    Diffusers or Hugging Face subfolder with ``config.json`` / ``model_index.json``),
+    its non-weight companion files in that same model directory travel with it.
+    """
+    if not held:
+        return []
+    skip_real = {os.path.realpath(p) for p in skip}
+    seen: set[str] = set()
+    out: list[Path] = []
+    for d in dirs:
+        base = Path(d)
+        if not base.is_dir() or _under_temp(base):
+            continue
+        is_models_root = base.name == "models"
+        all_files: list[tuple[Path, str, tuple[str, ...]]] = []
+        for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+            dirnames[:] = sorted(n for n in dirnames if not n.startswith(".")
+                                 and n != "__pycache__")
+            for name in sorted(filenames):
+                if name.startswith(".") or name.endswith(_IN_FLIGHT):
+                    continue
+                p = Path(dirpath) / name
+                try:
+                    if p.is_symlink() or not p.is_file():
+                        continue
+                    real = os.path.realpath(p)
+                    rel_parts = p.relative_to(base).parts
+                except (OSError, ValueError):
+                    continue
+                if _under_temp(p):
+                    continue
+                all_files.append((p, real, rel_parts))
+
+        # Identify which model subdirectories have at least one file held open
+        min_depth = 3 if is_models_root else 2
+        key_len = 2 if is_models_root else 1
+        held_model_dirs: set[tuple[str, ...]] = set()
+        for p, real, rel_parts in all_files:
+            if real in held:
+                if len(rel_parts) >= min_depth:
+                    held_model_dirs.add(rel_parts[:key_len])
+                if real not in seen and real not in skip_real:
+                    seen.add(real)
+                    out.append(p)
+
+        if held_model_dirs:
+            # Check which of those subdirectories have HF/Diffusers config markers
+            dir_has_marker: set[tuple[str, ...]] = set()
+            for p, _real, rel_parts in all_files:
+                if len(rel_parts) >= min_depth and rel_parts[:key_len] in held_model_dirs:
+                    if (
+                        p.name in _COMPANION_MARKERS
+                        or p.name.endswith(".index.json")
+                        or (is_models_root and rel_parts[0].lower() in {"diffusers", "llm", "transformers"})
+                    ):
+                        dir_has_marker.add(rel_parts[:key_len])
+            for p, real, rel_parts in all_files:
+                if len(rel_parts) >= min_depth and rel_parts[:key_len] in dir_has_marker:
+                    if not _is_weight(p) and real not in seen and real not in skip_real:
+                        seen.add(real)
+                        out.append(p)
+    return sorted(out)
+
+
 def _is_weight(p: Path) -> bool:
     if p.suffix.lower() in WEIGHT_SUFFIXES:
         return True

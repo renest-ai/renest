@@ -667,6 +667,7 @@ class ServeApp:
             "status": "ok",
             "version": __version__,
             "manifest_versions": list(MANIFEST_VERSIONS),
+            "capabilities": ["device_login"],
             "queue_depth": self._active_count(),
             "storage_configured": configured,
             "storage_kind": kind,
@@ -920,6 +921,66 @@ class ServeApp:
     # -- upload to the Renest drive, approved once in the person's browser ------
     def signed_in(self) -> bool:
         return bool(self._signin_token())
+
+    def login_start(self) -> dict:
+        """Start a device sign-in on behalf of the panel and return the code and page."""
+        from .approval import ApprovalError, retry_transient, start_device_login
+        from .login import machine_label
+
+        origin = self._api_origin()
+        client = self._http_client_fn()
+        try:
+            start = retry_transient(lambda: start_device_login(client, origin, machine_label()))
+            return {
+                "ok": True,
+                "device_code": start.device_code,
+                "user_code": start.user_code,
+                "verify_url": start.verify_url,
+                "expires_in": start.expires_in,
+                "interval": start.interval,
+            }
+        except ApprovalError as e:
+            raise ServeError(502, e.human) from None
+        finally:
+            with contextlib.suppress(Exception):
+                client.close()
+
+    def login_poll(self, device_code: str) -> dict:
+        """Poll one device sign-in and save the machine sign-in token to the 0600 config
+        file on approval. The token itself never leaves this process."""
+        from .approval import ApprovalError, poll_device_login
+        from .config import ConfigError, record_auth_token
+
+        origin = self._api_origin()
+        client = self._http_client_fn()
+        try:
+            try:
+                got = poll_device_login(client, origin, device_code)
+            except ApprovalError as e:
+                if e.transient:
+                    return {"ok": True, "status": "pending", "transient_error": e.human}
+                raise ServeError(400, e.human) from None
+            status = str(got.get("status") or "")
+            if status == "approved":
+                token = got.get("token")
+                email = str(got.get("account_email") or "")
+                if not isinstance(token, str) or not token:
+                    raise ServeError(400, "Approved but no token returned")
+                try:
+                    record_auth_token(token)
+                except ConfigError as e:
+                    raise ServeError(500, str(e)) from None
+                return {"ok": True, "status": "approved", "account_email": email}
+            if status == "pending":
+                return {"ok": True, "status": "pending"}
+            if status == "denied":
+                return {"ok": False, "status": "denied", "error": "Sign-in was denied in browser"}
+            if status == "expired":
+                return {"ok": False, "status": "expired", "error": "Sign-in code expired"}
+            return {"ok": False, "status": status or "unknown", "error": f"Sign-in status: {status}"}
+        finally:
+            with contextlib.suppress(Exception):
+                client.close()
 
     def _signin_token(self) -> str | None:
         try:
@@ -1669,7 +1730,8 @@ def make_handler(app: ServeApp) -> type[BaseHTTPRequestHandler]:
             if not self._require_auth():
                 return
             if path not in (f"{API_PREFIX}/pack", f"{API_PREFIX}/restore",
-                            f"{API_PREFIX}/takeback/sessions", f"{API_PREFIX}/takeback"):
+                            f"{API_PREFIX}/takeback/sessions", f"{API_PREFIX}/takeback",
+                            f"{API_PREFIX}/login/start", f"{API_PREFIX}/login/poll"):
                 self._send(404, {"error": "Unknown path"})
                 return
             body = self._read_json()
@@ -1678,6 +1740,21 @@ def make_handler(app: ServeApp) -> type[BaseHTTPRequestHandler]:
                 return
             if path == f"{API_PREFIX}/pack":
                 self._handle_pack(body)
+            elif path == f"{API_PREFIX}/login/start":
+                try:
+                    self._send(200, self.app.login_start())
+                except ServeError as e:
+                    self._send(e.status, {"ok": False, "error": e.human})
+            elif path == f"{API_PREFIX}/login/poll":
+                device_code = body.get("device_code")
+                if not isinstance(device_code, str) or not device_code.strip():
+                    self._send(400, {"ok": False, "error": "Missing device_code"})
+                    return
+                try:
+                    res = self.app.login_poll(device_code.strip())
+                    self._send(200, res)
+                except ServeError as e:
+                    self._send(e.status, {"ok": False, "error": e.human})
             elif path == f"{API_PREFIX}/takeback/sessions":
                 if not self.app.signed_in():
                     self._send(409, {"error": NOT_SIGNED_IN, "error_class": "NOT_SIGNED_IN"})

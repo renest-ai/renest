@@ -498,7 +498,21 @@ def _locate(comfyui_dir: Path, relname: str, search_dirs: tuple[str, ...],
     but always record it in the standard place.
     """
     rel = Path(relname.replace("\\", "/"))
-    if ".." in rel.parts or rel.is_absolute():
+    if ".." in rel.parts:
+        return None, "This reference points outside the folder (.. or an absolute path); we won't follow it"
+    if rel.is_absolute():
+        try:
+            resolved = rel.resolve()
+        except OSError:
+            resolved = None
+        if resolved is not None and resolved.is_file():
+            with contextlib.suppress(ValueError):
+                resolved.relative_to((comfyui_dir / "models").resolve())
+                return resolved, ""
+            for ed in extra_dirs:
+                with contextlib.suppress(ValueError):
+                    resolved.relative_to(ed.resolve())
+                    return resolved, f"Found in the extra_model_paths folder {ed} — recorded under the standard models folder"
         return None, "This reference points outside the folder (.. or an absolute path); we won't follow it"
     for sub in search_dirs:
         cand = comfyui_dir / sub / rel
@@ -971,7 +985,8 @@ def _model_index(comfyui_dir: Path, prefix: str, emp: dict[str, list[Path]]) -> 
             return
         for p in sorted(base.rglob("*")):
             try:
-                if not p.is_file() or p.name.startswith("."):
+                if not p.is_file() or any(part.startswith(".")
+                                          for part in p.relative_to(base).parts):
                     continue
                 real = p.resolve()
             except OSError:
@@ -1034,7 +1049,13 @@ def _string_leaves(inputs: dict) -> Iterable[tuple[tuple[str, ...], str, bool]]:
 _LORA_TAG = re.compile(r"<lora:([^:>]+)(?::[^>]*)?>", re.IGNORECASE)
 
 
-def _match_name(idx: _ModelIndex, value: str) -> tuple[str, list[_ModelFile]]:
+def _match_name(
+    idx: _ModelIndex,
+    value: str,
+    *,
+    comfyui_dir: Path | None = None,
+    emp: dict[str, list[Path]] | None = None,
+) -> tuple[str, list[_ModelFile]]:
     """How a string names a model file, if it does:
 
     ``exact``  -- the path inside a model folder, as ComfyUI lists it;
@@ -1046,6 +1067,13 @@ def _match_name(idx: _ModelIndex, value: str) -> tuple[str, list[_ModelFile]]:
     if not s or len(s) > 512 or "\n" in s:
         return "", []
     parts = s.split("/")
+    if s.startswith("/") and ".." not in parts and comfyui_dir is not None:
+        absolute = Path(s).resolve()
+        roots = [comfyui_dir / "models", *[d for ds in (emp or {}).values() for d in ds]]
+        for root in roots:
+            if absolute.is_relative_to(root.resolve()):
+                hits = [f for f in idx.files if f.abs.resolve() == absolute]
+                return ("exact", hits) if hits else ("", [])
     foreign = s.startswith("/") or ".." in parts or (len(s) > 1 and s[1] == ":")
     if not foreign and idx.by_rel.get(s):
         return "exact", idx.by_rel[s]
@@ -1055,6 +1083,135 @@ def _match_name(idx: _ModelIndex, value: str) -> tuple[str, list[_ModelFile]]:
     stem = s.rsplit(".", 1)[0] if _names_weights(s) else s
     hits = idx.by_stem_rel.get(stem) or idx.by_stem_name.get(stem.rsplit("/", 1)[-1])
     return ("stem", hits) if hits else ("", [])
+
+
+_MODEL_DIR_MARKERS = frozenset({
+    "model_index.json",
+    "config.json",
+    "tokenizer_config.json",
+    "preprocessor_config.json",
+    "scheduler_config.json",
+    "generation_config.json",
+    "adapter_config.json",
+})
+_MODEL_DIR_FOLDERS = frozenset({
+    "diffusers",
+    "llm",
+    "transformers",
+    "prompt_generator",
+    "mmaudio",
+    "florence2",
+})
+
+
+def _match_model_dir(
+    comfyui_dir: Path,
+    prefix: str,
+    emp: dict[str, list[Path]],
+    idx: _ModelIndex,
+    value: str,
+) -> tuple[list[_ModelFile], str]:
+    """Match a string that names a multi-file model directory under ``models/`` (such as
+    Diffusers or Hugging Face directory models like ``models/diffusers/MOSS-Image-Base``).
+
+    Returns ``(matched_files, missing_searched_dir)``:
+    - ``matched_files``: every file inside that model directory when it exists and holds
+      at least one weight file;
+    - ``missing_searched_dir``: non-empty ``<prefix>/models/<folder>/<sub>`` when ``value``
+      explicitly points to a model path under this machine's ``models/`` that is missing
+      or holds no weights (so the caller can report a missing model instead of silently
+      succeeding with 0 models).
+    """
+    s = value.strip().replace("\\", "/").rstrip("/")
+    if not s or len(s) > 512 or "\n" in s:
+        return [], ""
+    parts = s.split("/")
+    if ".." in parts:
+        return [], ""
+    # Existing files are handled by the file matcher, never diagnosed as directories.
+    if any(f.abs.resolve() == Path(s).resolve() or f.path == s
+           or f"models/{f.folder}/{f.rel}" == s or f"{f.folder}/{f.rel}" == s
+           for f in idx.files):
+        return [], ""
+
+    def _files_in_dir(folder: str, sub: str) -> list[_ModelFile]:
+        sub_prefix = sub.strip("/") + "/"
+        hits = [f for f in idx.files if f.folder == folder and f.rel.startswith(sub_prefix)]
+        if any(_names_weights(f.abs.name) for f in hits):
+            return hits
+        return []
+
+    # 1. Local absolute path inside this machine's ComfyUI/models or extra_model_paths
+    if s.startswith("/"):
+        for mroot in ((comfyui_dir / "models").resolve(), comfyui_dir / "models"):
+            mroot_s = mroot.as_posix().rstrip("/") + "/"
+            if s.startswith(mroot_s):
+                rel_under = s[len(mroot_s):].strip("/")
+                if "/" in rel_under:
+                    folder, sub = rel_under.split("/", 1)
+                    if not _names_weights(sub):
+                        hits = _files_in_dir(folder, sub)
+                        if hits:
+                            return hits, ""
+                        return [], f"{prefix}/models/{folder}/{sub}"
+        for key, edirs in emp.items():
+            for ed in edirs:
+                for eroot in (ed.resolve(), ed):
+                    eroot_s = eroot.as_posix().rstrip("/") + "/"
+                    if s.startswith(eroot_s):
+                        sub = s[len(eroot_s):].strip("/")
+                        if sub and not _names_weights(sub):
+                            hits = _files_in_dir(key, sub)
+                            if hits:
+                                return hits, ""
+                            return [], f"{prefix}/models/{key}/{sub}"
+        return [], ""
+
+    # 2. Relative path starting with "<prefix>/models/" or "models/"
+    rel_s = s
+    if rel_s.startswith(f"{prefix}/models/"):
+        rel_s = rel_s[len(f"{prefix}/models/"):]
+    elif rel_s.startswith("models/"):
+        rel_s = rel_s[len("models/"):]
+    if rel_s != s and "/" in rel_s:
+        folder, sub = rel_s.split("/", 1)
+        if sub and not _names_weights(sub):
+            hits = _files_in_dir(folder, sub)
+            if hits:
+                return hits, ""
+            return [], f"{prefix}/models/{folder}/{sub}"
+
+    # 3. Relative path "<folder>/<sub>" where <folder> is a models/ category folder
+    if "/" in s and not _names_weights(s):
+        folder, sub = s.split("/", 1)
+        if sub:
+            hits = _files_in_dir(folder, sub)
+            if hits:
+                return hits, ""
+            if (comfyui_dir / "models" / folder).is_dir() or folder in emp:
+                return [], f"{prefix}/models/{folder}/{sub}"
+
+    # 4. Bare directory name (e.g. "MOSS-Image-Base") inside a directory-model folder
+    #    or containing Hugging Face / Diffusers config markers + weights
+    if not _names_weights(s) and "." not in parts[-1]:
+        sub_prefix = s + "/"
+        by_folder: dict[str, list[_ModelFile]] = {}
+        for f in idx.files:
+            if f.rel.startswith(sub_prefix):
+                by_folder.setdefault(f.folder, []).append(f)
+        matched: list[_ModelFile] = []
+        for folder, group in by_folder.items():
+            has_weights = any(_names_weights(f.abs.name) for f in group)
+            has_marker = folder.lower() in _MODEL_DIR_FOLDERS or any(
+                f.abs.name in _MODEL_DIR_MARKERS or f.abs.name.endswith(".index.json")
+                for f in group
+            )
+            if has_weights and has_marker:
+                matched.extend(group)
+        if matched:
+            return matched, ""
+
+    return [], ""
 
 
 def _lora_tag_hits(idx: _ModelIndex, name: str) -> list[_ModelFile]:
@@ -1251,7 +1408,8 @@ def capture(workflow: dict, comfyui_dir: Path,
             large_file_bytes: int | None = None,
             hash_cache: Any = None,
             program_dir: Path | None = None,
-            env_python: str | os.PathLike[str] | None = None) -> CaptureResult:
+            env_python: str | os.PathLike[str] | None = None,
+            whole_environment: bool = False) -> CaptureResult:
     """Static capture: a workflow (API-format dict) plus a ComfyUI directory ->
     a pack-spec draft and a report.
 
@@ -1479,8 +1637,14 @@ def capture(workflow: dict, comfyui_dir: Path,
         possibly.pop(rel_to_root, None)
         sha, size = _sha256_file(found, hash_cache)
         folder = rel_to_root.split("/")[2] if rel_to_root.count("/") >= 3 else ""
+        if _names_weights(found.name):
+            fkind = dir_kind_by_folder.get(folder) or _kind_of_folder(folder)
+        elif found.name.lower().endswith((".json", ".yaml", ".yml", ".txt", ".model")):
+            fkind = "model_config"
+        else:
+            fkind = "other"
         entry = {**base, "path": rel_to_root, "size_bytes": size, "sha256": sha,
-                 "kind": dir_kind_by_folder.get(folder) or _kind_of_folder(folder),
+                 "kind": fkind,
                  "found_by": found_by}
         if source is not None:
             entry["source_abs"] = str(source)
@@ -1521,7 +1685,52 @@ def capture(workflow: dict, comfyui_dir: Path,
                                 f"text, but no LoRA of that name is under {prefix}/models/loras. "
                                 f"Without it the rebuilt recipe draws without that LoRA — put "
                                 f"the file back and pack again")
-            how, hits = _match_name(index, value)
+            dir_hits, missing_dir = _match_model_dir(comfyui_dir, prefix, emp, index, value)
+            if dir_hits:
+                if value.startswith("/") and not off:
+                    gaps.append(
+                        f"Manual path update required after restore: node {node_id} ({cls}) "
+                        f"names {value}. Its files are carried, but the workflow keeps the "
+                        "original path. Only the bytes are preserved automatically; point "
+                        "this input at the restored location before running the workflow."
+                    )
+                if off:
+                    for h in dir_hits:
+                        _maybe(h.path, h.abs.stat().st_size,
+                               f"node {node_id} ({cls}) names {value!r} in {where}, switched off")
+                else:
+                    took_count = 0
+                    for h in dir_hits:
+                        rec = _record_path(comfyui_dir, prefix, emp, h.abs)
+                        if rec and _take(h.abs, rec, base, "name_in_workflow"):
+                            took_count += 1
+                    if took_count:
+                        sub_dir = dir_hits[0].rel.split("/", 1)[0]
+                        dir_label = f"{prefix}/models/{dir_hits[0].folder}/{sub_dir}"
+                        gaps.append(
+                            f"{took_count} file(s) under {dir_label} are packed because "
+                            f"node {node_id} ({cls}) names {value} in {where}"
+                        )
+                continue
+            if missing_dir and not off:
+                missing.append({
+                    "node_id": node_id,
+                    "class_type": cls,
+                    "input": where,
+                    "value": value,
+                    "category": "model_dir",
+                    "searched_dirs": [missing_dir],
+                })
+                continue
+            how, hits = _match_name(index, value, comfyui_dir=comfyui_dir, emp=emp)
+            if hits:
+                if value.startswith("/") and not off:
+                    gaps.append(
+                        f"Manual path update required after restore: node {node_id} ({cls}) "
+                        f"names {value}. Its files are carried, but the workflow keeps the "
+                        "original path. Only the bytes are preserved automatically; point "
+                        "this input at the restored location before running the workflow."
+                    )
             if not hits:
                 if len(keypath) > 1 and _names_weights(value) and not off:
                     gaps.append(f"Node {node_id} ({cls}) names {value} in {where}, but no such "
@@ -1815,7 +2024,12 @@ def capture(workflow: dict, comfyui_dir: Path,
     #         hash travels only as a cross-check, never as the packer's source) ----
     # role (required from format v2.0 on): capture already knows which is which, so
     # emitting it here saves every consumer from inferring it back out of the path.
-    core_exclude = COMFYUI_CORE_EXCLUDE + [f"custom_nodes/{n}" for n in sorted(matched_dirs)]
+    # Unreferenced custom_nodes directories installed on the machine do not belong
+    # in this workflow's host archive; referenced ones without git (dirs_without_git)
+    # are NOT in dirs_not_referenced and still ride inside the host archive.
+    core_exclude = COMFYUI_CORE_EXCLUDE + [
+        f"custom_nodes/{n}" for n in sorted(set(matched_dirs) | (set() if whole_environment else set(dirs_not_referenced)))
+    ]
     host: dict = {"name": prefix, "role": "host", **core, "install_path": prefix}
     if program_dir is not None:
         # pack-spec 1.3: read the program's bytes over there, still land them at the
@@ -1858,7 +2072,8 @@ def capture(workflow: dict, comfyui_dir: Path,
             # models they already have.
             # Only advice the reader can act on: the panel has nowhere to type a licence
             # and --auto has no flag for one, but --mine works on every route.
-            gaps.append(unknown_licence_gap(r['path']))
+            if _names_weights(r["path"]):
+                gaps.append(unknown_licence_gap(r['path']))
         # Hand the hash we just measured to the packer as `expected_sha256`. It is a
         # cross-check, not a source — packing hashes the file again and refuses to
         # continue if it has changed since capture. The hash that reaches the nest is

@@ -4139,9 +4139,14 @@ def _carry_run_downloads(root: Path, spec: dict, cdir: Path, program_dir: Path |
         dirs = [cdir / "models", *[d for ds in emp.values() for d in ds]]
         listed = [_listed_file_source(root, f) for f in spec.get("files") or []
                   if isinstance(f, dict)]
-        fetched = rd.files_fetched_in(window, dirs, [p for p in listed if p is not None])
+        skip_paths = [p for p in listed if p is not None]
+        fetched = rd.files_fetched_in(window, dirs, skip_paths)
         held = rd.held_open(window.pid)
         split = rd.split_by_use(fetched, held) if fetched else rd.Fetched()
+        held_files = rd.files_held_in(held, dirs, [*skip_paths, *split.carry])
+        held_reals = {os.path.realpath(p) for p in held_files}
+        if held_files:
+            split.carry = sorted([*split.carry, *held_files])
         _carry_home_caches(spec, window, held, warnings)
         # A file that appeared in a folder ComfyUI itself loads models from **by name**
         # (checkpoints/, loras/, diffusion_models/, ...) is the recipe's business: the
@@ -4159,7 +4164,8 @@ def _carry_run_downloads(root: Path, spec: dict, cdir: Path, program_dir: Path |
         for f in list(split.carry):
             rel = _rel_for_gap(root, cdir, f).split("/")
             folder = rel[2] if len(rel) > 3 and rel[1] == "models" else ""
-            if folder in std and (held is None or os.path.realpath(f) not in held):
+            real_f = os.path.realpath(f)
+            if folder in std and real_f not in held_reals and (held is None or real_f not in held):
                 split.carry.remove(f)
                 by_name.append(f)
         split.undetermined = [d for d in split.undetermined
@@ -4765,6 +4771,7 @@ def infer_spec_current_state(
 
     hashes = _hash_record(hash_cache, env_root, full_rehash)
     result = capture(wf_json, cdir, workflow_relpath=wf_rel, hash_cache=hashes,
+                     whole_environment=driving is None,
                      program_dir=Path(program_dir).resolve() if program_dir else None,
                      env_python=env_python or find_env_python(venv_python_candidates(cdir, env_root)))
     if persist_hashes:
