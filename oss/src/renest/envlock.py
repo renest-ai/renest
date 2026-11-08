@@ -724,6 +724,63 @@ def drop_ourselves(body: str) -> str:
     return "\n".join(keep)
 
 
+def _recorded_torch_builds(python_exe: str | Path) -> dict[str, str]:
+    """Read installed build constants without importing torch or running package code.
+
+    Some vendor wheels omit the local build tag from distribution metadata while
+    keeping it in version.py. Read that package's own literal, never infer it from
+    another member of the torch family.
+    """
+    script = """
+import ast, importlib.metadata as m, json
+out = {}
+for name in ('torch', 'torchvision', 'torchaudio'):
+    try:
+        p = m.distribution(name).locate_file(name + '/version.py')
+        if p.stat().st_size > 65536:
+            continue
+        tree = ast.parse(p.read_text(encoding='utf-8'))
+        for node in tree.body:
+            targets = node.targets if isinstance(node, ast.Assign) else (
+                [node.target] if isinstance(node, ast.AnnAssign) else [])
+            if any(isinstance(t, ast.Name) and t.id == '__version__' for t in targets):
+                value = ast.literal_eval(node.value)
+                if isinstance(value, str):
+                    out[name] = value
+    except (m.PackageNotFoundError, OSError, ValueError, SyntaxError, TypeError):
+        pass
+print(json.dumps(out))
+"""
+    try:
+        result = subprocess.run(
+            [str(python_exe), "-c", script], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=15, check=False,
+            env=_utf8_child_env(),
+        )
+        values = json.loads(result.stdout) if result.returncode == 0 else {}
+        return values if isinstance(values, dict) else {}
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {}
+
+
+def _preserve_recorded_build_tags(body: str, python_exe: str | Path) -> str:
+    pattern = re.compile(r"(?m)^(torch|torchvision|torchaudio)==([^\s;+]+)$")
+    if not pattern.search(body):
+        return body
+    builds = _recorded_torch_builds(python_exe)
+
+    def replace(match: re.Match) -> str:
+        name, base = match.groups()
+        build = builds.get(name)
+        # Only fill an omitted CUDA suffix on the *same* version. Existing pins,
+        # direct URLs, editables and conflicting version evidence stay intact.
+        if isinstance(build, str) and re.fullmatch(re.escape(base) + r"\+cu\d+", build):
+            return f"{name}=={build}"
+        return match.group(0)
+
+    return pattern.sub(replace, body)
+
+
 def freeze_environment(python_exe: str | Path) -> str | None:
     """Ask the interpreter which packages it has and at which versions. Returns
     ``None`` when it cannot be read — we report that honestly rather than invent a
@@ -741,10 +798,10 @@ def freeze_environment(python_exe: str | Path) -> str | None:
     """
     body = _uv_freeze(python_exe)
     if body:
-        return LOCK_FROM_ENV_HEADER + drop_ourselves(body) + "\n"
+        return LOCK_FROM_ENV_HEADER + drop_ourselves(_preserve_recorded_build_tags(body, python_exe)) + "\n"
     body = _pip_freeze(python_exe)
     if body:
-        return LOCK_FROM_ENV_HEADER + drop_ourselves(body) + "\n"
+        return LOCK_FROM_ENV_HEADER + drop_ourselves(_preserve_recorded_build_tags(body, python_exe)) + "\n"
     try:
         out = subprocess.run(
             [str(python_exe), "-c", _FREEZE_SNIPPET],
@@ -758,7 +815,7 @@ def freeze_environment(python_exe: str | Path) -> str | None:
     body = out.stdout.strip()
     if not body:
         return None
-    return LOCK_FROM_ENV_HEADER + drop_ourselves(body) + "\n"
+    return LOCK_FROM_ENV_HEADER + drop_ourselves(_preserve_recorded_build_tags(body, python_exe)) + "\n"
 
 
 # -------------------------------------------------- reading it without running it --

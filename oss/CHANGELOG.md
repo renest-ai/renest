@@ -2,7 +2,23 @@
 
 What changed for the person using `renest`. Dates are the release date.
 
-## 0.1.31 — Unreleased
+## 0.1.32 — Unreleased
+
+### Directory previews show what is included and what is left out
+The ComfyUI panel counts files rather than calling every config and licence a
+model. Each directory model shows its included and excluded file counts, with
+excluded paths available to review. Unreferenced model notices have their own
+collapsed section; all remaining notices can be expanded, and manual path
+changes and excluded files appear first.
+
+### Keep CUDA build identities recorded by installed packages
+When a torch-family distribution omits its CUDA suffix from package metadata,
+packing reads the same package's literal version record without importing its
+code. It fills only a missing CUDA suffix on the same base version, preserving
+existing pins and direct URLs. This fixes a Spark torchaudio build whose
+metadata said 2.11.0 while its own version record said 2.11.0+cu130.
+
+## 0.1.31 — 2026-11-08
 
 ### Packing recognizes generic Python wheels from the vendor index
 A working environment with a vendor wheel tagged `py3` or `py2.py3` no longer

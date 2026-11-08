@@ -33,13 +33,22 @@ and left out. Small companion files (configs, tokenizers) are always carried -- 
 loader reads them and closes them, so "not held open" says nothing about them -- and
 in a folder where nothing is held open, everything is carried and the pack says it
 could not tell.
+
+**Shards of one model are one unit** (2026-11-08). A loader reads a sharded model one
+shard at a time and may close all but the last, so "the run holds shard 4" says
+nothing about shards 1-3. A held weight brings along every shard its own index file
+(``*.index.json`` ``weight_map``) lists, and every file named like it
+``<stem>-NNNNN-of-MMMMM.<ext>`` with the same stem, count and suffix. Only a weight
+outside that set can still be called an unused duplicate.
 """
 
 from __future__ import annotations
 
 import contextlib
 import datetime as _dt
+import json
 import os
+import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -314,10 +323,22 @@ def files_held_in(
         min_depth = 3 if is_models_root else 2
         key_len = 2 if is_models_root else 1
         held_model_dirs: set[tuple[str, ...]] = set()
+        held_by_parent: dict[Path, list[Path]] = {}
         for p, real, rel_parts in all_files:
             if real in held:
                 if len(rel_parts) >= min_depth:
                     held_model_dirs.add(rel_parts[:key_len])
+                if _is_weight(p):
+                    held_by_parent.setdefault(p.parent, []).append(p)
+                if real not in seen and real not in skip_real:
+                    seen.add(real)
+                    out.append(p)
+        # The other shards of a held sharded model: a loader may have read and closed
+        # them already (see the module docstring).
+        for parent, loaded in held_by_parent.items():
+            in_parent = [p for p, _r, _rp in all_files if p.parent == parent]
+            for p in shard_siblings(loaded, in_parent):
+                real = os.path.realpath(p)
                 if real not in seen and real not in skip_real:
                     seen.add(real)
                     out.append(p)
@@ -349,6 +370,50 @@ def _is_weight(p: Path) -> bool:
     return payload_kind(p) is not None
 
 
+_SHARD_NAME = re.compile(r"^(?P<stem>.+)-(?P<i>\d{5})-of-(?P<n>\d{5})(?P<ext>\.[^./]+)$")
+#: An index file larger than this is not a shard index; it is not read.
+_INDEX_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _index_shards(index: Path) -> set[str]:
+    """File names an ``*.index.json`` lists in its ``weight_map`` (bare names only:
+    an entry that names another folder is ignored, never followed)."""
+    try:
+        if index.stat().st_size > _INDEX_MAX_BYTES:
+            return set()
+        data = json.loads(index.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    wm = data.get("weight_map") if isinstance(data, dict) else None
+    if not isinstance(wm, dict):
+        return set()
+    return {v for v in wm.values()
+            if isinstance(v, str) and v and "/" not in v and "\\" not in v and v != ".."}
+
+
+def shard_siblings(loaded: Iterable[Path], folder_files: Iterable[Path]) -> set[Path]:
+    """The files in ``folder_files`` that belong to the same sharded model as one of
+    ``loaded`` (all in one folder). See the module docstring."""
+    files = list(folder_files)
+    by_name = {f.name: f for f in files}
+    loaded_names = {p.name for p in loaded}
+    out: set[Path] = set()
+    for f in files:
+        if f.name.endswith(".index.json"):
+            listed = _index_shards(f)
+            if listed & loaded_names:
+                out.update(by_name[n] for n in listed if n in by_name)
+    for name in loaded_names:
+        m = _SHARD_NAME.match(name)
+        if not m:
+            continue
+        for f in files:
+            o = _SHARD_NAME.match(f.name)
+            if o and (o["stem"], o["n"], o["ext"]) == (m["stem"], m["n"], m["ext"]):
+                out.add(f)
+    return out
+
+
 def split_by_use(files: Sequence[Path], held: set[str] | None) -> Fetched:
     """Which fetched files to carry. See the module docstring for the one rule."""
     res = Fetched()
@@ -363,8 +428,15 @@ def split_by_use(files: Sequence[Path], held: set[str] | None) -> Fetched:
             if weights:
                 res.undetermined.append(folder)
             continue
+        # Index files already on disk count as evidence even when they were not
+        # fetched in this run.
+        try:
+            beside = [p for p in folder.iterdir() if p.is_file()]
+        except OSError:
+            beside = list(group)
+        needed = set(loaded) | shard_siblings(loaded, {*group, *beside})
         for f in group:
-            if f in weights and f not in loaded:
+            if f in weights and f not in needed:
                 res.unused.append((f, loaded[0]))
             else:
                 res.carry.append(f)

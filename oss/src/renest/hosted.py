@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -52,8 +53,8 @@ __all__ = ["DEFAULT_ORIGIN", "MAX_PARALLEL_PUT", "HostedResult", "HostedUploader
            "storage_exit_code",
            "store_put", "upload_blob_multipart"]
 
-#: Timeout for control-plane calls: short connect, ordinary read.
-_API_TIMEOUT = httpx.Timeout(connect=15.0, read=60.0, write=60.0, pool=15.0)
+#: Timeout for control-plane calls: generous connect for international links (TLS delays), wide read budget.
+_API_TIMEOUT = httpx.Timeout(connect=45.0, read=180.0, write=120.0, pool=30.0)
 #: Cap on parallel part uploads — **one shared constant for both upload paths**;
 #: do not split it again. Split once, it left hosted at 1 and bring-your-own-
 #: storage at 4, so the hosted path ran four times slower than the free one.
@@ -360,6 +361,7 @@ class HostedUploader:
         challenges: bool = True,
         check_name: bool = True,
         upload_once: bool = False,
+        progress: Callable[[dict], None] | None = None,
     ) -> None:
         """``notice`` is where the reporting disclosure is written. It is separate from
         ``log`` on purpose: ``--json`` silences ``log``, but a run that reports must still
@@ -386,6 +388,7 @@ class HostedUploader:
         self._challenges = challenges
         self._check_name = check_name
         self._upload_once = upload_once
+        self._progress = progress
         self._disclosed = False
         # After one failed report, this process stops trying (same rule as the
         # restore side).
@@ -458,13 +461,36 @@ class HostedUploader:
     def _api(
         self, client: httpx.Client, method: str, path: str, *, json_body: dict | None = None
     ) -> httpx.Response:
-        resp = client.request(
-            method,
-            f"{self._origin}/api/v1{path}",
-            json=json_body,
-            headers={"Authorization": f"Bearer {self._token}"},
-            timeout=_API_TIMEOUT,
-        )
+        url = f"{self._origin}/api/v1{path}"
+        headers = {"Authorization": f"Bearer {self._token}"}
+        resp: httpx.Response | None = None
+        for attempt in range(1, _STORE_ATTEMPTS + 1):
+            try:
+                resp = client.request(
+                    method,
+                    url,
+                    json=json_body,
+                    headers=headers,
+                    timeout=_API_TIMEOUT,
+                )
+                if resp.status_code in _RETRYABLE_STATUSES and attempt < _STORE_ATTEMPTS:
+                    time.sleep(_STORE_BACKOFF_BASE_S ** (attempt - 1))
+                    continue
+                break
+            except (httpx.ConnectTimeout, httpx.ConnectError, httpx.RemoteProtocolError):
+                if attempt < _STORE_ATTEMPTS:
+                    time.sleep(_STORE_BACKOFF_BASE_S ** (attempt - 1))
+                    continue
+                raise
+            except httpx.ReadTimeout:
+                # Safe to retry idempotent methods, or pre-upload provision
+                if attempt < _STORE_ATTEMPTS and (method == "GET" or path == "/buckets/provision"):
+                    time.sleep(_STORE_BACKOFF_BASE_S ** (attempt - 1))
+                    continue
+                raise
+        if resp is None:
+            raise PackError(f"Cannot reach hosted storage at {self._origin}",
+                            exit_code=int(ExitCode.S1_NETWORK_INTERRUPTED))
         if resp.status_code == 401 and self._upload_once:
             raise PackError(
                 "This upload's approval was withdrawn or ran out. Start the upload again "
@@ -617,7 +643,13 @@ class HostedUploader:
             exit_code=int(ExitCode.S1_STORAGE_UNAVAILABLE),
         )
 
-    def _upload_blob(self, client: httpx.Client, path: Path, plan: dict) -> int:
+    def _upload_blob(
+        self,
+        client: httpx.Client,
+        path: Path,
+        plan: dict,
+        on_part: Callable[[int], None] | None = None,
+    ) -> int:
         # The plan comes back from the server; the channel to speak on is ours, so it is
         # attached here rather than asked of the API.
         mp = plan.get("multipart")
@@ -627,10 +659,14 @@ class HostedUploader:
             # upload to open for zero bytes). Same trust boundary as a part URL.
             data = path.read_bytes()
             store_put(client, put_url, data, resumable=True, notice=self._log)
+            if on_part is not None:
+                on_part(len(data))
             return len(data)
         if isinstance(mp, dict):
             mp.setdefault("notice", self._log)
-        return upload_blob_multipart(client, path, plan, max_parallel=MAX_PARALLEL_PUT)
+        return upload_blob_multipart(
+            client, path, plan, max_parallel=MAX_PARALLEL_PUT, on_part=on_part
+        )
 
     # -- Answering a byte spot check. Skipping an upload is **the server's
     # -- verdict**; here we only answer the question, we never ask about the
@@ -796,6 +832,19 @@ class HostedUploader:
                         "stay home (zero bytes uploaded for those files)."
                     )
 
+            # [SECURITY-REVIEW] Trust boundary: every sha in the plan must be
+            # one this run declared. Without this check a compromised control
+            # plane could name an arbitrary string, build a local path from
+            # it, and have this tool read and send out an undeclared file.
+            for plan in plans:
+                sha = str(plan.get("sha256", ""))
+                if sha not in wanted:
+                    raise PackError(
+                        f"The server's plan lists a blob we never declared: {_clean(sha)[:12]}. "
+                        "That is outside the trust boundary; refusing to continue.",
+                        exit_code=int(ExitCode.S1_STORAGE_UNAVAILABLE),
+                    )
+
             sizes: dict[str, int] = {}
             need = [p for p in plans if p["action"] == "upload"]
             self._log(
@@ -807,6 +856,58 @@ class HostedUploader:
                 "blobs_total": len(plans), "blobs_to_upload": len(need),
                 "declared_bytes": sum(wanted.values()),
             }])
+
+            bytes_to_upload = sum(wanted[p["sha256"]] for p in need)
+            bytes_uploaded = 0
+            t_upload_start = time.monotonic()
+            last_progress_emit = t_upload_start
+            last_emit_bytes = 0
+            progress_lock = threading.Lock()
+
+            def emit_progress(force: bool = False) -> None:
+                nonlocal last_progress_emit, last_emit_bytes
+                if self._progress is None:
+                    return
+                now = time.monotonic()
+                dt = now - last_progress_emit
+                if not force and dt < 0.5:
+                    return
+                delta_bytes = bytes_uploaded - last_emit_bytes
+                speed_mbps = (delta_bytes * 8 / dt / 1_000_000) if dt > 0 else 0.0
+                last_progress_emit = now
+                last_emit_bytes = bytes_uploaded
+                percent = (bytes_uploaded / bytes_to_upload * 100.0) if bytes_to_upload > 0 else 100.0
+                self._progress({
+                    "type": "progress",
+                    "stage": "P3",
+                    "percent": round(min(percent, 99.9), 1) if bytes_uploaded < bytes_to_upload else 100.0,
+                    "bytes_done": bytes_uploaded,
+                    "bytes_total": bytes_to_upload,
+                    "speed_mbps": round(speed_mbps, 2),
+                    "parallel_streams": MAX_PARALLEL_PUT if len(need) > 0 else 1,
+                    "blobs_done": self.result.uploaded_blobs,
+                    "blobs_total": len(need),
+                })
+
+            def on_part(chunk_size: int) -> None:
+                nonlocal bytes_uploaded
+                with progress_lock:
+                    bytes_uploaded += chunk_size
+                    emit_progress(force=False)
+
+            if self._progress is not None:
+                self._progress({
+                    "type": "progress",
+                    "stage": "P3",
+                    "percent": 0.0,
+                    "bytes_done": 0,
+                    "bytes_total": bytes_to_upload,
+                    "speed_mbps": 0.0,
+                    "parallel_streams": MAX_PARALLEL_PUT if len(need) > 0 else 1,
+                    "blobs_done": 0,
+                    "blobs_total": len(need),
+                })
+
             for i, plan in enumerate(plans, 1):
                 sha = str(plan["sha256"])
                 # [SECURITY-REVIEW] Trust boundary: every sha in the plan must be
@@ -825,7 +926,7 @@ class HostedUploader:
                         local, sha, wanted[sha], manifest.get("created_at"))
                     self._log(f"[{i}/{len(plans)}] Sending {sha[:12]} ({wanted[sha]} bytes)…")
                     tb = time.monotonic()
-                    sent = self._upload_blob(client, local, plan)
+                    sent = self._upload_blob(client, local, plan, on_part=on_part)
                     sizes[sha] = sent
                     self.result.uploaded_blobs += 1
                     self.result.uploaded_bytes += sent
@@ -836,11 +937,16 @@ class HostedUploader:
                         "seconds": round(secs, 3),
                         "mbps": round(sent / secs / 1e6, 3),
                     }])
+                    with progress_lock:
+                        emit_progress(force=True)
                 else:
                     # already_owned: the bytes are already stored, so nothing is
                     # uploaded; the local size is still what we reconcile against.
                     sizes[sha] = local.stat().st_size if local.exists() else wanted[sha]
                     self.result.skipped_blobs += 1
+
+            with progress_lock:
+                emit_progress(force=True)
 
             plan_m = session.get("manifest_plan")
             if not plan_m:
@@ -1035,7 +1141,12 @@ def store_put(
 
 
 def upload_blob_multipart(
-    client: httpx.Client, path: Path, plan: dict, *, max_parallel: int = 1
+    client: httpx.Client,
+    path: Path,
+    plan: dict,
+    *,
+    max_parallel: int = 1,
+    on_part: Callable[[int], None] | None = None,
 ) -> int:
     """Upload one blob following its multi-part plan; returns the bytes actually
     sent.
@@ -1095,6 +1206,8 @@ def upload_blob_multipart(
             n, etag, size = send(entry)
             parts.append((n, etag))
             sent += size
+            if on_part is not None:
+                on_part(size)
     else:
         with ThreadPoolExecutor(max_workers=min(max_parallel, len(entries))) as pool:
             futures = {pool.submit(send, e): e for e in entries}
@@ -1103,6 +1216,8 @@ def upload_blob_multipart(
                     n, etag, size = fut.result()
                     parts.append((n, etag))
                     sent += size
+                    if on_part is not None:
+                        on_part(size)
             except BaseException:
                 # Once a part fails, stop pouring bytes into a multi-part
                 # upload that is about to be thrown away.

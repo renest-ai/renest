@@ -1066,8 +1066,13 @@ def _copies_of_listed_files(root: Path, src_dir: Path, exclude, listed: list[dic
     licence (same bytes, same licence). Sizes are compared first; only an equal
     size costs a read.
     """
+    from .capture import _names_weights
+
     by_size: dict[int, list[tuple[Path, dict]]] = {}
     for f in listed:
+        p_name = str(f.get("path") or "")
+        if not _names_weights(p_name) and int(f.get("size_bytes") or 0) < 1024 * 1024:
+            continue
         src = _listed_file_source(root, f)
         if src is None:
             continue
@@ -1089,6 +1094,8 @@ def _copies_of_listed_files(root: Path, src_dir: Path, exclude, listed: list[dic
     out: list[tuple[str, dict]] = []
     for rel, p in _packed_files(src_dir, exclude):
         try:
+            if not _names_weights(p.name) and p.stat().st_size < 1024 * 1024:
+                continue
             same = by_size.get(p.stat().st_size)
             if not same:
                 continue
@@ -1483,11 +1490,20 @@ class PackReport:
     #: What this nest knowingly does not carry, one entry per thing
     #: (:mod:`renest.gaps`): ``{kind, subject, detail, required}``.
     capture_gaps: list[dict] = field(default_factory=list)
+    #: Presentation categories recorded by the finding's producer. Report only;
+    #: findings still contains every original sentence for older clients and CLI.
+    notice_groups: dict[str, list[str]] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         d = asdict(self)
         d.pop("manifest", None)  # keep report light; manifest lives on disk
         return d
+
+
+def _add_notice(warnings: list[str], groups: dict | None, category: str, text: str) -> None:
+    warnings.append(text)
+    if groups is not None:
+        groups.setdefault(category, []).append(text)
 
 
 def _gaps_of(spec: dict | None) -> list[dict]:
@@ -2093,6 +2109,7 @@ def download_address_hint(paths: list[str]) -> str:
 def _fill_download_addresses(
     manifest: dict, spec: dict, root: Path, warnings: list[str], *, online: bool,
     client: httpx.Client | None, declared: dict[str, str] | None,
+    notice_groups: dict | None = None,
 ) -> None:
     """Write ``origin_url`` for every file an address can be derived for.
 
@@ -2189,7 +2206,7 @@ def _fill_download_addresses(
     missing = [str(f.get("path")) for f in files
                if _is_restricted(f) and not f.get("origin_url")]
     if missing:
-        warnings.append(download_address_hint(missing))
+        _add_notice(warnings, notice_groups, "hand_off", download_address_hint(missing))
 
 
 def _base_image_of_this_machine(*, online: bool) -> tuple[dict | None, str | None]:
@@ -2408,6 +2425,7 @@ def _build_manifest(
     download_urls: dict[str, str] | None = None,
     lfs: dict | None = None,
     environment_id: str | None = None,
+    notice_groups: dict | None = None,
 ) -> tuple[dict, list[dict]]:
     """P1 + P2: scan/hash + assemble the v1 manifest. Returns (manifest, inventory).
 
@@ -2974,7 +2992,7 @@ def _build_manifest(
             stray.append(rel)
     if stray:
         one = len(stray) == 1
-        warnings.append(
+        _add_notice(warnings, notice_groups, "unverified",
             f"{', '.join(stray)} {'looks' if one else 'look'} like the script that starts "
             f"this setup (it runs Python), and {'it sits' if one else 'they sit'} outside "
             f"the folders this nest carries — so {'it' if one else 'they'} won't come back "
@@ -2997,7 +3015,7 @@ def _build_manifest(
                 "data_outside_node", rel,
                 f"{dep['name']} names {lit!r} in its code ({src_file}); this file sits outside "
                 f"everything the nest carries."))
-            warnings.append(
+            _add_notice(warnings, notice_groups, "unverified",
                 f"{dep['name']} names the file {lit!r} in its code ({src_file}), and a file by "
                 f"that name sits at {rel} — outside everything this nest carries, so it will "
                 f"not come back with it. If the node reads it, pack again with --add {rel}"
@@ -3086,7 +3104,7 @@ def _build_manifest(
             # interpreter, not copied from a file. Leave lockfile_path out rather than
             # naming a path that was never there.
             lock_orig_rel = None
-            warnings.append(
+            _add_notice(warnings, notice_groups, "information",
                 f"This environment had no lock file, so the dependency list was read from the "
                 f"Python that runs it ({from_env['python']}): "
                 f"{len(frozen.splitlines()) - LOCK_FROM_ENV_HEADER.count(chr(10))} packages, "
@@ -3495,7 +3513,7 @@ def _build_manifest(
         elif local_ver and pin_wheels:
             # A dry run of an online pack: the rehearsal never rewrites the lock
             # and never goes online; the real pack will pin — or fail loudly.
-            warnings.append(
+            _add_notice(warnings, notice_groups, "information",
                 f"{len(local_ver)} package(s) carry a vendor-only version PyPI doesn't have "
                 f"(like torch==…+cu124): a restore can only install them from direct wheel URLs, "
                 f"and a dry run never rewrites the lock file, so pinned_wheel_urls is left out. "
@@ -3847,7 +3865,7 @@ def _build_manifest(
     # files are restricted (the ones a recipient gets only the address of).
     _fill_download_addresses(
         manifest, spec, root, warnings, online=not no_licence_lookup, client=client,
-        declared=download_urls)
+        declared=download_urls, notice_groups=notice_groups)
 
     # The escape hatch travels with the nest (format 2.3). Doing it **after** the
     # licence-text step is deliberate: it is our own script, and it should not
@@ -4707,7 +4725,7 @@ def _carry_recipe_inline(spec: dict, cui: dict, wf_json: dict, cdir: Path, repor
             "nest too."
         )
     else:
-        report["gaps"].append(
+        _add_notice(report["gaps"], report.setdefault("notice_groups", {}), "information",
             "A finished run in this environment wrote this very workflow into its output, "
             "so this nest carries a verified run: restoring it will re-run that workflow and "
             "require a picture to come out."
@@ -4851,7 +4869,7 @@ def infer_spec_current_state(
     # Tell the caller which of the two nests they are about to get -- said once,
     # up front, not left for them to notice missing on the other end.
     if evidence.verified:
-        report["gaps"].append(
+        _add_notice(report["gaps"], report.setdefault("notice_groups", {}), "information",
             "This environment has produced at least one picture with its recipe attached, "
             "so this nest carries a verified run: restoring it will re-run that recipe and "
             "require a picture to come out."
@@ -5297,7 +5315,7 @@ def pack(
                     pin_wheels=pin_wheels, client=client, no_licence_lookup=no_licence_lookup,
                     mine=mine, cache=hash_cache, program_dir=_program_dir,
                     download_urls=download_urls, lfs=_lfs_opts,
-                    environment_id=environment_id,
+                    environment_id=environment_id, notice_groups=report.notice_groups,
                 )
                 # The same last gate as a real pack. A dry run that waves an
                 # unresolved placeholder through lets "the dry run was green"
@@ -5361,7 +5379,7 @@ def pack(
                 mine=mine, emitter=emitter, cache=hash_cache, program_dir=_program_dir,
                 download_urls=download_urls,
                 lfs=_lfs_opts,
-                environment_id=environment_id,
+                environment_id=environment_id, notice_groups=report.notice_groups,
             )
             # Saved as soon as the reading is done: what was read stays true even
             # if a later stage fails, and a retry should not pay for it twice.

@@ -29,6 +29,7 @@ from typing import Any
 
 from . import __version__
 from .integrity import dirty_gap, git_identity, probe_model_bytes, registry_identity
+from .roots import ENV_DATA_SUFFIXES
 from .syslibs import read_run_record, record_search_roots
 from .verified import scan_comfyui_output
 
@@ -1193,7 +1194,9 @@ def _match_model_dir(
 
     # 4. Bare directory name (e.g. "MOSS-Image-Base") inside a directory-model folder
     #    or containing Hugging Face / Diffusers config markers + weights
-    if not _names_weights(s) and "." not in parts[-1]:
+    if not _names_weights(s) and Path(parts[-1]).suffix.lower() not in (
+        ENV_DATA_SUFFIXES | set(_WEIGHT_SUFFIXES)
+    ):
         sub_prefix = s + "/"
         by_folder: dict[str, list[_ModelFile]] = {}
         for f in idx.files:
@@ -1443,6 +1446,13 @@ def capture(workflow: dict, comfyui_dir: Path,
     prefix = comfyui_dir.name           # usually "ComfyUI"
     nodes = _normalize_workflow(workflow)
     gaps: list[str] = []
+    information: list[str] = []
+
+    def add_information(text: str) -> None:
+        gaps.append(text)
+        information.append(text)
+
+    directory_candidates: dict[str, set[str]] = {}
 
     # ---- 1. scan the workflow: file references + non-built-in classes ----
     refs: list[dict] = []               # file references, per the lookup table
@@ -1700,16 +1710,21 @@ def capture(workflow: dict, comfyui_dir: Path,
                                f"node {node_id} ({cls}) names {value!r} in {where}, switched off")
                 else:
                     took_count = 0
+                    selected_paths = []
                     for h in dir_hits:
                         rec = _record_path(comfyui_dir, prefix, emp, h.abs)
+                        if rec:
+                            selected_paths.append(rec[0])
                         if rec and _take(h.abs, rec, base, "name_in_workflow"):
                             took_count += 1
+                    sub_dir = dir_hits[0].rel.split("/", 1)[0]
+                    dir_label = f"{prefix}/models/{dir_hits[0].folder}/{sub_dir}"
+                    directory_candidates.setdefault(dir_label, set()).update(selected_paths)
                     if took_count:
-                        sub_dir = dir_hits[0].rel.split("/", 1)[0]
-                        dir_label = f"{prefix}/models/{dir_hits[0].folder}/{sub_dir}"
-                        gaps.append(
-                            f"{took_count} file(s) under {dir_label} are packed because "
-                            f"node {node_id} ({cls}) names {value} in {where}"
+                        add_information(
+                            f"{took_count} file(s) under {dir_label} were selected for packing because "
+                            f"node {node_id} ({cls}) names {value} in {where}. "
+                            "Files excluded by the packer's file rules are listed separately."
                         )
                 continue
             if missing_dir and not off:
@@ -2168,6 +2183,11 @@ def capture(workflow: dict, comfyui_dir: Path,
         "capture_version": CAPTURE_VERSION,
         "workflow_nodes": len(nodes),
         "models": {"recognized": recognized, "missing": missing},
+        "notice_groups": {"information": information},
+        "model_directories": [
+            {"path": path, "selected_paths": sorted(paths)}
+            for path, paths in sorted(directory_candidates.items())
+        ],
         "custom_nodes": {
             "class_match": class_match,
             "packed_dirs": {n: matched_dirs[n] for n in sorted(matched_dirs)},

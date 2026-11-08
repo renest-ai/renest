@@ -483,6 +483,32 @@ class Job:
 # --------------------------------------------------------------------------
 # app
 # --------------------------------------------------------------------------
+def _preview_sections(report: Any, warnings: list[str], other_models: set[str]) -> dict:
+    """Use producer categories; every unclassified finding remains in review.
+
+    Do not infer severity from English wording. The licence factory is shared
+    with capture, so changing that wording cannot silently change its category.
+    """
+    from .capture import unknown_licence_gap
+
+    known = {kind: set() for kind in ("hand_off", "unverified", "information")}
+    capture = getattr(report, "capture_report", None) or {}
+    for groups in (capture.get("notice_groups", {}), getattr(report, "notice_groups", {}) or {}):
+        for kind in known:
+            known[kind].update(groups.get(kind, []))
+    known["hand_off"].update(
+        unknown_licence_gap(i["path"]) for i in report.inventory
+        if i.get("role") == "asset" and isinstance(i.get("path"), str)
+    )
+    used = set(other_models)
+    sections = {}
+    for kind, lines in known.items():
+        sections[kind] = [w for w in warnings if w in lines and w not in used]
+        used.update(sections[kind])
+    sections["review"] = [w for w in warnings if w not in used]
+    return sections
+
+
 class ServeApp:
     """Serve state: token, job store, single-worker queue, local nest registry.
 
@@ -756,6 +782,35 @@ class ServeApp:
         if not getattr(report, "ok", False):
             raise ServeError(400, "; ".join(f for f in report.findings if f) or "dry run failed")
         inv = report.inventory
+        from .capture import _names_weights, not_packed_gap_lines
+
+        capture_report = getattr(report, "capture_report", None) or {}
+        included_paths = {i.get("path") for i in inv if i.get("role") == "asset"}
+        directory_models = []
+        directory_paths: set[str] = set()
+        directory_model_count = 0
+        for directory in capture_report.get("model_directories", []):
+            selected = set(directory["selected_paths"])
+            included = selected & included_paths
+            directory_paths.update(selected)
+            if any(_names_weights(path) for path in included):
+                directory_model_count += 1
+            excluded = sorted(selected - included_paths)
+            directory_models.append({
+                "path": directory["path"],
+                "included_count": len(selected & included_paths),
+                "excluded_count": len(excluded),
+                "excluded_paths": excluded,
+            })
+        model_count = directory_model_count + sum(
+            isinstance(path, str) and _names_weights(path)
+            for path in included_paths - directory_paths
+        )
+        warnings = [f for f in (getattr(report, "findings", None) or []) if f]
+        other_model_lines = set(not_packed_gap_lines(
+            [], capture_report.get("unreferenced_large_files", []),
+            capture_report.get("unreferenced_model_files", []),
+        ))
         named = body.get("name") or (spec or {}).get("name")
         return {
             # When nobody names it, put the date in the name — otherwise every nest
@@ -767,11 +822,19 @@ class ServeApp:
                 "deps": [i for i in inv if i.get("role") == "python_lock"],
             },
             "size_estimate_bytes": report.total_bytes,
+            "directory_models": directory_models,
+            "model_count": model_count,
+            "warning_groups": {
+                # Keep limits complete for older plugins; new plugins use sections.
+                "limits": [w for w in warnings if w not in other_model_lines],
+                "other_models": [w for w in warnings if w in other_model_lines],
+                "sections": _preview_sections(report, warnings, other_model_lines),
+            },
             # The confirmation sheet must also say what is **not** going in: a custom
             # node dropped in as a plain unzip has no recoverable origin, so capture
             # cannot pack it. Drop these findings and the list looks complete while
             # the nest is missing a node.
-            "warnings": [f for f in (getattr(report, "findings", None) or []) if f],
+            "warnings": warnings,
             # Where a real pack would put the nest — so the user knows the destination
             # before pressing confirm.
             "out_dir": str(
@@ -814,6 +877,9 @@ class ServeApp:
                 "bytes_done": event.get("bytes_done", 0),
                 "bytes_total": event.get("bytes_total", 0),
                 "speed_mbps": event.get("speed_mbps", 0.0),
+                "parallel_streams": event.get("parallel_streams", 1),
+                "blobs_done": event.get("blobs_done", 0),
+                "blobs_total": event.get("blobs_total", 0),
             }
         elif et == "error":
             job.error = {k: v for k, v in event.items() if k not in ("type", "ts")}
@@ -1084,10 +1150,21 @@ class ServeApp:
                 self._on_event(job, {"type": "info", "stage": "P4" if checking["said"] else "P3",
                                      "human": text})
 
-            uploader = uploader_cls(
-                origin, upload_token, nest_name=name, client=client, log=say, notice=say,
-                challenges=False, check_name=False, upload_once=True,
+            uploader_kwargs = dict(
+                nest_name=name,
+                client=client,
+                log=say,
+                notice=say,
+                challenges=False,
+                check_name=False,
+                upload_once=True,
             )
+            try:
+                uploader = uploader_cls(
+                    origin, upload_token, progress=self._make_sink(job), **uploader_kwargs
+                )
+            except TypeError:
+                uploader = uploader_cls(origin, upload_token, **uploader_kwargs)
             report = self._pack_once(job, uploader=uploader)
             landed = getattr(uploader, "result", None)
             uploader = None  # it holds the upload-once token; let it go with the run
